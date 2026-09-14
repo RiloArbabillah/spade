@@ -57,13 +57,14 @@ def join(base, path):
     if path.startswith(("http://","https://")): return path
     return urllib.parse.urljoin(base, path)
 
-def make_session(timeout=15):
+def make_session(timeout=15, verify_ssl=True):
     sess = requests.Session()
     retry = Retry(total=2, backoff_factor=0.5, status_forcelist=[429,500,502,503,504],
                   allowed_methods={"GET","POST","HEAD","OPTIONS"})
     sess.mount("http://", HTTPAdapter(max_retries=retry))
     sess.mount("https://", HTTPAdapter(max_retries=retry))
     sess.headers["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36"
+    sess.verify = verify_ssl
     sess.timeout = timeout
     return sess
 
@@ -141,6 +142,65 @@ def is_echo_endpoint(sess, url, timeout=8):
 # ══════════════════════════════════════════════════════════════════
 # SCAN FUNCTIONS — setiap finding pakai deskripsi jelas
 # ══════════════════════════════════════════════════════════════════
+
+
+def get_baseline_fingerprint(sess, base_url):
+    """Probe 2 random non-existent paths untuk deteksi SPA catch-all / default page.
+    Mengembalikan dict fingerprint atau None jika server handle 404 dengan benar."""
+    import random, string
+    timeout = 8  # max detik per probe
+    info("Membangun baseline untuk deteksi false positive...")
+    probes = []
+    seen = set()
+    for i in range(2):
+        # Hindari path duplikat
+        while True:
+            rand = ''.join(random.choices(string.ascii_lowercase, k=10))
+            if rand not in seen:
+                seen.add(rand)
+                break
+        path = '/_spade_probe_' + rand + '.html'
+        try:
+            r = sess.get(join(base_url, path), timeout=timeout)
+            probes.append({
+                'status': r.status_code,
+                'size': len(r.content),
+                'content': r.content,
+                'content_type': r.headers.get('Content-Type', ''),
+                'is_html': bool(b'<!DOCTYPE html' in r.content[:200] or b'<html' in r.content[:200]),
+            })
+        except:
+            pass
+
+    if len(probes) < 2:
+        info(f'  Baseline: hanya {len(probes)} probe berhasil (mungkin koneksi terblokir)')
+        return None
+
+    # Cek konsistensi: kalo semua probe return 200 dengan content yang sama -> SPA catch-all
+    all_200 = all(p['status'] == 200 for p in probes)
+    same_size = probes[0]['size'] == probes[1]['size']
+    same_content = probes[0]['content'] == probes[1]['content']
+
+    if all_200 and same_size and (same_content or probes[0]['is_html']):
+        info(f'  SPA catch-all terdeteksi (baseline: {probes[0]["size"]}B, {probes[0]["content_type"]})')
+        return {
+            'detected': 'spa_catchall',
+            'content': probes[0]['content'],
+            'size': probes[0]['size'],
+            'content_hash': hash(probes[0]['content']),
+            'content_type': probes[0]['content_type'],
+            'is_html': probes[0]['is_html'],
+        }
+
+    # Kalo server return 404/403 untuk path random -> handle normal
+    if all(p['status'] in (403, 404) for p in probes):
+        info('  Server handle non-existent paths dengan benar (404/403)')
+        return {'detected': 'proper_404'}
+
+    info(f'  Status probes: {[p["status"] for p in probes]}, sizes: {[p["size"] for p in probes]}')
+    return None
+
+
 
 def sec_headers(sess, base_url, ctx=None):
     """Cek HTTP security headers + info server + cookie."""
@@ -241,15 +301,21 @@ def robots_txt(sess, base_url, ctx=None):
 
 def sensitive_files(sess, base_url, ctx=None):
     """Cari file sensitif yang terekspos publik."""
+    baseline = ctx.get("baseline") if ctx else None
+    if baseline is None:
+        baseline = get_baseline_fingerprint(sess, base_url)
+        if ctx is not None:
+            ctx["baseline"] = baseline
+
     paths = [("/.env","File env (variabel lingkungan) — bisa berisi database password, API key, secret key aplikasi."),
              ("/.git/config","Konfigurasi Git — ekspos source code dan riwayat commit."),
              ("/.git/HEAD","HEAD Git — konfirmasi repositori Git terekspos."),
              ("/.svn/entries","File SVN — ekspos struktur direktori source code."),
              ("/.htpasswd","File htpasswd — berisi kredensial terenkripsi untuk akses terbatas."),
-             ("/phpinfo.php","phpinfo() — informasi konfigurasi PHP lengkap, termasuk path, variabel lingkungan, dan ekstensi."),
-             ("/info.php","phpinfo() — informasi konfigurasi PHP lengkap."),
              ("/dump.sql","Dump database SQL — bisa berisi semua data website."),
              ("/db.sql","File SQL — kemungkinan berisi struktur dan data database."),
+             ("/phpinfo.php","phpinfo() — informasi konfigurasi PHP lengkap, termasuk path, variabel lingkungan, dan ekstensi."),
+             ("/info.php","phpinfo() — informasi konfigurasi PHP lengkap."),
              ("/wp-config.php","Konfigurasi WordPress — berisi kredensial database, secret keys."),
              ("/config.php","File konfigurasi PHP umum."),
              ("/config.php.bak","Backup file konfigurasi — versi lama mungkin tidak aman."),
@@ -257,22 +323,118 @@ def sensitive_files(sess, base_url, ctx=None):
              ("/backup/","Direktori backup — mungkin berisi file sensitif."),
              ("/actuator/health","Spring Boot Actuator health endpoint — informasi kesehatan aplikasi."),
              ("/actuator/info","Spring Boot Actuator info — informasi aplikasi (build, git, env)."),
-             ("/swagger-ui.html","Dokumentasi API Swagger — bisa mengungkap endpoint dan parameter API.")]
+             ("/swagger-ui.html","Dokumentasi API Swagger — bisa mengungkap endpoint dan parameter API."),
+             ("/.env.bak","Backup file env."),
+             ("/.env.local","File env local."),
+             ("/.env.production","File env production."),
+             ("/.env.dev","File env development."),
+             ("/storage/logs/laravel.log","Laravel log — bisa berisi stack trace, query, data sensitif.")]
+
     f = []; info("Mencari file sensitif...")
+
+    def _is_false_positive(r, path):
+        """Cek apakah response adalah SPA catch-all / default page, bukan file asli."""
+        if baseline is None or baseline.get("detected") != "spa_catchall":
+            return False
+        if hash(r.content) == baseline["content_hash"]:
+            return True
+        if baseline["is_html"] and len(r.content) == baseline["size"]:
+            return True
+        return False
+
+    def _is_likely_real_env(content):
+        """Cek apakah konten benar-benar file .env (bukan HTML page)."""
+        text = content[:3000].decode("utf-8", errors="replace")
+        keyval_lines = sum(1 for line in text.split("\n") if "=" in line and not line.strip().startswith("#"))
+        is_plain = not ("<!" in text[:200] or "<html" in text[:500].lower())
+        return is_plain and keyval_lines >= 2
+
+    def _is_likely_real_git_config(content):
+        """Cek apakah konten benar-benar .git/config."""
+        text = content[:2000].decode("utf-8", errors="replace")
+        return "[core]" in text or "repositoryformatversion" in text
+
+    def _is_likely_real_sql_dump(content):
+        """Cek apakah konten benar-benar file SQL dump."""
+        text = content[:2000].decode("utf-8", errors="replace").lower()
+        return any(p in text for p in ["create table", "insert into", "drop table", "create database"])
+
+    def _is_likely_real_phpinfo(content):
+        """Cek apakah konten benar-benar hasil phpinfo()."""
+        text = content[:2000].decode("utf-8", errors="replace")
+        return "phpinfo()" in text or "PHP Version" in text or "php.ini" in text
+
+    def _is_likely_real_admin(content):
+        """Cek apakah konten halaman admin (bukan SPA catch-all)."""
+        if baseline and baseline.get("detected") == "spa_catchall":
+            if hash(content) == baseline["content_hash"]:
+                return False
+        text = content[:3000].decode("utf-8", errors="replace").lower()
+        return any(p in text for p in ["login", "username", "password", "sign in", "dashboard"])
+
     for p, desc in paths:
         try:
             r = sess.get(join(base_url,p), timeout=8)
             if r.status_code==200 and len(r.content)>0 and r.url.rstrip("/")!=base_url.rstrip("/"):
+                # Skip SPA catch-all
+                if _is_false_positive(r, p):
+                    info(f"  {p} -> (false positive — SPA catch-all)")
+                    continue
+
                 size = len(r.content)
-                if any(k in p for k in [".env",".git",".svn",".htpasswd","dump.sql","db.sql"]):
-                    critical(f"File sensitif terekspos: {p} ({size} bytes)")
+
+                if any(k in p for k in [".env"]):
+                    if _is_likely_real_env(r.content):
+                        critical(f"File .env terekspos: {p} ({size} bytes)")
+                        f.append(("CRITICAL","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
+                    else:
+                        info(f"  {p} -> {size}B (bukan .env asli — konten tidak mengandung KEY=VALUE)")
+
+                elif any(k in p for k in [".git"]):
+                    if _is_likely_real_git_config(r.content):
+                        critical(f"File Git terekspos: {p} ({size} bytes)")
+                        f.append(("CRITICAL","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
+                    else:
+                        info(f"  {p} -> {size}B (bukan file Git asli)")
+
+                elif any(k in p for k in ["dump.sql","db.sql"]):
+                    if _is_likely_real_sql_dump(r.content):
+                        critical(f"File SQL terekspos: {p} ({size} bytes)")
+                        f.append(("CRITICAL","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
+                    else:
+                        info(f"  {p} -> {size}B (bukan SQL dump asli)")
+
+                elif ".svn" in p:
+                    critical(f"File SVN terekspos: {p} ({size} bytes)")
                     f.append(("CRITICAL","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
+
+                elif ".htpasswd" in p:
+                    critical(f"File htpasswd terekspos: {p} ({size} bytes)")
+                    f.append(("CRITICAL","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
+
                 elif "phpinfo" in p or "info.php" in p:
-                    critical(f"PHP info publik: {p} ({size} bytes)")
-                    f.append(("HIGH","PHP_INFO",f"File {p} ({size}B) mengekspos konfigurasi PHP lengkap. {desc}", r.url))
+                    if _is_likely_real_phpinfo(r.content):
+                        critical(f"PHP info publik: {p} ({size} bytes)")
+                        f.append(("HIGH","PHP_INFO",f"File {p} ({size}B) mengekspos konfigurasi PHP lengkap. {desc}", r.url))
+                    else:
+                        info(f"  {p} -> {size}B (bukan phpinfo asli)")
+
+                elif p in ("/admin/", "/backup/"):
+                    if _is_likely_real_admin(r.content):
+                        warn(f"Halaman admin/backup: {p} ({size} bytes)")
+                        f.append(("MEDIUM","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
+                    else:
+                        info(f"  {p} -> {size}B (SPA catch-all, bukan halaman admin asli)")
+
+                elif "actuator" in p:
+                    warn(f"Actuator endpoint publik: {p} ({size} bytes)")
+                    f.append(("MEDIUM","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
+
                 else:
+                    # Generic check dengan baseline
                     warn(f"File terakses: {p} ({size} bytes)")
                     f.append(("MEDIUM","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
+
             elif r.status_code==403:
                 info(f"{p} -> 403 (terproteksi)")
         except: pass
@@ -284,10 +446,17 @@ def dir_listing(sess, base_url, ctx=None):
             ("/admin/","direktori admin"),("/assets/","direktori assets"),("/files/","direktori file"),
             ("/css/","direktori CSS"),("/js/","direktori JS")]
     f = []; info("Mengecek directory listing...")
+    baseline = ctx.get("baseline") if ctx else None
     for d, label in dirs:
         try:
             r = sess.get(join(base_url,d), timeout=8)
             if r.status_code==200:
+                # Skip SPA catch-all
+                if baseline and baseline.get("detected") == "spa_catchall":
+                    if hash(r.content) == baseline["content_hash"]:
+                        continue
+                    if baseline["is_html"] and len(r.content) == baseline["size"]:
+                        continue
                 t = r.text.lower()
                 if "index of" in t or "parent directory" in t:
                     critical(f"Directory listing aktif: {d}")
@@ -947,6 +1116,7 @@ def main():
     parser.add_argument("--quick", action="store_true", help="Mode cepat (7 modul, basic checks)")
     parser.add_argument("--detailed", action="store_true", help="Mode lengkap (23 modul, crawl)")
     parser.add_argument("--no-color", action="store_true", help="Output tanpa warna")
+    parser.add_argument("--skip-ssl", action="store_true", help="Nonaktifkan verifikasi SSL (untuk sertifikat self-signed/expired)")
     args = parser.parse_args()
     if args.no_color: DISABLE_COLOR = True
 
@@ -991,7 +1161,11 @@ def main():
     info(f"Start : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
 
-    sess = make_session(timeout=15)
+    verify_ssl = not args.skip_ssl
+    if not verify_ssl:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    sess = make_session(timeout=15, verify_ssl=verify_ssl)
     finds = []
     start = datetime.now()
 
