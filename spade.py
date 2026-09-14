@@ -266,13 +266,13 @@ def sensitive_files(sess, base_url, ctx=None):
                 size = len(r.content)
                 if any(k in p for k in [".env",".git",".svn",".htpasswd","dump.sql","db.sql"]):
                     critical(f"File sensitif terekspos: {p} ({size} bytes)")
-                    f.append(("CRITICAL","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}"))
+                    f.append(("CRITICAL","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
                 elif "phpinfo" in p or "info.php" in p:
                     critical(f"PHP info publik: {p} ({size} bytes)")
-                    f.append(("HIGH","PHP_INFO",f"File {p} ({size}B) mengekspos konfigurasi PHP lengkap. {desc}"))
+                    f.append(("HIGH","PHP_INFO",f"File {p} ({size}B) mengekspos konfigurasi PHP lengkap. {desc}", r.url))
                 else:
                     warn(f"File terakses: {p} ({size} bytes)")
-                    f.append(("MEDIUM","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}"))
+                    f.append(("MEDIUM","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
             elif r.status_code==403:
                 info(f"{p} -> 403 (terproteksi)")
         except: pass
@@ -291,7 +291,7 @@ def dir_listing(sess, base_url, ctx=None):
                 t = r.text.lower()
                 if "index of" in t or "parent directory" in t:
                     critical(f"Directory listing aktif: {d}")
-                    f.append(("HIGH","DIR_LISTING",f"Direktori {d} mengaktifkan directory listing. Siapa pun bisa melihat daftar lengkap file di direktori ini, termasuk file non-publik."))
+                    f.append(("HIGH","DIR_LISTING",f"Direktori {d} mengaktifkan directory listing. Siapa pun bisa melihat daftar lengkap file di direktori ini, termasuk file non-publik.", r.url))
         except: pass
     return f
 
@@ -875,7 +875,10 @@ def gen_html(finds, target, start, end, out):
     rows = ""
     for fi in sf:
         sev = fi[0].lower()
-        rows += f"""<tr class="{sev}"><td><span class="sev-badge {sev}">{fi[0]}</span></td><td>{htmlmod.escape(fi[1]) if len(fi)>1 else ""}</td><td>{htmlmod.escape(fi[2]) if len(fi)>2 else ""}</td></tr>\n"""
+        url_cell = ""
+        if len(fi) > 3 and fi[3]:
+            url_cell = f'<td style="word-break:break-all"><a href="{htmlmod.escape(fi[3])}" target="_blank" rel="noopener" style="color:#58a6ff">{htmlmod.escape(fi[3])}</a></td>'
+        rows += f"""<tr class="{sev}"><td><span class="sev-badge {sev}">{fi[0]}</span></td><td>{htmlmod.escape(fi[1]) if len(fi)>1 else ""}</td><td>{htmlmod.escape(fi[2]) if len(fi)>2 else ""}</td>{url_cell}</tr>\n"""
     sc = defaultdict(int)
     for fi in sf: sc[fi[0]]+=1
     summary = "".join(f'<div class="sev-count {s.lower()}"><strong>{s}:</strong> {c}</div>' for s,c in sorted(sc.items(), key=lambda x: SEV_ORDER.get(x[0],99)))
@@ -911,7 +914,7 @@ tr.info{{border-left:3px solid #8b949e}}
 <h1>Spade Scan Report</h1>
 <p class="subtitle">{htmlmod.escape(target)} &mdash; {end.strftime('%Y-%m-%d %H:%M:%S')}</p>
 <div class="summary"><div class="card"><h3>Duration</h3><div class="val">{dur:.1f}s</div></div><div class="card"><h3>Findings</h3><div class="val">{len(sf)}</div></div><div class="card"><h3>Severity</h3><div style="margin-top:8px">{summary}</div></div></div>
-<table><thead><tr><th style="width:90px">Severity</th><th style="width:200px">Category</th><th>Detail</th></tr></thead><tbody>{rows}</tbody></table>
+<table><thead><tr><th style="width:90px">Severity</th><th style="width:200px">Category</th><th>Detail</th><th style="width:300px">URL</th></tr></thead><tbody>{rows}</tbody></table>
 <div class="footer">spade &mdash; {end.strftime('%Y-%m-%d %H:%M:%S')}</div>
 </div></body></html>"""
     with open(out,"w",encoding="utf-8") as f: f.write(html)
@@ -919,9 +922,9 @@ tr.info{{border-left:3px solid #8b949e}}
 
 def gen_csv(finds, target, out):
     with open(out,"w",newline="",encoding="utf-8") as f:
-        w = csv.writer(f); w.writerow(["Severity","Category","Detail","Target"])
+        w = csv.writer(f); w.writerow(["Severity","Category","Detail","URL","Target"])
         for fi in finds:
-            w.writerow([fi[0], fi[1] if len(fi)>1 else "", fi[2] if len(fi)>2 else "", target])
+            w.writerow([fi[0], fi[1] if len(fi)>1 else "", fi[2] if len(fi)>2 else "", fi[3] if len(fi)>3 else "", target])
 
 # ══════════════════════════════════════════════════════════════════
 # MAIN
