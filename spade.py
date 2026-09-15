@@ -10,7 +10,7 @@ Cara pakai:
   python3 spade.py example.com --csv hasil.csv     # export CSV
 """
 
-import argparse, csv, html as htmlmod, json, os, re, socket, ssl, sys, time
+import argparse, csv, html as htmlmod, json, os, re, socket, ssl, sys, threading, time
 import urllib.parse, urllib.robotparser
 from collections import OrderedDict, defaultdict
 from datetime import datetime
@@ -34,13 +34,47 @@ C = {
 }
 DISABLE_COLOR = False
 
+_OUTPUT_LOCAL = threading.local()
+
 def c(code, t):
     return t if DISABLE_COLOR else f"{C.get(code,'')}{t}{C['reset']}"
-def info(m):   print(f"  {c('blue','[*]')} {m}")
-def good(m):   print(f"  {c('green','[v]')} {m}")
-def warn(m):   print(f"  {c('yellow','[!]')} {m}")
-def err(m):    print(f"  {c('red','[x]')} {m}")
-def critical(m): print(f"  {c('bg_red',c('white','[!!]'))} {c('red',m)}")
+
+def _emit(line):
+    """Tulis ke stdout, atau ke buffer thread-local saat modul dijalankan paralel."""
+    buf = getattr(_OUTPUT_LOCAL, "buf", None)
+    if buf is not None:
+        buf.append(line + "\n")
+    else:
+        print(line)
+
+def info(m):   _emit(f"  {c('blue','[*]')} {m}")
+def good(m):   _emit(f"  {c('green','[v]')} {m}")
+def warn(m):   _emit(f"  {c('yellow','[!]')} {m}")
+def err(m):    _emit(f"  {c('red','[x]')} {m}")
+def critical(m): _emit(f"  {c('bg_red',c('white','[!!]'))} {c('red',m)}")
+
+_CTX_LOCK = threading.Lock()
+
+def ctx_get(ctx, key, producer):
+    """Cache hasil request yang mahal di dalam ctx agar tidak diulang antar modul."""
+    if ctx is None:
+        return producer()
+    with _CTX_LOCK:
+        if key in ctx:
+            return ctx[key]
+    value = producer()
+    with _CTX_LOCK:
+        ctx.setdefault(key, value)
+    return ctx[key]
+
+def get_base_response(sess, base_url, ctx=None):
+    """GET halaman utama sekali, lalu pakai ulang di modul-modul pasif."""
+    def _fetch():
+        try:
+            return sess.get(base_url, timeout=10)
+        except Exception:
+            return None
+    return ctx_get(ctx, ("base_response", base_url), _fetch)
 
 # ── helpers ──
 def normalize_url(url):
@@ -59,14 +93,105 @@ def join(base, path):
 
 def make_session(timeout=15, verify_ssl=True):
     sess = requests.Session()
-    retry = Retry(total=2, backoff_factor=0.5, status_forcelist=[429,500,502,503,504],
-                  allowed_methods={"GET","POST","HEAD","OPTIONS"})
+    # Retry minimal: scanner ini mengirim banyak request, jadi retry agresif
+    # justru memperlambat total (terutama saat target down/slow).
+    retry = Retry(total=1, backoff_factor=0.2, status_forcelist=[429,500,502,503,504],
+                  allowed_methods={"GET","POST","HEAD","OPTIONS"}, respect_retry_after_header=True)
     sess.mount("http://", HTTPAdapter(max_retries=retry))
     sess.mount("https://", HTTPAdapter(max_retries=retry))
     sess.headers["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36"
     sess.verify = verify_ssl
     sess.timeout = timeout
     return sess
+
+
+class ThreadLocalSession:
+    """Proxy Session yang membuat requests.Session terpisah per thread.
+
+    Dipakai supaya request bisa diparalelkan tanpa membuat requests.Session
+    yang sama dipakai bersamaan oleh banyak thread. Objek ini tetap bisa
+    dipakai seperti Session biasa (delegasi atribut ke Session thread terkait).
+    """
+
+    def __init__(self, timeout=15, verify_ssl=True):
+        self._local = threading.local()
+        self.timeout = timeout
+        self.verify_ssl = verify_ssl
+
+    def _session(self):
+        sess = getattr(self._local, "sess", None)
+        if sess is None:
+            sess = make_session(timeout=self.timeout, verify_ssl=self.verify_ssl)
+            self._local.sess = sess
+        return sess
+
+    def __getattr__(self, name):
+        return getattr(self._session(), name)
+
+
+REQUEST_EXECUTOR = None
+DEFAULT_WORKERS = 10
+
+
+def set_request_executor(workers):
+    """Batasi total request paralel untuk seluruh modul."""
+    global REQUEST_EXECUTOR
+    if REQUEST_EXECUTOR is not None:
+        REQUEST_EXECUTOR.shutdown(wait=False)
+        REQUEST_EXECUTOR = None
+    if workers and workers > 1:
+        REQUEST_EXECUTOR = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="spade-req")
+
+
+def pmap(fn, items, workers=None):
+    """Map paralel dengan worker global yang sama untuk semua modul."""
+    items = list(items)
+    if not items:
+        return []
+    if REQUEST_EXECUTOR is None or (workers is not None and workers <= 1):
+        return [fn(x) for x in items]
+    return list(REQUEST_EXECUTOR.map(fn, items))
+
+def pmap_until(fn, items):
+    """Map paralel, berhenti lebih awal begitu ada hasil yang truthy.
+
+    Dipakai modul deteksi (SQLi/XSS/CMDi/...) supaya job sisa tidak ikut
+    dieksekusi setelah satu temuan ditemukan. Ini penghemat besar di mode
+    DETAILED karena jumlah payload × parameter bisa ratusan request.
+    """
+    items = list(items)
+    if not items:
+        return None
+    if REQUEST_EXECUTOR is None:
+        for x in items:
+            out = fn(x)
+            if out:
+                return out
+        return None
+    stop = threading.Event()
+
+    def _wrapped(x):
+        if stop.is_set():
+            return None
+        out = fn(x)
+        if out:
+            stop.set()
+        return out
+
+    futures = [REQUEST_EXECUTOR.submit(_wrapped, x) for x in items]
+    try:
+        for fut in as_completed(futures):
+            out = fut.result()
+            if out:
+                stop.set()
+                for other in futures:
+                    other.cancel()
+                return out
+    except Exception:
+        pass
+    finally:
+        stop.set()
+    return None
 
 # ── HTML form parser ──
 class FormParser(HTMLParser):
@@ -102,25 +227,55 @@ class Crawler:
         p = urllib.parse.urlparse(url)
         return f"{p.scheme}://{p.netloc}{p.path.rstrip('/') or '/'}"
     def _internal(self, url): return urllib.parse.urlparse(url).netloc == self.netloc
-    def crawl(self):
-        q = [(self.base, 0)]
+    def crawl(self, seed_text=None):
+        """BFS per level, fetch semua halaman di level yang sama secara paralel.
+
+        seed_text dipakai kalau halaman root sudah di-fetch modul lain, supaya
+        tidak request base URL dua kali.
+        """
+        level = [self.base]
         self.visited.add(self._norm(self.base))
-        while q and len(self.visited) <= self.max_p:
-            u, d = q.pop(0)
-            if d > self.depth: continue
-            try:
-                r = self.sess.get(u, timeout=10)
-                if r.status_code != 200: continue
-                self.pages[u] = r.text
+        if seed_text is not None:
+            self.pages[self.base] = seed_text
+            level = []
+            for m in re.finditer(r'href=["\'](.*?)["\']', seed_text, re.I):
+                full = urllib.parse.urljoin(self.base, m.group(1)).split("#")[0]
+                n = self._norm(full)
+                if self._internal(full) and n not in self.visited:
+                    if not any(n.lower().endswith(e) for e in (".pdf",".zip",".png",".jpg",".gif",".css",".js",".svg",".ico")):
+                        self.visited.add(n); level.append(n)
+
+        start_depth = 1 if seed_text is not None else 0
+        for d in range(start_depth, self.depth + 1):
+            if not level:
+                break
+            # Batasi jumlah halaman sesuai max_p
+            remaining = self.max_p - len(self.pages)
+            if remaining <= 0:
+                break
+            batch = level[:remaining]
+
+            def _fetch(u):
+                try:
+                    r = self.sess.get(u, timeout=10)
+                    if r.status_code == 200:
+                        return u, r.text
+                except: pass
+                return u, None
+
+            next_level = []
+            for u, text in pmap(_fetch, batch):
+                if text is None:
+                    continue
+                self.pages[u] = text
                 if d < self.depth:
-                    for m in re.finditer(r'href=["\'](.*?)["\']', r.text, re.I):
-                        link = m.group(1)
-                        full = urllib.parse.urljoin(u, link).split("#")[0]
+                    for m in re.finditer(r'href=["\'](.*?)["\']', text, re.I):
+                        full = urllib.parse.urljoin(u, m.group(1)).split("#")[0]
                         n = self._norm(full)
                         if self._internal(full) and n not in self.visited:
                             if not any(n.lower().endswith(e) for e in (".pdf",".zip",".png",".jpg",".gif",".css",".js",".svg",".ico")):
-                                self.visited.add(n); q.append((n, d+1))
-            except: pass
+                                self.visited.add(n); next_level.append(n)
+            level = next_level
         return self.pages
     def get_forms(self):
         forms = []
@@ -131,6 +286,13 @@ class Crawler:
                 forms.append((a, f["method"], f["inputs"], url))
         return forms
 
+def get_forms(ctx):
+    """Parse form satu kali saja, lalu pakai ulang di semua modul."""
+    crawler = ctx.get("crawler") if ctx else None
+    if not crawler or not crawler.pages:
+        return []
+    return ctx_get(ctx, ("forms", id(crawler)), crawler.get_forms)
+
 def is_echo_endpoint(sess, url, timeout=8):
     """Probe endpoint — kalau ngulangin input mentah, skip buat ngurangin false positive."""
     probe = "__xechoprobe__" + str(int(time.time()))
@@ -138,6 +300,10 @@ def is_echo_endpoint(sess, url, timeout=8):
         r = sess.get(url, params={"q": probe}, timeout=timeout)
         return probe in r.text
     except: return False
+
+def echo_skip(sess, url, ctx=None):
+    """Cache hasil is_echo_endpoint supaya tidak diprobe berulang di tiap modul."""
+    return ctx_get(ctx, ("echo", url), lambda: is_echo_endpoint(sess, url))
 
 # ══════════════════════════════════════════════════════════════════
 # SCAN FUNCTIONS — setiap finding pakai deskripsi jelas
@@ -205,8 +371,8 @@ def get_baseline_fingerprint(sess, base_url):
 def sec_headers(sess, base_url, ctx=None):
     """Cek HTTP security headers + info server + cookie."""
     f = []
+    r = get_base_response(sess, base_url, ctx)
     try:
-        r = sess.get(base_url, timeout=10)
         h = r.headers
 
         # Security headers checklist
@@ -265,8 +431,8 @@ def sec_headers(sess, base_url, ctx=None):
 def tech_finger(sess, base_url, ctx=None):
     """Deteksi teknologi dari header dan HTML."""
     f = []; info("Mendeteksi teknologi website...")
+    r = get_base_response(sess, base_url, ctx)
     try:
-        r = sess.get(base_url, timeout=10)
         techs = []
         srv = r.headers.get("Server")
         if srv: techs.append(srv)
@@ -372,72 +538,84 @@ def sensitive_files(sess, base_url, ctx=None):
         text = content[:3000].decode("utf-8", errors="replace").lower()
         return any(p in text for p in ["login", "username", "password", "sign in", "dashboard"])
 
-    for p, desc in paths:
+    def _check(item):
+        """Periksa satu path. Return (findings, log_lines)."""
+        p, desc = item
+        out = []; logs = []
         try:
-            r = sess.get(join(base_url,p), timeout=8)
+            r = sess.get(join(base_url, p), timeout=8)
             if r.status_code==200 and len(r.content)>0 and r.url.rstrip("/")!=base_url.rstrip("/"):
                 # Skip SPA catch-all
                 if _is_false_positive(r, p):
-                    info(f"  {p} -> (false positive — SPA catch-all)")
-                    continue
+                    logs.append(f"  {p} -> (false positive — SPA catch-all)")
+                    return out, logs
 
                 size = len(r.content)
 
                 if any(k in p for k in [".env"]):
                     if _is_likely_real_env(r.content):
-                        critical(f"File .env terekspos: {p} ({size} bytes)")
-                        f.append(("CRITICAL","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
+                        logs.append(f"!CRIT!File .env terekspos: {p} ({size} bytes)")
+                        out.append(("CRITICAL","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
                     else:
-                        info(f"  {p} -> {size}B (bukan .env asli — konten tidak mengandung KEY=VALUE)")
+                        logs.append(f"  {p} -> {size}B (bukan .env asli — konten tidak mengandung KEY=VALUE)")
 
                 elif any(k in p for k in [".git"]):
                     if _is_likely_real_git_config(r.content):
-                        critical(f"File Git terekspos: {p} ({size} bytes)")
-                        f.append(("CRITICAL","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
+                        logs.append(f"!CRIT!File Git terekspos: {p} ({size} bytes)")
+                        out.append(("CRITICAL","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
                     else:
-                        info(f"  {p} -> {size}B (bukan file Git asli)")
+                        logs.append(f"  {p} -> {size}B (bukan file Git asli)")
 
                 elif any(k in p for k in ["dump.sql","db.sql"]):
                     if _is_likely_real_sql_dump(r.content):
-                        critical(f"File SQL terekspos: {p} ({size} bytes)")
-                        f.append(("CRITICAL","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
+                        logs.append(f"!CRIT!File SQL terekspos: {p} ({size} bytes)")
+                        out.append(("CRITICAL","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
                     else:
-                        info(f"  {p} -> {size}B (bukan SQL dump asli)")
+                        logs.append(f"  {p} -> {size}B (bukan SQL dump asli)")
 
                 elif ".svn" in p:
-                    critical(f"File SVN terekspos: {p} ({size} bytes)")
-                    f.append(("CRITICAL","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
+                    logs.append(f"!CRIT!File SVN terekspos: {p} ({size} bytes)")
+                    out.append(("CRITICAL","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
 
                 elif ".htpasswd" in p:
-                    critical(f"File htpasswd terekspos: {p} ({size} bytes)")
-                    f.append(("CRITICAL","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
+                    logs.append(f"!CRIT!File htpasswd terekspos: {p} ({size} bytes)")
+                    out.append(("CRITICAL","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
 
                 elif "phpinfo" in p or "info.php" in p:
                     if _is_likely_real_phpinfo(r.content):
-                        critical(f"PHP info publik: {p} ({size} bytes)")
-                        f.append(("HIGH","PHP_INFO",f"File {p} ({size}B) mengekspos konfigurasi PHP lengkap. {desc}", r.url))
+                        logs.append(f"!CRIT!PHP info publik: {p} ({size} bytes)")
+                        out.append(("HIGH","PHP_INFO",f"File {p} ({size}B) mengekspos konfigurasi PHP lengkap. {desc}", r.url))
                     else:
-                        info(f"  {p} -> {size}B (bukan phpinfo asli)")
+                        logs.append(f"  {p} -> {size}B (bukan phpinfo asli)")
 
                 elif p in ("/admin/", "/backup/"):
                     if _is_likely_real_admin(r.content):
-                        warn(f"Halaman admin/backup: {p} ({size} bytes)")
-                        f.append(("MEDIUM","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
+                        logs.append(f"!WARN!Halaman admin/backup: {p} ({size} bytes)")
+                        out.append(("MEDIUM","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
                     else:
-                        info(f"  {p} -> {size}B (SPA catch-all, bukan halaman admin asli)")
+                        logs.append(f"  {p} -> {size}B (SPA catch-all, bukan halaman admin asli)")
 
                 elif "actuator" in p:
-                    warn(f"Actuator endpoint publik: {p} ({size} bytes)")
-                    f.append(("MEDIUM","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
+                    logs.append(f"!WARN!Actuator endpoint publik: {p} ({size} bytes)")
+                    out.append(("MEDIUM","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
 
                 else:
                     # Generic check dengan baseline
-                    warn(f"File terakses: {p} ({size} bytes)")
-                    f.append(("MEDIUM","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
+                    logs.append(f"!WARN!File terakses: {p} ({size} bytes)")
+                    out.append(("MEDIUM","SENSITIVE_FILE",f"File {p} ({size}B) dapat diakses publik. {desc}", r.url))
 
             elif r.status_code==403:
-                info(f"{p} -> 403 (terproteksi)")
+                logs.append(f"{p} -> 403 (terproteksi)")
         except: pass
+        return out, logs
+
+    results = pmap(_check, paths)
+    for out, logs in results:
+        f.extend(out)
+        for line in logs:
+            if line.startswith("!CRIT!"): critical(line[6:])
+            elif line.startswith("!WARN!"): warn(line[6:])
+            else: info(line)
     return f
 
 def dir_listing(sess, base_url, ctx=None):
@@ -447,37 +625,55 @@ def dir_listing(sess, base_url, ctx=None):
             ("/css/","direktori CSS"),("/js/","direktori JS")]
     f = []; info("Mengecek directory listing...")
     baseline = ctx.get("baseline") if ctx else None
-    for d, label in dirs:
+
+    def _check(item):
+        d, label = item
+        out = []
         try:
-            r = sess.get(join(base_url,d), timeout=8)
+            r = sess.get(join(base_url, d), timeout=8)
             if r.status_code==200:
                 # Skip SPA catch-all
                 if baseline and baseline.get("detected") == "spa_catchall":
                     if hash(r.content) == baseline["content_hash"]:
-                        continue
+                        return out
                     if baseline["is_html"] and len(r.content) == baseline["size"]:
-                        continue
+                        return out
                 t = r.text.lower()
                 if "index of" in t or "parent directory" in t:
-                    critical(f"Directory listing aktif: {d}")
-                    f.append(("HIGH","DIR_LISTING",f"Direktori {d} mengaktifkan directory listing. Siapa pun bisa melihat daftar lengkap file di direktori ini, termasuk file non-publik.", r.url))
+                    out.append(("HIGH","DIR_LISTING",f"Direktori {d} mengaktifkan directory listing. Siapa pun bisa melihat daftar lengkap file di direktori ini, termasuk file non-publik.", r.url))
         except: pass
+        return out
+
+    for out in pmap(_check, dirs):
+        for sev, code, desc, url in out:
+            critical(f"Directory listing aktif: {urllib.parse.urlparse(url).path}")
+            f.append((sev, code, desc, url))
     return f
 
 def http_methods(sess, base_url, ctx=None):
     f = []; info("Memeriksa metode HTTP...")
-    for m in ["PUT","DELETE","TRACE","OPTIONS"]:
+    def _check(m):
+        out = []
         try:
             r = sess.request(m, base_url, timeout=8)
             if m=="OPTIONS":
                 a = r.headers.get("Allow","")
                 if a and ("PUT" in a.upper() or "DELETE" in a.upper()):
-                    critical(f"Metode berbahaya diizinkan: {a}")
-                    f.append(("HIGH","HTTP_METHOD",f"Server mengizinkan metode PUT/DELETE: {a}. PUT bisa dipakai unggah file berbahaya, DELETE bisa hapus resource."))
+                    out.append(("HIGH","HTTP_METHOD",f"Server mengizinkan metode PUT/DELETE: {a}. PUT bisa dipakai unggah file berbahaya, DELETE bisa hapus resource.", None))
             if m=="TRACE" and r.status_code==200:
-                critical("Metode TRACE aktif")
-                f.append(("MEDIUM","TRACE_ENABLED","Metode HTTP TRACE aktif. Bisa dieksploitasi untuk Cross-Site Tracing (XST) — mencuri cookie HttpOnly via JavaScript."))
+                out.append(("MEDIUM","TRACE_ENABLED","Metode HTTP TRACE aktif. Bisa dieksploitasi untuk Cross-Site Tracing (XST) — mencuri cookie HttpOnly via JavaScript.", None))
         except: pass
+        return out
+
+    results = pmap(_check, ["PUT","DELETE","TRACE","OPTIONS"])
+    for out in results:
+        for item in out:
+            sev, code, desc = item[0], item[1], item[2]
+            if code == "HTTP_METHOD":
+                critical("Metode berbahaya diizinkan di target")
+            else:
+                critical("Metode TRACE aktif")
+            f.append((sev, code, desc))
     return f
 
 def cors_check(sess, base_url, ctx=None):
@@ -539,43 +735,56 @@ def tls_ssl(sess, base_url, ctx=None):
 
 def scan_sqli(sess, base_url, ctx=None):
     f = []; info("Menguji SQL injection...")
-    if is_echo_endpoint(sess, base_url):
+    if echo_skip(sess, base_url, ctx):
         info("  (dilewati: endpoint memantulkan input)")
         return f
     crawler = ctx.get("crawler") if ctx else None
-    forms = crawler.get_forms() if crawler else []
+    forms = get_forms(ctx)
     payloads = [("'","petik tunggal"),("' OR '1'='1","OR true"),("' OR 1=1--","OR true komentar"),
                 ("' UNION SELECT NULL--","UNION"),("' AND SLEEP(3)--","time-based")]
     errs = ["sql","mysql","syntax error","unclosed quotation","odbc","driver","warning: mysql","pg_query","sqlite","ora-"]
-    tested = 0
+    tested = [0]
     # Cek URL params
-    for p in ["id","page","p","q","cat","user","uid"]:
+    def _check_url(p):
         for payload, label in payloads:
             try:
                 r = sess.get(base_url, params={p: payload}, timeout=10)
                 if any(e in r.text.lower() for e in errs) and len(r.text)<50000:
-                    critical(f"SQL injection via parameter '{p}' dengan payload '{label}'")
-                    f.append(("HIGH","SQLI",f"Parameter URL '{p}' rentan SQL injection (error-based, payload: {label}). Attacker bisa membaca/mengubah database. URL: {base_url}?{p}={payload[:30]}"))
+                    return [("HIGH","SQLI",f"Parameter URL '{p}' rentan SQL injection (error-based, payload: {label}). Attacker bisa membaca/mengubah database. URL: {base_url}?{p}={payload[:30]}", f"{base_url}?{p}={payload[:30]}", f"SQL injection via parameter '{p}' dengan payload '{label}'")]
+            except: pass
+        return []
+    out = pmap_until(_check_url, ["id","page","p","q","cat","user","uid"])
+    if out:
+        for sev, code, desc, url, msg in out:
+            critical(msg)
+            f.append((sev, code, desc, url))
+    # Cek form params
+    def _check_form(job):
+        action, method, inputs, page, inp = job
+        out = []
+        for payload, label in payloads:
+            try:
+                p = {inp["name"]: payload}
+                url = join(base_url, action)
+                r = sess.get(url, params=p, timeout=10) if method=="GET" else sess.post(url, data=p, timeout=10)
+                if any(e in r.text.lower() for e in errs) and len(r.text)<50000:
+                    out.append(("HIGH","SQLI",f"Form field '{inp['name']}' di {action} rentan SQL injection (error-based, payload: {label}). Attacker bisa membaca/mengubah database.", action, f"SQL injection via field '{inp['name']}' di form {action}"))
                     break
             except: pass
-        else: continue
-        break
-    # Cek form params
+        return out
+    jobs = []
     for action,method,inputs,page in forms:
         for inp in inputs:
             if inp["type"] in ("text","search","textarea","hidden","") and inp["name"]:
-                for payload, label in payloads:
-                    try:
-                        p = {inp["name"]: payload}
-                        url = join(base_url,action)
-                        r = sess.get(url, params=p, timeout=10) if method=="GET" else sess.post(url, data=p, timeout=10)
-                        if any(e in r.text.lower() for e in errs) and len(r.text)<50000:
-                            critical(f"SQL injection via field '{inp['name']}' di form {action}")
-                            f.append(("HIGH","SQLI",f"Form field '{inp['name']}' di {action} rentan SQL injection (error-based, payload: {label}). Attacker bisa membaca/mengubah database."))
-                            break
-                    except: pass
-                tested += 1
-    info(f"SQLi: {tested} parameter diuji")
+                jobs.append((action, method, inputs, page, inp))
+    tested[0] = len(jobs)
+    if jobs:
+        out = pmap_until(_check_form, jobs)
+        if out:
+            for sev, code, desc, url, msg in out:
+                critical(msg)
+                f.append((sev, code, desc, url))
+    info(f"SQLi: {tested[0]} parameter diuji")
     return f
 
 def scan_xss(sess, base_url, ctx=None):
@@ -589,37 +798,46 @@ def scan_xss(sess, base_url, ctx=None):
     params = ["q","s","search","query","id","page","name","text","term","keyword","msg","message","subject","comment"]
     
     # ── Reflected XSS via GET ──
-    for payload in payloads:
-        for p in params:
-            try:
-                r = sess.get(base_url, params={p: payload}, timeout=10)
-                if payload in r.text:
-                    critical(f"XSS terdeteksi di parameter '{p}' (GET)")
-                    f.append(("HIGH","XSS_REFLECTED",f"Parameter '{p}' memantulkan tag script mentah — reflected XSS. Attacker bisa menjalankan JavaScript di browser korban. URL: {r.url}"))
-                    break
-            except: pass
-        else: continue
-        break
+    def _check_get(job):
+        p, payload = job
+        try:
+            r = sess.get(base_url, params={p: payload}, timeout=10)
+            if payload in r.text:
+                return [("HIGH","XSS_REFLECTED",f"Parameter '{p}' memantulkan tag script mentah — reflected XSS. Attacker bisa menjalankan JavaScript di browser korban. URL: {r.url}", r.url, f"XSS terdeteksi di parameter '{p}' (GET)")]
+        except: pass
+        return []
+    out = pmap_until(_check_get, [(p, pl) for pl in payloads for p in params])
+    if out:
+        for sev, code, desc, url, msg in out:
+            critical(msg)
+            f.append((sev, code, desc, url))
 
     # ── XSS via form POST (dari crawler) ──
     crawler = ctx.get("crawler") if ctx else None
     if crawler:
-        forms = crawler.get_forms()
+        forms = get_forms(ctx)
+        def _check_post(job):
+            action, inputs, page, payload = job
+            text_inputs = [i for i in inputs if i["type"] in ("text","search","textarea","") and i["name"]]
+            if not text_inputs: return []
+            data = {i["name"]: payload for i in inputs if i["name"]}
+            try:
+                r = sess.post(action, data=data, timeout=10)
+                if payload in r.text:
+                    return [("HIGH","XSS_POST",f"Form POST di {page} (action: {action}) rentan XSS. Field {text_inputs[0]['name']} memantulkan payload JavaScript. Attacker bisa mengirim link ke korban yang mengeksekusi script di browser mereka.", action, f"XSS terdeteksi via POST form {action}")]
+            except: pass
+            return []
+        jobs = []
         for action,method,inputs,page in forms:
             if method.upper() != "POST": continue
-            text_inputs = [i for i in inputs if i["type"] in ("text","search","textarea","") and i["name"]]
-            if not text_inputs: continue
             for payload in payloads:
-                data = {i["name"]: payload for i in inputs if i["name"]}
-                try:
-                    r = sess.post(action, data=data, timeout=10)
-                    if payload in r.text:
-                        critical(f"XSS terdeteksi via POST form {action}")
-                        f.append(("HIGH","XSS_POST",f"Form POST di {page} (action: {action}) rentan XSS. Field {text_inputs[0]['name']} memantulkan payload JavaScript. Attacker bisa mengirim link ke korban yang mengeksekusi script di browser mereka."))
-                        break
-                except: pass
-            else: continue
-            break
+                jobs.append((action, inputs, page, payload))
+        if jobs:
+            out = pmap_until(_check_post, jobs)
+            if out:
+                for sev, code, desc, url, msg in out:
+                    critical(msg)
+                    f.append((sev, code, desc, url))
         
         # ── Stored XSS — submit lalu cek halaman lain ──
         if not any("XSS" in x[0] for x in f):
@@ -645,39 +863,45 @@ def scan_xss(sess, base_url, ctx=None):
 
 def open_redirect(sess, base_url, ctx=None):
     f = []; info("Menguji open redirect...")
-    for param in ["next","redirect","url","return","to","dest","goto"]:
+    def _check(param):
         try:
             r = sess.get(base_url, params={param: "https://evil.com"}, timeout=10, allow_redirects=False)
             if r.status_code in (301,302,303,307,308) and "evil.com" in r.headers.get("Location",""):
-                critical(f"Open redirect via parameter '{param}'")
-                f.append(("HIGH","OPEN_REDIRECT",f"Parameter '{param}' di {base_url} mengarahkan browser ke URL eksternal tanpa validasi. Attacker bisa memanfaatkan ini untuk phishing (mengelabui korban mengklik link yang mengarah ke situs jahat)."))
-                break
+                return [("HIGH","OPEN_REDIRECT",f"Parameter '{param}' di {base_url} mengarahkan browser ke URL eksternal tanpa validasi. Attacker bisa memanfaatkan ini untuk phishing (mengelabui korban mengklik link yang mengarah ke situs jahat).", r.url, f"Open redirect via parameter '{param}'")]
         except: pass
+        return []
+    out = pmap_until(_check, ["next","redirect","url","return","to","dest","goto"])
+    if out:
+        for sev, code, desc, url, msg in out:
+            critical(msg)
+            f.append((sev, code, desc, url))
     return f
 
 def lfi_check(sess, base_url, ctx=None):
     f = []; info("Menguji LFI / path traversal...")
-    if is_echo_endpoint(sess, base_url):
+    if echo_skip(sess, base_url, ctx):
         info("  (dilewati: endpoint memantulkan input)")
         return f
-    for param in ["file","page","include","path","doc","load"]:
-        for payload in ["../../etc/passwd","../../etc/hosts"]:
-            try:
-                r = sess.get(base_url, params={param: payload}, timeout=10)
-                body = r.text.lower()
-                if ("root:" in body or "daemon:" in body):
-                    if "../../etc/passwd" not in r.text.lower()[:500]:
-                        critical(f"LFI terdeteksi via parameter '{param}'")
-                        f.append(("HIGH","LFI",f"Parameter '{param}' di {base_url} memungkinkan pembacaan file server (path traversal). Attacker bisa membaca /etc/passwd dan file sensitif lainnya. Payload: {payload}"))
-                        break
-            except: pass
-        else: continue
-        break
+    def _check(job):
+        param, payload = job
+        try:
+            r = sess.get(base_url, params={param: payload}, timeout=10)
+            body = r.text.lower()
+            if ("root:" in body or "daemon:" in body):
+                if "../../etc/passwd" not in r.text.lower()[:500]:
+                    return [("HIGH","LFI",f"Parameter '{param}' di {base_url} memungkinkan pembacaan file server (path traversal). Attacker bisa membaca /etc/passwd dan file sensitif lainnya. Payload: {payload}", r.url, f"LFI terdeteksi via parameter '{param}'")]
+        except: pass
+        return []
+    out = pmap_until(_check, [(p, pl) for p in ["file","page","include","path","doc","load"] for pl in ["../../etc/passwd","../../etc/hosts"]])
+    if out:
+        for sev, code, desc, url, msg in out:
+            critical(msg)
+            f.append((sev, code, desc, url))
     return f
 
 def cmd_injection(sess, base_url, ctx=None):
     f = []; info("Menguji command injection...")
-    if is_echo_endpoint(sess, base_url):
+    if echo_skip(sess, base_url, ctx):
         info("  (dilewati: endpoint memantulkan input)")
         return f
     
@@ -685,38 +909,56 @@ def cmd_injection(sess, base_url, ctx=None):
     cmd_payloads = [("; id","titik koma + id"),("| id","pipe + id"),("`id`","backtick"),("$(whoami)","subshell")]
     
     # ── Cek GET params ──
-    for path in ["/","/ping","/exec","/cmd","/run","/api/exec"]:
-        for payload,label in cmd_payloads:
-            for param in cmd_params:
-                try:
-                    r = sess.get(join(base_url,path), params={param: payload}, timeout=10)
-                    body = r.text
-                    if ("uid=" in body or "gid=" in body) and not any(x in body for x in ["whoami","id","git"]):
-                        critical(f"Command injection di {path} via '{param}' (GET)")
-                        f.append(("HIGH","CMD_INJECTION",f"Command injection di {path} via parameter '{param}' (GET). Payload: {label}. Attacker bisa menjalankan perintah shell di server dengan hak akses web server."))
-                        return f
-                except: pass
+    def _check_get(job):
+        path, param, payload, label = job
+        try:
+            r = sess.get(join(base_url, path), params={param: payload}, timeout=10)
+            body = r.text
+            if ("uid=" in body or "gid=" in body) and not any(x in body for x in ["whoami","id","git"]):
+                return [("HIGH","CMD_INJECTION",f"Command injection di {path} via parameter '{param}' (GET). Payload: {label}. Attacker bisa menjalankan perintah shell di server dengan hak akses web server.", r.url, f"Command injection di {path} via '{param}' (GET)")]
+        except: pass
+        return []
+    jobs = [(path, param, payload, label)
+            for path in ["/","/ping","/exec","/cmd","/run","/api/exec"]
+            for payload, label in cmd_payloads
+            for param in cmd_params]
+    out = pmap_until(_check_get, jobs)
+    if out:
+        for sev, code, desc, url, msg in out:
+            critical(msg)
+            f.append((sev, code, desc, url))
+        return f
     
     # ── Cek POST form ──
     crawler = ctx.get("crawler") if ctx else None
     if crawler:
-        forms = crawler.get_forms()
+        forms = get_forms(ctx)
+        def _check_post(job):
+            action, inputs, page, payload, label, field = job
+            data = {}
+            for i in inputs:
+                if i["name"]:
+                    data[i["name"]] = payload if i["name"] == field else "test"
+            try:
+                r = sess.post(action, data=data, timeout=10)
+                body = r.text
+                if ("uid=" in body or "gid=" in body) and not any(x in body for x in ["whoami","id","git"]):
+                    return [("HIGH","CMD_INJECTION_POST",f"Form POST di {page} (action: {action}) rentan command injection via field '{field}' dengan payload {label}. Attacker bisa menjalankan perintah shell di server.", action, f"Command injection via POST form {action} (field: {field})")]
+            except: pass
+            return []
+        jobs = []
         for action,method,inputs,page in forms:
             if method.upper() != "POST": continue
             text_inputs = [i for i in inputs if i["type"] in ("text","search","textarea","") and i["name"]]
             if not text_inputs: continue
             for payload,label in cmd_payloads:
-                data = {}
-                for i in inputs:
-                    if i["name"]: data[i["name"]] = payload if i == text_inputs[0] else "test"
-                try:
-                    r = sess.post(action, data=data, timeout=10)
-                    body = r.text
-                    if ("uid=" in body or "gid=" in body) and not any(x in body for x in ["whoami","id","git"]):
-                        critical(f"Command injection via POST form {action} (field: {text_inputs[0]['name']})")
-                        f.append(("HIGH","CMD_INJECTION_POST",f"Form POST di {page} (action: {action}) rentan command injection via field '{text_inputs[0]['name']}' dengan payload {label}. Attacker bisa menjalankan perintah shell di server."))
-                        return f
-                except: pass
+                jobs.append((action, inputs, page, payload, label, text_inputs[0]["name"]))
+        out = pmap_until(_check_post, jobs)
+        if out:
+            for sev, code, desc, url, msg in out:
+                critical(msg)
+                f.append((sev, code, desc, url))
+            return f
     return f
 
 def ssrf_check(sess, base_url, ctx=None):
@@ -725,80 +967,102 @@ def ssrf_check(sess, base_url, ctx=None):
     ssrf_payloads = ["url","uri","link","href","src","ref","reference","callback","redirect","return","next","path","file","document","image","img","target"]
     
     # ── Cek endpoint umum via GET ──
-    for path in ["/proxy","/fetch","/curl","/api/proxy","/api/fetch","/api/url","/fetch-url","/proxy?url="]:
-        for param in ["url","uri","target"]:
-            try:
-                target = join(base_url,path)
-                r = sess.get(target, params={param:ssrf_url}, timeout=10)
-                if r.status_code in (200,301,302) and len(r.content)>10:
-                    warn(f"Kemungkinan SSRF: {path}?{param}=...")
-                    f.append(("MEDIUM","SSRF",f"Endpoint {path} dengan parameter '{param}' menerima URL eksternal dan merespons. Jika server memproses URL internal (seperti 169.254.169.254 untuk metadata AWS/GCP), attacker bisa mencuri kredensial cloud."))
-                    break
-            except: pass
+    def _check_get(job):
+        path, param = job
+        try:
+            target = join(base_url, path)
+            r = sess.get(target, params={param:ssrf_url}, timeout=10)
+            if r.status_code in (200,301,302) and len(r.content)>10:
+                return [("MEDIUM","SSRF",f"Endpoint {path} dengan parameter '{param}' menerima URL eksternal dan merespons. Jika server memproses URL internal (seperti 169.254.169.254 untuk metadata AWS/GCP), attacker bisa mencuri kredensial cloud.", r.url, f"Kemungkinan SSRF: {path}?{param}=...")]
+        except: pass
+        return []
+    jobs = [(path, param)
+            for path in ["/proxy","/fetch","/curl","/api/proxy","/api/fetch","/api/url","/fetch-url","/proxy?url="]
+            for param in ["url","uri","target"]]
+    out = pmap_until(_check_get, jobs)
+    if out:
+        for sev, code, desc, url, msg in out:
+            warn(msg)
+            f.append((sev, code, desc, url))
     
     # ── SSRF via form POST (crawler) ──
     crawler = ctx.get("crawler") if ctx else None
     if crawler:
-        forms = crawler.get_forms()
-        for action,method,inputs,page in forms:
-            if method.upper() != "POST": continue
-            url_fields = [i for i in inputs if i["name"] and any(kw in i["name"].lower() for kw in ssrf_payloads)]
-            if not url_fields: continue
-            url_field = url_fields[0]["name"]
+        forms = get_forms(ctx)
+        def _check_post(job):
+            action, inputs, page, url_field = job
             data = {}
             for i in inputs:
                 if i["name"]:
                     data[i["name"]] = ssrf_url if i["name"] == url_field else "test"
+            out = []
             try:
                 r = sess.post(action, data=data, timeout=10)
-                # Cek apakah server mem-fetch URL (metadata response muncul)
                 if "169.254.169.254" in r.text or len(r.content) > 1000:
-                    warn(f"Kemungkinan SSRF via form field '{url_field}' di {action}")
-                    f.append(("MEDIUM","SSRF_FORM",f"Form POST di {page} (action: {action}) memiliki field '{url_field}' yang mungkin diproses server sebagai URL. Attacker bisa memanfaatkan ini untuk SSRF — membaca metadata cloud internal atau memindai port jaringan internal."))
-                # Cek apakah ada error connection timeout (indikasi fetch attempt)
+                    out.append(("MEDIUM","SSRF_FORM",f"Form POST di {page} (action: {action}) memiliki field '{url_field}' yang mungkin diproses server sebagai URL. Attacker bisa memanfaatkan ini untuk SSRF — membaca metadata cloud internal atau memindai port jaringan internal.", action, f"Kemungkinan SSRF via form field '{url_field}' di {action}"))
                 elif "timed out" in r.text.lower() or "connection refused" in r.text.lower() or "couldn't connect" in r.text.lower():
-                    warn(f"SSRF indikasi: field '{url_field}' di {action} mencoba fetch URL (error timeout)")
-                    f.append(("LOW","SSRF_TIMEOUT",f"Field '{url_field}' di form {action} menyebabkan timeout/connection error saat dikirim URL eksternal — indikasi server mencoba mengakses URL tersebut."))
+                    out.append(("LOW","SSRF_TIMEOUT",f"Field '{url_field}' di form {action} menyebabkan timeout/connection error saat dikirim URL eksternal — indikasi server mencoba mengakses URL tersebut.", action, f"SSRF indikasi: field '{url_field}' di {action} mencoba fetch URL (error timeout)"))
             except: pass
+            return out
+        jobs = []
+        for action,method,inputs,page in forms:
+            if method.upper() != "POST": continue
+            url_fields = [i for i in inputs if i["name"] and any(kw in i["name"].lower() for kw in ssrf_payloads)]
+            if not url_fields: continue
+            jobs.append((action, inputs, page, url_fields[0]["name"]))
+        out = pmap_until(_check_post, jobs)
+        if out:
+            for sev, code, desc, url, msg in out:
+                warn(msg)
+                f.append((sev, code, desc, url))
     return f
 
 def rate_limit(sess, base_url, ctx=None):
     f = []; info("Menguji rate limiting...")
-    try:
-        for _ in range(15):
+    def _probe(_):
+        try:
             r = sess.get(base_url, timeout=8)
-            if r.status_code==429:
-                good("Rate limiting aktif (HTTP 429)")
-                f.append(("INFO","RATE_LIMIT","Rate limiting aktif — server mengembalikan HTTP 429 setelah beberapa permintaan cepat. Melindungi dari brute force."))
-                return f
+            return r.status_code
+        except: pass
+        return None
+    statuses = pmap(_probe, list(range(15)))
+    if 429 in statuses:
+        good("Rate limiting aktif (HTTP 429)")
+        f.append(("INFO","RATE_LIMIT","Rate limiting aktif — server mengembalikan HTTP 429 setelah beberapa permintaan cepat. Melindungi dari brute force."))
+    else:
         warn("Tidak ada rate limiting")
         f.append(("LOW","NO_RATE_LIMIT","Tidak ada rate limiting — server tidak memblokir permintaan berulang (tidak ada HTTP 429 setelah 15 permintaan cepat). Rentan brute force login, credential stuffing."))
-    except: pass
     return f
 
 # ── DETAILED modules ──
 
 def scan_ssti(sess, base_url, ctx=None):
     f = []; info("Menguji SSTI (Server-Side Template Injection)...")
-    if is_echo_endpoint(sess, base_url):
+    if echo_skip(sess, base_url, ctx):
         info("  (dilewati: endpoint memantulkan input)")
         return f
     crawler = ctx.get("crawler") if ctx else None
     params = [("q",False),("name",False),("search",False),("user",False)]
     if crawler:
-        for a,m,inps,p in crawler.get_forms():
+        for a,m,inps,p in get_forms(ctx):
             for i in inps:
                 if i["type"] in ("text","search","textarea","") and i["name"]: params.append((i["name"],True))
     tests = [("{{7*7}}","49","Jinja2/Twig"),("{{7*'7'}}","7777777","Jinja2"),("${7*7}","49","Freemarker")]
-    for param,_ in params:
-        for payload, expected, engine in tests:
-            try:
-                r = sess.get(base_url, params={param: payload}, timeout=10)
-                if expected.lower() in r.text and payload.lower() not in r.text:
-                    critical(f"SSTI terdeteksi: '{param}' menggunakan engine {engine}")
-                    f.append(("HIGH","SSTI",f"Parameter '{param}' di {base_url} rentan Server-Side Template Injection (engine: {engine}). Payload '{payload}' dieksekusi server menjadi '{expected}'. Attacker bisa menjalankan kode remote (RCE), membaca file, atau mengakses variabel lingkungan server."))
-                    return f
-            except: pass
+    def _check(job):
+        param, payload, expected, engine = job
+        try:
+            r = sess.get(base_url, params={param: payload}, timeout=10)
+            if expected.lower() in r.text and payload.lower() not in r.text:
+                return [("HIGH","SSTI",f"Parameter '{param}' di {base_url} rentan Server-Side Template Injection (engine: {engine}). Payload '{payload}' dieksekusi server menjadi '{expected}'. Attacker bisa menjalankan kode remote (RCE), membaca file, atau mengakses variabel lingkungan server.", r.url, f"SSTI terdeteksi: '{param}' menggunakan engine {engine}")]
+        except: pass
+        return []
+    jobs = [(param, payload, expected, engine) for param, _ in params for payload, expected, engine in tests]
+    out = pmap_until(_check, jobs)
+    if out:
+        for sev, code, desc, url, msg in out:
+            critical(msg)
+            f.append((sev, code, desc, url))
+        return f
     return f
 
 def scan_xxe(sess, base_url, ctx=None):
@@ -812,22 +1076,44 @@ def scan_xxe(sess, base_url, ctx=None):
     
     # ── Kirim langsung ke endpoint umum dengan Content-Type XML ──
     xxe_paths = ["/api/xml","/xml","/soap","/api/soap","/api/upload","/ws","/api/ws"]
-    for path in xxe_paths:
-        url = join(base_url, path)
-        for payload in xxe_payloads:
-            try:
-                r = requests.post(url, data=payload, headers={"Content-Type": "application/xml"}, timeout=10)
-                body = r.text.lower()
-                if "root:" in body and ":" in body and "/bin/bash" in body:
-                    critical(f"XXE terdeteksi di {url}")
-                    f.append(("HIGH","XXE_DIRECT",f"XXE di {url}: payload XML mentah berhasil membaca /etc/passwd. Attacker bisa membaca file server (konfigurasi, kredensial, source code), melakukan SSRF ke jaringan internal, atau denial of service (Billion Laughs)."))
-                    return f
-            except: pass
+    def _check_direct(job):
+        url, payload = job
+        try:
+            r = sess.post(url, data=payload, headers={"Content-Type": "application/xml"}, timeout=10)
+            body = r.text.lower()
+            if "root:" in body and ":" in body and "/bin/bash" in body:
+                return [("HIGH","XXE_DIRECT",f"XXE di {url}: payload XML mentah berhasil membaca /etc/passwd. Attacker bisa membaca file server (konfigurasi, kredensial, source code), melakukan SSRF ke jaringan internal, atau denial of service (Billion Laughs).", url, f"XXE terdeteksi di {url}")]
+        except: pass
+        return []
+    jobs = [(join(base_url, path), payload) for path in xxe_paths for payload in xxe_payloads]
+    out = pmap_until(_check_direct, jobs)
+    if out:
+        for sev, code, desc, url, msg in out:
+            critical(msg)
+            f.append((sev, code, desc, url))
+        return f
     
     # ── XXE via form POST ──
     crawler = ctx.get("crawler") if ctx else None
     if crawler:
-        forms = crawler.get_forms()
+        forms = get_forms(ctx)
+        def _check_form(job):
+            action, inputs, page, payload = job
+            data = {}
+            for i in inputs:
+                if i["name"]:
+                    if "xml" in i["name"].lower():
+                        data[i["name"]] = payload
+                    else:
+                        data[i["name"]] = "test"
+            try:
+                r = sess.post(join(base_url, action), data=data, timeout=10)
+                body = r.text.lower()
+                if "root:" in body and ":" in body and "/bin/bash" in body:
+                    return [("HIGH","XXE_FORM",f"XXE di form {page} (action: {action}): field XML menerima entity eksternal dan mengeksekusi pembacaan file. Attacker bisa membaca file server sensitif.", action, f"XXE terdeteksi via form {action}")]
+            except: pass
+            return []
+        jobs = []
         for action,method,inputs,page in forms:
             if method.upper() != "POST": continue
             types = {i["type"] for i in inputs}
@@ -836,38 +1122,33 @@ def scan_xxe(sess, base_url, ctx=None):
             has_xml_field = any("xml" in i["name"].lower() for i in text_inputs)
             if not has_xml_field and "file" not in types: continue
             for payload in xxe_payloads:
-                data = {}
-                for i in inputs:
-                    if i["name"]:
-                        # Inject XXE ke field yang namanya mengandung "xml"
-                        if "xml" in i["name"].lower():
-                            data[i["name"]] = payload
-                        else:
-                            data[i["name"]] = "test"
-                try:
-                    r = requests.post(join(base_url,action), data=data, timeout=10)
-                    body = r.text.lower()
-                    if "root:" in body and ":" in body and "/bin/bash" in body:
-                        critical(f"XXE terdeteksi via form {action}")
-                        f.append(("HIGH","XXE_FORM",f"XXE di form {page} (action: {action}): field XML menerima entity eksternal dan mengeksekusi pembacaan file. Attacker bisa membaca file server sensitif."))
-                        return f
-                except: pass
+                jobs.append((action, inputs, page, payload))
+        out = pmap_until(_check_form, jobs)
+        if out:
+            for sev, code, desc, url, msg in out:
+                critical(msg)
+                f.append((sev, code, desc, url))
+            return f
     return f
 
 def scan_nosqli(sess, base_url, ctx=None):
     f = []; info("Menguji NoSQL injection...")
-    if is_echo_endpoint(sess, base_url):
+    if echo_skip(sess, base_url, ctx):
         info("  (dilewati: endpoint memantulkan input)")
         return f
-    for param in ["id","user","username","email","token"]:
+    def _check(param):
         try:
             r1 = sess.get(base_url, params={param: '{"$gt":""}'}, timeout=10)
             r2 = sess.get(base_url, params={param: "test"}, timeout=10)
             if r1.status_code==200 and abs(len(r1.content)-len(r2.content)) > 500:
-                warn(f"Kemungkinan NoSQL injection di parameter '{param}'")
-                f.append(("MEDIUM","NOSQLI",f"Parameter '{param}' menunjukkan respons berbeda saat dikirim nilai JSON operator MongoDB ($gt). Attacker bisa bypass autentikasi atau membaca data tanpa izin."))
-                break
+                return [("MEDIUM","NOSQLI",f"Parameter '{param}' menunjukkan respons berbeda saat dikirim nilai JSON operator MongoDB ($gt). Attacker bisa bypass autentikasi atau membaca data tanpa izin.", None, f"Kemungkinan NoSQL injection di parameter '{param}'")]
         except: pass
+        return []
+    out = pmap_until(_check, ["id","user","username","email","token"])
+    if out:
+        for sev, code, desc, url, msg in out:
+            warn(msg)
+            f.append((sev, code, desc) if url is None else (sev, code, desc, url))
     return f
 
 def scan_graphql(sess, base_url, ctx=None):
@@ -875,8 +1156,8 @@ def scan_graphql(sess, base_url, ctx=None):
     # Introspection query mentah (tanpa double-encode)
     q_raw = "{__schema{types{name fields{name}}}}"
     paths = ["/graphql","/api/graphql","/gql","/graphiql","/v1/graphql","/query"]
-    for path in paths:
-        url = join(base_url,path)
+    # GET dan POST tiap path dicek paralel; tiap job mencoba dua metode sekaligus.
+    def _check(url):
         # GET — param query lgsg
         try:
             r = sess.get(url, params={"query": q_raw}, timeout=10)
@@ -884,9 +1165,7 @@ def scan_graphql(sess, base_url, ctx=None):
                 try:
                     j = r.json()
                     if isinstance(j.get("data"), dict) and "__schema" in j["data"]:
-                        critical(f"GraphQL introspection aktif (GET): {url}")
-                        f.append(("HIGH","GRAPHQL_INTROSPECTION",f"GraphQL endpoint di {url} mengizinkan introspection query via GET. Siapa pun bisa mendapatkan skema lengkap API — termasuk semua tipe, query, mutasi, dan field. Ini membocorkan seluruh permukaan API."))
-                        return f
+                        return [("HIGH","GRAPHQL_INTROSPECTION",f"GraphQL endpoint di {url} mengizinkan introspection query via GET. Siapa pun bisa mendapatkan skema lengkap API — termasuk semua tipe, query, mutasi, dan field. Ini membocorkan seluruh permukaan API.", url, f"GraphQL introspection aktif (GET): {url}")]
                 except: pass
         except: pass
         # POST — kirim JSON langsung (jangan pake json.dumps lagi biar requests yg encode)
@@ -896,27 +1175,39 @@ def scan_graphql(sess, base_url, ctx=None):
                 try:
                     j = r.json()
                     if isinstance(j.get("data"), dict) and "__schema" in j["data"]:
-                        critical(f"GraphQL introspection aktif (POST): {url}")
-                        f.append(("HIGH","GRAPHQL_INTROSPECTION",f"GraphQL endpoint di {url} mengizinkan introspection query via POST. Siapa pun bisa mendapatkan skema lengkap API — termasuk semua tipe, query, mutasi, dan field. Ini membocorkan seluruh permukaan API."))
-                        return f
+                        return [("HIGH","GRAPHQL_INTROSPECTION",f"GraphQL endpoint di {url} mengizinkan introspection query via POST. Siapa pun bisa mendapatkan skema lengkap API — termasuk semua tipe, query, mutasi, dan field. Ini membocorkan seluruh permukaan API.", url, f"GraphQL introspection aktif (POST): {url}")]
                 except: pass
         except: pass
+        return []
+    out = pmap_until(_check, [join(base_url, p) for p in paths])
+    if out:
+        for sev, code, desc, url, msg in out:
+            critical(msg)
+            f.append((sev, code, desc, url))
+        return f
     return f
 
 def scan_js(sess, base_url, ctx=None):
     f = []; info("Menganalisis JavaScript...")
     try:
-        r = sess.get(base_url, timeout=10)
+        r = get_base_response(sess, base_url, ctx)
+        if r is None:
+            info("Tidak bisa mengambil halaman utama"); return f
         js_urls = set()
         for m in re.finditer(r'<script[^>]*src=["\']([^"\']+\.js[^"\']*)["\']', r.text, re.I):
             js_urls.add(urllib.parse.urljoin(base_url, m.group(1)))
         if not js_urls: info("Tidak ada file JS"); return f
+        targets = list(js_urls)[:5]
         info(f"Ditemukan {len(js_urls)} file JS")
-        for js_url in list(js_urls)[:5]:
+        def _fetch(js_url):
             try:
                 r2 = sess.get(js_url, timeout=10)
-                if r2.status_code!=200: continue
-                t = r2.text
+                if r2.status_code==200:
+                    return js_url, r2.text
+            except: pass
+            return js_url, None
+        for js_url, t in pmap(_fetch, targets):
+            if t is not None:
                 fn = js_url.split('/')[-1]
                 # API endpoints
                 apis = re.findall(r'["\'](/[a-zA-Z0-9_\-./?&=]+)["\']', t)
@@ -936,14 +1227,15 @@ def scan_js(sess, base_url, ctx=None):
                 for s in real[:5]:
                     critical(f"Kredensial hardcode di {fn}")
                     f.append(("CRITICAL","JS_SECRET",f"File JS {fn} mengandung kredensial/secret hardcode: '{s[:20]}...'. Jika ini adalah kredensial produksi, attacker bisa langsung mengakses resource yang dilindungi."))
-            except: pass
     except: pass
     return f
 
 def scan_jwt(sess, base_url, ctx=None):
     f = []; info("Menganalisis JWT...")
     try:
-        r = sess.get(base_url, timeout=10)
+        r = get_base_response(sess, base_url, ctx)
+        if r is None:
+            return f
         for ck, cv in sess.cookies.items():
             if cv.count(".")==2:
                 try:
@@ -984,13 +1276,16 @@ def scan_subdomains(sess, base_url, ctx=None):
             except: pass
     except: pass
     common = ["www","mail","admin","api","dev","staging","test","beta","app","blog","cdn","static","docs","wiki","help","support","status","portal","shop"]
-    for sub in common:
+    def _dns(sub):
         fqdn = f"{sub}.{host}"
-        if fqdn in subs: continue
+        if fqdn in subs: return None
         try:
             socket.getaddrinfo(fqdn, 443, socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, socket.AI_NUMERICSERV)
-            subs.add(fqdn)
+            return fqdn
         except: pass
+        return None
+    for found in pmap(_dns, common):
+        if found: subs.add(found)
     if subs:
         info(f"Ditemukan {len(subs)} subdomain")
         for s in sorted(subs)[:10]: info(f"  {s}")
@@ -1002,7 +1297,7 @@ def scan_forms_analyze(sess, base_url, ctx=None):
     f = []; info("Menganalisis form...")
     crawler = ctx.get("crawler") if ctx else None
     if not crawler: return f
-    forms = crawler.get_forms()
+    forms = get_forms(ctx)
     if forms:
         seen = set()
         info(f"Ditemukan {len(forms)} form")
@@ -1019,7 +1314,7 @@ def scan_forms_analyze(sess, base_url, ctx=None):
     else: info("Tidak ada form")
     return f
 
-def waf_detect(sess, base_url):
+def waf_detect(sess, base_url, ctx=None):
     sigs = {"Cloudflare":[("server","cloudflare"),("cf-ray","")],
             "AWS WAF":[("x-amz-cf-id",""),("server","cloudfront")],
             "ModSecurity":[("server","mod_security")],
@@ -1027,7 +1322,9 @@ def waf_detect(sess, base_url):
             "Imperva":[("x-iinfo","")]}
     detected = []
     try:
-        r = sess.get(base_url, timeout=10)
+        r = get_base_response(sess, base_url, ctx)
+        if r is None:
+            return detected
         h = {k.lower():v.lower() for k,v in r.headers.items()}
         for name, sigs_list in sigs.items():
             if all(h.get(hdr,"") and (not val or val in h[hdr]) for hdr,val in sigs_list): detected.append(name)
@@ -1117,6 +1414,9 @@ def main():
     parser.add_argument("--detailed", action="store_true", help="Mode lengkap (23 modul, crawl)")
     parser.add_argument("--no-color", action="store_true", help="Output tanpa warna")
     parser.add_argument("--skip-ssl", action="store_true", help="Nonaktifkan verifikasi SSL (untuk sertifikat self-signed/expired)")
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help=f"Jumlah request paralel per scan (default: {DEFAULT_WORKERS}, 1 = sekuensial)")
+    parser.add_argument("--crawl-depth", type=int, default=2, help="Kedalaman crawl mode detailed (default: 2)")
+    parser.add_argument("--crawl-max", type=int, default=30, help="Maksimal halaman di-crawl mode detailed (default: 30)")
     args = parser.parse_args()
     if args.no_color: DISABLE_COLOR = True
 
@@ -1165,12 +1465,16 @@ def main():
     if not verify_ssl:
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    sess = make_session(timeout=15, verify_ssl=verify_ssl)
+    set_request_executor(args.workers)
+    sess = ThreadLocalSession(timeout=15, verify_ssl=verify_ssl)
     finds = []
     start = datetime.now()
+    ctx = {"crawler": None}
 
-    wafs = waf_detect(sess, target)
+    wafs = waf_detect(sess, target, ctx)
     if wafs: info(f"WAF terdeteksi: {', '.join(wafs)}")
+    # Ambil halaman utama sekali, agar modul pasif (headers/tech/js/jwt/crawl) tidak request berulang.
+    base_resp = get_base_response(sess, target, ctx)
 
     ALL_MODULES = OrderedDict([
         ("tech",      ("Teknologi", tech_finger)),
@@ -1205,14 +1509,14 @@ def main():
     elif mode == "detailed":
         modules = list(ALL_MODULES.keys())
         info("Merayapi halaman (depth 2)...")
-        crawler = Crawler(sess, target, depth=2, max_p=30)
-        crawler.crawl()
+        crawler = Crawler(sess, target, depth=args.crawl_depth, max_p=args.crawl_max)
+        crawler.crawl(seed_text=base_resp.text if base_resp is not None else None)
         info(f"Merayapi {len(crawler.pages)} halaman")
         print()
     else:
         modules = [k for k in ALL_MODULES.keys() if k not in DETAILED_ONLY]
         crawler = None
-    ctx = {"crawler": crawler}
+    ctx["crawler"] = crawler
 
     info(f"Menjalankan {len(modules)} modul...")
     for key in modules:
@@ -1221,7 +1525,8 @@ def main():
         try:
             res = func(sess, target, ctx)
             if res: finds.extend(res)
-        except: pass
+        except Exception:
+            pass
 
     end = datetime.now()
     dur = (end-start).total_seconds()

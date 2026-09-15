@@ -31,6 +31,9 @@ python3 spade.py example.com
 | `-o file.html` | Output HTML report |
 | `--csv file.csv` | Export hasil ke CSV |
 | `--no-color` | Output terminal tanpa warna |
+| `--workers N` | Jumlah request paralel (default 10, 1 = sekuensial) |
+| `--crawl-depth N` | Kedalaman crawl mode detailed (default 2) |
+| `--crawl-max N` | Maksimal halaman di-crawl mode detailed (default 30) |
 
 ### Contoh
 
@@ -44,7 +47,7 @@ python3 spade.py https://example.com --detailed -o full-report.html --csv full.c
 
 | Fitur | QUICK | STANDARD | DETAILED |
 |---|---|---|---|
-| Durasi | ~15-30s | ~45-90s | ~2-5mnt |
+| Durasi | ~15-30s | ~45-90s | ~1-3mnt (paralel + early-exit) |
 | Modul | 7 | 16 | 23 |
 | Crawl | ❌ | ❌ | ✅ depth 2 |
 | Security headers | ✅ | ✅ | ✅ |
@@ -95,6 +98,9 @@ Hanya butuh **`requests`**. Sisanya Python stdlib.
 ## Catatan
 
 - Scan ini non-intrusive. Tapi hanya gunakan di situs sendiri/terotorisasi.
+- Request dijalankan paralel (default 10 worker). Naikkan `--workers` untuk target cepat, turunkan ke `--workers 1` jika target rate-limit/WAF sensitif.
+- Modul deteksi (SQLi, XSS, LFI, CMDi, SSTI, XXE, GraphQL, SSRF, NoSQLi, Open Redirect) berhenti lebih awal begitu temuan pertama ketemu, jadi mode DETAILED tidak selalu mengirim semua payload.
+- Halaman utama dan daftar form di-cache: satu request/parse dipakai ulang lintas modul, bukan diulang per modul.
 - False positive mungkin terjadi. Verifikasi manual temuan CRITICAL/HIGH.
 - Mulai dengan `--quick`, lanjut `--detailed` kalau perlu.
 - Untuk hasil maksimal: `--detailed` karena mengaktifkan crawler untuk menemukan form POST.
