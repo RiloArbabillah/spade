@@ -10,19 +10,28 @@ Cara pakai:
   python3 spade.py example.com --csv hasil.csv     # export CSV
 """
 
-import argparse, csv, html as htmlmod, json, os, re, socket, ssl, sys, threading, time
-import urllib.parse, urllib.robotparser
+import argparse
+import csv
+import html as htmlmod
+import json
+import re
+import socket
+import ssl
+import sys
+import threading
+import time
+import typing
+import urllib.parse
 from collections import OrderedDict, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from html.parser import HTMLParser
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
-    import requests
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
+    from curl_cffi.requests import BrowserType, BrowserTypeLiteral
+    from curl_cffi.requests import Session as CurlSession
 except ImportError:
-    print("[!] Butuh 'requests'. Install: pip3 install requests")
+    print("[!] Butuh 'curl_cffi'. Install: pip3 install curl_cffi")
     sys.exit(1)
 
 # ── color ──
@@ -91,39 +100,116 @@ def join(base, path):
     if path.startswith(("http://","https://")): return path
     return urllib.parse.urljoin(base, path)
 
-def make_session(timeout=15, verify_ssl=True):
-    sess = requests.Session()
-    # Retry minimal: scanner ini mengirim banyak request, jadi retry agresif
-    # justru memperlambat total (terutama saat target down/slow).
-    retry = Retry(total=1, backoff_factor=0.2, status_forcelist=[429,500,502,503,504],
-                  allowed_methods={"GET","POST","HEAD","OPTIONS"}, respect_retry_after_header=True)
-    sess.mount("http://", HTTPAdapter(max_retries=retry))
-    sess.mount("https://", HTTPAdapter(max_retries=retry))
-    sess.headers["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36"
-    sess.verify = verify_ssl
-    sess.timeout = timeout
-    return sess
+# ── HTTP layer (curl_cffi) ──
+DEFAULT_IMPERSONATE = "chrome"     # profil default: Chrome terbaru yang didukung curl_cffi
+TRANSPORT_RETRIES = 1              # retry error koneksi/DNS/TLS (ditangani curl_cffi)
+STATUS_RETRIES = 1                 # retry status 429/5xx (ditangani ThreadLocalSession)
+RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+RETRY_METHODS = frozenset({"GET", "POST", "HEAD", "OPTIONS"})
+RETRY_AFTER_MAX = 5.0              # batas tunggu Retry-After agar scan tidak macet
+_DEFAULT = object()                # sentinel: bedakan "pakai default" dari "tanpa impersonate"
+
+
+def supported_impersonate_profiles():
+    """Daftar profil yang diterima curl_cffi untuk --impersonate.
+
+    Sumbernya BrowserTypeLiteral (mencakup nama berversi seperti 'chrome146'
+    sekaligus alias generik seperti 'chrome' = Chrome terbaru), ditambah nama
+    dari enum BrowserType sebagai cadangan untuk versi lama curl_cffi.
+    """
+    profiles = set(typing.get_args(BrowserTypeLiteral))
+    profiles.update(m.name for m in BrowserType)
+    return sorted(profiles)
+
+
+def _retry_after_seconds(value):
+    """Ubah header Retry-After (detik atau HTTP-date) jadi durasi tunggu, dibatasi RETRY_AFTER_MAX."""
+    if not value:
+        return 0.0
+    value = value.strip()
+    try:
+        return max(0.0, min(float(value), RETRY_AFTER_MAX))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        stamp = parsedate_to_datetime(value)
+        if stamp is None:
+            return 0.0
+        delta = (stamp - datetime.now(stamp.tzinfo)).total_seconds()
+        return max(0.0, min(delta, RETRY_AFTER_MAX))
+    except Exception:
+        return 0.0
+
+
+def make_session(timeout=15, verify_ssl=True, impersonate=_DEFAULT):
+    """Buat satu curl_cffi Session dengan browser impersonation.
+
+    User-Agent, sec-ch-ua, sec-fetch-*, dan Accept-Language tidak diset manual:
+    nilainya berasal dari profil impersonate agar fingerprint TLS + header sama
+    seperti browser asli (menyetel UA manual justru merusak paritas tersebut).
+    Retry untuk error transport ditangani curl_cffi sendiri, sedangkan retry
+    berdasarkan status HTTP (429/5xx) ditangani wrapper ThreadLocalSession.
+
+    impersonate=None berarti impersonation dimatikan (mode paritas/debugging).
+    """
+    profile = DEFAULT_IMPERSONATE if impersonate is _DEFAULT else impersonate
+    kwargs = {"timeout": timeout, "verify": verify_ssl, "retry": TRANSPORT_RETRIES}
+    if profile:
+        kwargs["impersonate"] = profile
+    return CurlSession(**kwargs)
 
 
 class ThreadLocalSession:
-    """Proxy Session yang membuat requests.Session terpisah per thread.
+    """Proxy Session yang membuat curl_cffi Session terpisah per thread.
 
-    Dipakai supaya request bisa diparalelkan tanpa membuat requests.Session
-    yang sama dipakai bersamaan oleh banyak thread. Objek ini tetap bisa
-    dipakai seperti Session biasa (delegasi atribut ke Session thread terkait).
+    Dipakai supaya request bisa diparalelkan tanpa berbagi satu Session antar
+    thread. Seluruh request melewati satu funnel (`.request()`), jadi timeout
+    default dan retry status HTTP berlaku seragam untuk semua modul tanpa perlu
+    mengubah call site. Atribut lain (cookies, headers, close) didelegasikan ke
+    Session milik thread terkait lewat __getattr__.
     """
 
-    def __init__(self, timeout=15, verify_ssl=True):
+    def __init__(self, timeout=15, verify_ssl=True, impersonate=_DEFAULT, retries=None):
         self._local = threading.local()
         self.timeout = timeout
         self.verify_ssl = verify_ssl
+        self.impersonate = impersonate
+        self.retries = STATUS_RETRIES if retries is None else max(0, retries)
 
     def _session(self):
         sess = getattr(self._local, "sess", None)
         if sess is None:
-            sess = make_session(timeout=self.timeout, verify_ssl=self.verify_ssl)
+            sess = make_session(timeout=self.timeout, verify_ssl=self.verify_ssl,
+                                impersonate=self.impersonate)
             self._local.sess = sess
         return sess
+
+    def request(self, method, url, **kwargs):
+        """Kirim request dengan timeout default + retry status HTTP transparan.
+
+        curl_cffi hanya me-retry error transport; retry untuk status 429/5xx
+        (perilaku lama dari urllib3.Retry) dibuat ulang di sini, termasuk
+        menghormati header Retry-After, supaya cakupan modul tidak berkurang.
+        """
+        kwargs.setdefault("timeout", self.timeout)
+        method = method.upper()
+        max_attempts = self.retries if method in RETRY_METHODS else 0
+        resp = None
+        for attempt in range(max_attempts + 1):
+            resp = self._session().request(method, url, **kwargs)
+            if resp.status_code not in RETRY_STATUS or attempt >= max_attempts:
+                return resp
+            time.sleep(_retry_after_seconds(resp.headers.get("Retry-After")))
+        return resp
+
+    def get(self, url, **kwargs):     return self.request("GET", url, **kwargs)
+    def post(self, url, **kwargs):    return self.request("POST", url, **kwargs)
+    def put(self, url, **kwargs):     return self.request("PUT", url, **kwargs)
+    def patch(self, url, **kwargs):   return self.request("PATCH", url, **kwargs)
+    def delete(self, url, **kwargs):  return self.request("DELETE", url, **kwargs)
+    def head(self, url, **kwargs):    return self.request("HEAD", url, **kwargs)
+    def options(self, url, **kwargs): return self.request("OPTIONS", url, **kwargs)
 
     def __getattr__(self, name):
         return getattr(self._session(), name)
@@ -313,7 +399,8 @@ def echo_skip(sess, url, ctx=None):
 def get_baseline_fingerprint(sess, base_url):
     """Probe 2 random non-existent paths untuk deteksi SPA catch-all / default page.
     Mengembalikan dict fingerprint atau None jika server handle 404 dengan benar."""
-    import random, string
+    import random
+    import string
     timeout = 8  # max detik per probe
     info("Membangun baseline untuk deteksi false positive...")
     probes = []
@@ -420,7 +507,7 @@ def sec_headers(sess, base_url, ctx=None):
             if "SameSite" not in ck: issues.append("SameSite")
             if issues:
                 warn(f"Cookie: tidak ada flag {', '.join(issues)}")
-                desc = f"Cookie tidak memiliki flag "
+                desc = "Cookie tidak memiliki flag "
                 if "Secure" in issues: desc += "Secure (bisa dikirim lewat HTTP), "
                 if "HttpOnly" in issues: desc += "HttpOnly (bisa diakses JavaScript/XSS), "
                 if "SameSite" in issues: desc += "SameSite (rentan CSRF), "
@@ -738,7 +825,6 @@ def scan_sqli(sess, base_url, ctx=None):
     if echo_skip(sess, base_url, ctx):
         info("  (dilewati: endpoint memantulkan input)")
         return f
-    crawler = ctx.get("crawler") if ctx else None
     forms = get_forms(ctx)
     payloads = [("'","petik tunggal"),("' OR '1'='1","OR true"),("' OR 1=1--","OR true komentar"),
                 ("' UNION SELECT NULL--","UNION"),("' AND SLEEP(3)--","time-based")]
@@ -851,7 +937,7 @@ def scan_xss(sess, base_url, ctx=None):
                 for i in inputs:
                     if i["name"]: data[i["name"]] = payload if i == text_inputs[0] else "test"
                 try:
-                    r = sess.post(action, data=data, timeout=10)
+                    sess.post(action, data=data, timeout=10)
                     # Cek beberapa halaman setelah submit apakah payload muncul
                     for pg_url, pg_html in list(crawler.pages.items())[:5]:
                         if pg_url != page and payload in pg_html:
@@ -1396,7 +1482,41 @@ def gen_csv(finds, target, out):
 # MAIN
 # ══════════════════════════════════════════════════════════════════
 
-def main():
+# Registry modul scan — satu sumber kebenaran untuk mode CLI maupun test.
+# Format: key -> (label tampilan, fungsi scan(sess, base_url, ctx))
+ALL_MODULES = OrderedDict([
+    ("tech",      ("Teknologi", tech_finger)),
+    ("headers",   ("Security Headers", sec_headers)),
+    ("robots",    ("robots.txt", robots_txt)),
+    ("sensitive", ("File Sensitif", sensitive_files)),
+    ("dirlist",   ("Directory Listing", dir_listing)),
+    ("methods",   ("HTTP Methods", http_methods)),
+    ("cors",      ("CORS", cors_check)),
+    ("tls",       ("TLS/SSL", tls_ssl)),
+    ("forms",     ("Analisis Form", scan_forms_analyze)),
+    ("sqli",      ("SQL Injection", scan_sqli)),
+    ("xss",       ("XSS", scan_xss)),
+    ("openr",     ("Open Redirect", open_redirect)),
+    ("lfi",       ("LFI", lfi_check)),
+    ("cmdi",      ("Command Injection", cmd_injection)),
+    ("ssrf",      ("SSRF", ssrf_check)),
+    ("ratelimit", ("Rate Limit", rate_limit)),
+    ("xxe",       ("XXE", scan_xxe)),
+    ("ssti",      ("SSTI", scan_ssti)),
+    ("nosqli",    ("NoSQL Injection", scan_nosqli)),
+    ("graphql",   ("GraphQL", scan_graphql)),
+    ("js",        ("JS Analysis", scan_js)),
+    ("jwt",       ("JWT", scan_jwt)),
+    ("subdomains",("Subdomain", scan_subdomains)),
+])
+
+QUICK_MODULES = ["tech","headers","robots","sensitive","cors","tls","ratelimit"]
+DETAILED_ONLY = {"xxe","ssti","nosqli","graphql","js","jwt","subdomains"}
+STANDARD_MODULES = [k for k in ALL_MODULES if k not in DETAILED_ONLY]
+
+
+def main(argv=None):
+    """Entry point CLI. argv=None berarti pakai sys.argv (dipakai test dengan list eksplisit)."""
     global DISABLE_COLOR
     parser = argparse.ArgumentParser(
         description="spade — Automated Web Vulnerability Scanner",
@@ -1414,11 +1534,22 @@ def main():
     parser.add_argument("--detailed", action="store_true", help="Mode lengkap (23 modul, crawl)")
     parser.add_argument("--no-color", action="store_true", help="Output tanpa warna")
     parser.add_argument("--skip-ssl", action="store_true", help="Nonaktifkan verifikasi SSL (untuk sertifikat self-signed/expired)")
+    parser.add_argument("--impersonate", default=DEFAULT_IMPERSONATE, metavar="PROFIL",
+                        help=f"Profil browser curl_cffi untuk menyamarkan request (default: {DEFAULT_IMPERSONATE}). Contoh: chrome136, safari184, firefox147")
+    parser.add_argument("--no-impersonate", action="store_true", help="Matikan browser impersonation (fingerprint default curl; untuk debugging/paritas)")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help=f"Jumlah request paralel per scan (default: {DEFAULT_WORKERS}, 1 = sekuensial)")
     parser.add_argument("--crawl-depth", type=int, default=2, help="Kedalaman crawl mode detailed (default: 2)")
     parser.add_argument("--crawl-max", type=int, default=30, help="Maksimal halaman di-crawl mode detailed (default: 30)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.no_color: DISABLE_COLOR = True
+
+    # Validasi profil impersonasi sebelum request apa pun dikirim.
+    profiles = supported_impersonate_profiles()
+    if args.no_impersonate:
+        args.impersonate = None
+    elif args.impersonate not in profiles:
+        parser.error(f"profil impersonate '{args.impersonate}' tidak dikenal. "
+                     f"Contoh yang valid: chrome146, safari184, firefox147, edge101 (total {len(profiles)} profil)")
 
     # ── Interactive prompt jika target tidak diberikan ──
     if not args.target:
@@ -1426,9 +1557,13 @@ def main():
         print(f"    {c('bold',c('cyan','+===========[ SPADE ]===========+'))}")
         print(f"    {c('bold',c('cyan','|'))}  {c('bold','Web Vuln Scanner')}     {c('bold',c('cyan','|'))}")
         print(f"    {c('bold',c('cyan','+==============================+'))}")
-        inp = input("\n  [>] Masukkan domain/URL target: ").strip()
-        while not inp:
-            inp = input("  [>] Target tidak boleh kosong: ").strip()
+        try:
+            inp = input("\n  [>] Masukkan domain/URL target: ").strip()
+            while not inp:
+                inp = input("  [>] Target tidak boleh kosong: ").strip()
+        except EOFError:
+            print("\n  [!] Tidak ada input target (EOF). Keluar.", file=sys.stderr)
+            return 2
         args.target = inp
         print()
         print("  Pilih mode scan:")
@@ -1458,15 +1593,13 @@ def main():
     print()
     info(f"Target: {c('bold',target)}")
     info(f"Mode  : {mode.upper()}")
+    info(f"Bot   : {args.impersonate or 'tanpa impersonation'}")
     info(f"Start : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
 
     verify_ssl = not args.skip_ssl
-    if not verify_ssl:
-        import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     set_request_executor(args.workers)
-    sess = ThreadLocalSession(timeout=15, verify_ssl=verify_ssl)
+    sess = ThreadLocalSession(timeout=15, verify_ssl=verify_ssl, impersonate=args.impersonate)
     finds = []
     start = datetime.now()
     ctx = {"crawler": None}
@@ -1476,35 +1609,8 @@ def main():
     # Ambil halaman utama sekali, agar modul pasif (headers/tech/js/jwt/crawl) tidak request berulang.
     base_resp = get_base_response(sess, target, ctx)
 
-    ALL_MODULES = OrderedDict([
-        ("tech",      ("Teknologi", tech_finger)),
-        ("headers",   ("Security Headers", sec_headers)),
-        ("robots",    ("robots.txt", robots_txt)),
-        ("sensitive", ("File Sensitif", sensitive_files)),
-        ("dirlist",   ("Directory Listing", dir_listing)),
-        ("methods",   ("HTTP Methods", http_methods)),
-        ("cors",      ("CORS", cors_check)),
-        ("tls",       ("TLS/SSL", tls_ssl)),
-        ("forms",     ("Analisis Form", scan_forms_analyze)),
-        ("sqli",      ("SQL Injection", scan_sqli)),
-        ("xss",       ("XSS", scan_xss)),
-        ("openr",     ("Open Redirect", open_redirect)),
-        ("lfi",       ("LFI", lfi_check)),
-        ("cmdi",      ("Command Injection", cmd_injection)),
-        ("ssrf",      ("SSRF", ssrf_check)),
-        ("ratelimit", ("Rate Limit", rate_limit)),
-        ("xxe",       ("XXE", scan_xxe)),
-        ("ssti",      ("SSTI", scan_ssti)),
-        ("nosqli",    ("NoSQL Injection", scan_nosqli)),
-        ("graphql",   ("GraphQL", scan_graphql)),
-        ("js",        ("JS Analysis", scan_js)),
-        ("jwt",       ("JWT", scan_jwt)),
-        ("subdomains",("Subdomain", scan_subdomains)),
-    ])
-    DETAILED_ONLY = {"xxe","ssti","nosqli","graphql","js","jwt","subdomains"}
-
     if mode == "quick":
-        modules = ["tech","headers","robots","sensitive","cors","tls","ratelimit"]
+        modules = list(QUICK_MODULES)
         crawler = None
     elif mode == "detailed":
         modules = list(ALL_MODULES.keys())
@@ -1514,7 +1620,7 @@ def main():
         info(f"Merayapi {len(crawler.pages)} halaman")
         print()
     else:
-        modules = [k for k in ALL_MODULES.keys() if k not in DETAILED_ONLY]
+        modules = list(STANDARD_MODULES)
         crawler = None
     ctx["crawler"] = crawler
 
@@ -1546,6 +1652,7 @@ def main():
         gen_csv(finds, target, args.csv)
         good(f"CSV   : {args.csv}")
     print()
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
