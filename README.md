@@ -1,6 +1,6 @@
 # Spade
 
-Automated web vulnerability scanner dengan 3 mode + mode interaktif. Detect SQLi, XSS, LFI, CMDi, SSRF (termasuk blind/OOB), XXE, GraphQL introspection, IDOR/BOLA, CSRF, JWT, auth bypass, host header/cache poisoning, CRLF, request smuggling, open redirect, sensitive files, TLS, CORS, WAF, dan masih banyak lagi.
+Automated web vulnerability scanner dengan 4 mode + mode interaktif. Detect SQLi, XSS, LFI, CMDi, SSRF (termasuk blind/OOB), XXE, GraphQL introspection, IDOR/BOLA, CSRF, JWT, auth bypass, host header/cache poisoning, CRLF, request smuggling, open redirect, sensitive files, TLS, CORS, WAF, recon (subdomain/URL historis/JS/port), dan masih banyak lagi.
 
 **File:** `spade.py` (Python 3, dependensi minimal)
 
@@ -12,7 +12,9 @@ Automated web vulnerability scanner dengan 3 mode + mode interaktif. Detect SQLi
 python3 spade.py                          # INTERAKTIF — minta domain & mode
 python3 spade.py https://target.com       # STANDARD (19 modul)
 python3 spade.py https://target.com --quick   # QUICK (7 modul, basic)
-python3 spade.py https://target.com --detailed # DETAILED (31 modul, full)
+python3 spade.py https://target.com --detailed # DETAILED (32 modul, full)
+python3 spade.py https://target.com --recon-only # RECON (enumerasi saja)
+python3 spade.py https://target.com --detailed --port-scan # DETAILED + TCP connect scan
 ```
 
 URL boleh pakai `https://` atau langsung domain:
@@ -27,7 +29,7 @@ python3 spade.py example.com
 |---|---|
 | Tanpa argumen | Mode interaktif — minta target & pilih mode |
 | `--quick` | Mode cepat (7 modul, no crawl) |
-| `--detailed` | Mode lengkap (31 modul, crawl depth 2, parameter discovery, JWT, OOB) |
+| `--detailed` | Mode lengkap (32 modul, crawl depth 2, recon, parameter discovery, JWT, OOB) |
 | `-o file.html` | Output HTML report |
 | `--csv file.csv` | Export hasil ke CSV |
 | `--json file.json` | Export JSON (metadata scan + temuan + bukti request/response, cocok untuk pipeline) |
@@ -46,6 +48,9 @@ python3 spade.py example.com
 | `--workers N` | Jumlah request paralel (default 10, 1 = sekuensial) |
 | `--crawl-depth N` | Kedalaman crawl mode detailed (default 2) |
 | `--crawl-max N` | Maksimal halaman di-crawl mode detailed (default 30) |
+| `--recon-only` | Hanya jalankan recon (subdomain, URL historis, endpoint JS, host hidup). Bentrok dengan `--quick`/`--detailed`/`--no-recon` → exit 2 |
+| `--no-recon` | Lewati tahap recon di mode detailed (nama target tidak dikirim ke crt.sh/Wayback/Cert Spotter) |
+| `--port-scan` | TCP connect scan ringan ke 41 port umum di target + host hasil enumerasi (butuh `--detailed` atau `--recon-only`) |
 
 ### Contoh
 
@@ -90,7 +95,7 @@ redaksi, dan skema output ada di
 | Fitur | QUICK | STANDARD | DETAILED |
 |---|---|---|---|
 | Durasi | ~15-30s | ~45-90s | ~1-3mnt (paralel + early-exit) |
-| Modul | 7 | 19 | 31 |
+| Modul | 7 | 19 | 32 |
 | Crawl | ❌ | ❌ | ✅ depth 2 |
 | Security headers | ✅ | ✅ | ✅ |
 | TLS/SSL | ✅ | ✅ | ✅ |
@@ -118,7 +123,9 @@ redaksi, dan skema output ada di
 | Request smuggling (butuh `--check-smuggling`) | ❌ | ❌ | ✅ |
 | Blind SSRF/CMDi (butuh `--oob-host`) | ❌ | ✅ | ✅ |
 | Blind XXE (butuh `--oob-host`) | ❌ | ❌ | ✅ |
-| Subdomain enum | ❌ | ❌ | ✅ |
+| Recon (subdomain + URL historis + JS) | ❌ | ❌ | ✅ |
+| Subdomain enum (`crt.sh` + Cert Spotter + DNS wordlist) | ❌ | ❌ | ✅ |
+| Port scan (butuh `--port-scan`, opt-in) | ❌ | ❌ | ✅ |
 
 ## Semua Modul
 
@@ -141,7 +148,10 @@ redaksi, dan skema output ada di
 - CRLF injection/response splitting, request smuggling CL.TE/TE.CL (opt-in)
 - Blind SSRF/XXE/CMDi lewat collector OOB sendiri (opt-in)
 - API spec OpenAPI/Swagger + parameter discovery
-- Subdomain enumeration (CRT.sh + DNS wordlist)
+- Recon: subdomain (crt.sh + Cert Spotter + 134 kata DNS internal), host hidup (status/title/Server)
+- URL historis (Wayback CDX + Common Crawl) → seed crawler + pool parameter modul injection
+- Endpoint dari berkas JS (`<script src>` halaman utama + crawl)
+- Port scan TCP connect 41 port umum (opt-in lewat `--port-scan`)
 
 ## Instalasi
 
@@ -168,9 +178,17 @@ payload desync harus dikirim apa adanya.
 
 Yang belum tersedia: rotasi IP/proxy, delay/jitter, dan pola request manusiawi.
 Daftar lengkapnya ada di [docs/bug-bounty-gaps.md](docs/bug-bounty-gaps.md).
+
 Detail HTTP layer ada di [docs/http-layer.md](docs/http-layer.md), model
-temuan/bukti/laporan ada di [docs/findings-model.md](docs/findings-model.md), dan
-rincian kelas kerentanan ada di [docs/vuln-classes.md](docs/vuln-classes.md).
+temuan/bukti/laporan ada di [docs/findings-model.md](docs/findings-model.md),
+tahap recon ada di [docs/recon.md](docs/recon.md), dan rincian kelas kerentanan
+ada di [docs/vuln-classes.md](docs/vuln-classes.md).
+
+**Catatan recon:** tahap recon di mode DETAILED mengirim **nama target** ke API
+pihak ketiga (crt.sh, Cert Spotter, Wayback, Common Crawl) dari IP tester.
+Request itu tidak bisa disamarkan dengan browser impersonation dan terlihat
+sebagai passive reconnaissance. Pakai `--no-recon` kalau nama target tidak boleh
+keluar ke pihak ketiga.
 
 ## Development
 
@@ -182,7 +200,7 @@ python3 tools/oob_collector.py --help  # collector OOB (stdlib, tanpa dependency
 ```
 
 Test memakai fixture server lokal di `tests/conftest.py` (tanpa jaringan
-eksternal): 176 test mencakup 31 modul, flag CLI, dan generator laporan.
+eksternal): 226 test mencakup 32 modul, flag CLI, recon, dan generator laporan.
 
 ## Catatan
 
@@ -190,12 +208,15 @@ eksternal): 176 test mencakup 31 modul, flag CLI, dan generator laporan.
   POST), `--check-smuggling` (socket mentah), dan `--oob-host` (callback ke
   collector Anda). Semuanya mati secara default. Hanya gunakan di situs
   sendiri/terotorisasi.
-- Roadmap celah fitur bug bounty (proxy/rate limit, scope file, multi-target,
-  recon lanjutan) ada di [docs/bug-bounty-gaps.md](docs/bug-bounty-gaps.md).
+- Roadmap celah fitur bug bounty (proxy/rate limit, scope file, multi-target)
+  ada di [docs/bug-bounty-gaps.md](docs/bug-bounty-gaps.md).
   Bagian 1 (kualitas temuan: bukti, repro, CVSS/CWE/OWASP, confidence,
-  JSON/SARIF) dan bagian 2 (cakupan kelas kerentanan: IDOR, CSRF, JWT, auth
-  bypass, API spec, host header/cache, CRLF, smuggling, blind OOB) sudah
+  JSON/SARIF), bagian 2 (cakupan kelas kerentanan: IDOR, CSRF, JWT, auth
+  bypass, API spec, host header/cache, CRLF, smuggling, blind OOB), dan bagian 3
+  (recon: subdomain, URL historis, endpoint JS, host hidup, port scan) sudah
   selesai.
+- Detail tahap recon (sumber, batas request, alur data ke crawler dan modul
+  injection, privasi) ada di [docs/recon.md](docs/recon.md).
 - Model data temuan ada di [docs/findings-model.md](docs/findings-model.md);
   rincian tiap kelas kerentanan (apa yang diuji, flag yang dibutuhkan, batas
   request, penjaga false positive) ada di

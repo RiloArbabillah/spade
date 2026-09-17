@@ -129,6 +129,68 @@ CRLF_MAX_PARAMS = 15       # batas parameter untuk uji CRLF
 AUTH_BYPASS_MAX_PATHS = 10 # batas path terlindungi untuk uji auth bypass
 JWT_CRAWL_TARGETS = 8    # batas halaman hasil crawl yang diuji sebagai orakel JWT
 
+# ── Recon (bagian 3): enumerasi subdomain, URL historis, JS, port scan ──
+# Semua nilai di bawah ini adalah batas request/berkas agar recon tidak
+# membanjiri target maupun API pihak ketiga.
+RECON_SOURCE_TIMEOUT = 20.0    # timeout sumber pasif (crt.sh, Cert Spotter, collinfo)
+RECON_CDX_TIMEOUT = 45.0       # timeout Wayback CDX / Common Crawl (CDX terukur ~17s)
+RECON_HOST_TIMEOUT = 8.0       # timeout probe HTTP per host hasil enumerasi
+RECON_MAX_SUBDOMAINS = 200     # batas subdomain unik yang dilaporkan
+RECON_DNS_TIMEOUT = 1.5        # timeout per lookup DNS brute force
+RECON_MAX_HOSTS_PROBED = 25    # batas host hasil enumerasi yang di-probe HTTP
+RECON_MAX_HISTORIC_URLS = 300  # batas URL historis unik
+RECON_MAX_SEEDS = 6            # URL historis yang jadi seed crawler tambahan
+RECON_PARAM_URLS = 5           # batas URL recon ber-query untuk modul injection
+RECON_PARAM_NAMES = 5          # batas nama parameter per URL recon
+RECON_JS_MAX_PAGES = 5         # halaman sumber daftar <script src>
+RECON_JS_MAX_FILES = 15        # batas file JS yang dipanen
+RECON_JS_MAX_ENDPOINTS = 50    # batas endpoint unik hasil ekstraksi JS
+PORT_SCAN_TIMEOUT = 1.0        # timeout per port (TCP connect scan)
+PORT_SCAN_MAX_HOSTS = 5        # host yang di-port-scan: target + host hidup
+
+# Wordlist DNS internal (tanpa file eksternal) supaya enumerasi tetap punya
+# jalur aktif saat layanan transparansi sertifikat tidak bisa diakses.
+RECON_DNS_WORDLIST = tuple(dict.fromkeys((
+    "www","mail","smtp","imap","pop","webmail","email","mx","ns1","ns2","ns3",
+    "dns","dns1","dns2","vpn","remote","gateway","gw","proxy","firewall",
+    "admin","administrator","panel","cpanel","whm","manage","management",
+    "portal","intranet","internal","home","office","staff","hr","erp","crm",
+    "api","api-v1","api-v2","apis","rest","graphql","webhook",
+    "dev","development","staging","stage","stg","uat","qa","test","testing",
+    "sandbox","demo","preview","beta","alpha","nightly","edge",
+    "app","apps","application","mobile","m","wap","web","www2","www3","site",
+    "shop","store","cart","checkout","pay","payment","payments","billing",
+    "blog","news","press","media","assets","static","cdn","img","images","files",
+    "download","downloads","upload","uploads","docs","documentation","wiki",
+    "help","support","status","monitor","monitoring","metrics","grafana",
+    "kibana","jenkins","ci","cd","git","gitlab","registry","docker","k8s",
+    "kubernetes","vault","config","db","database","mysql","postgres","redis",
+    "mongo","elastic","search","sso","auth","login","id","oauth","account",
+    "accounts","user","users","profile","cloud","s3","backup",
+)))
+
+# Port umum + service non-HTTP yang paling sering jadi temuan bounty.
+PORT_SCAN_PORTS = (
+    21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 161, 389, 443, 445, 465,
+    587, 631, 993, 995, 1433, 1521, 2049, 2375, 3000, 3306, 3389, 5000, 5432,
+    5601, 5900, 6379, 8000, 8080, 8081, 8443, 8888, 9000, 9200, 11211, 27017,
+)
+PORT_SCAN_SERVICES = {
+    21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns", 80: "http",
+    110: "pop3", 111: "rpcbind", 135: "msrpc", 139: "netbios", 143: "imap",
+    161: "snmp", 389: "ldap", 443: "https", 445: "smb", 465: "smtps",
+    587: "smtp-submission", 631: "ipp", 993: "imaps", 995: "pop3s",
+    1433: "mssql", 1521: "oracle", 2049: "nfs", 2375: "docker-api",
+    3000: "node-http", 3306: "mysql", 3389: "rdp", 5000: "dev-http",
+    5432: "postgres", 5601: "kibana", 5900: "vnc", 6379: "redis",
+    8000: "http-alt", 8080: "http-proxy", 8081: "http-alt", 8443: "https-alt",
+    8888: "http-alt", 9000: "http-alt", 9200: "elasticsearch",
+    11211: "memcached", 27017: "mongodb",
+}
+# Service yang tidak seharusnya terekspos ke internet: kalau terbuka, temuan
+# dinaikkan jadi LOW supaya tidak tenggelam di daftar temuan INFO.
+PORT_SCAN_RISKY_PORTS = frozenset({2375, 3306, 5432, 6379, 9200, 11211, 27017, 5601, 2049, 3389})
+
 def oob_token():
     """Token callback unik per temuan OOB (aman dipakai di payload/log)."""
     return "spade-" + secrets.token_hex(OOB_TOKEN_BYTES)
@@ -756,6 +818,12 @@ FINDING_META = {
     "JWT_ALG_CONFUSION_SURFACE": FindingMeta(None, 0.0, "CWE-347", "A07:2021", "tentative"),
     "JWT_KID_SUSPECT":      FindingMeta(None, 0.0, "CWE-22", "A07:2021", "tentative"),
     "PARAM_DISCOVERY":      FindingMeta(None, 0.0, "CWE-200", "A01:2021", "tentative"),
+    # Recon (bagian 3): subdomain, URL historis, endpoint JS, port terbuka.
+    "SUBDOMAIN_LIVE":       FindingMeta(None, 0.0, "CWE-200", "A01:2021", "firm"),
+    "HISTORIC_URLS":        FindingMeta(None, 0.0, "CWE-200", "A01:2021", "tentative"),
+    "JS_ENDPOINT":          FindingMeta(None, 0.0, "CWE-200", "A01:2021", "firm"),
+    "PORT_OPEN":            FindingMeta(None, 0.0, "CWE-200", "A05:2021", "firm"),
+    "RECON_SOURCE_SKIPPED": FindingMeta(None, 0.0, None, None, "certain"),
     "SCAN_ERROR":           FindingMeta(None, 0.0, None, None, "certain"),
 }
 
@@ -770,7 +838,7 @@ META_PREFIX_RULES = (
 # Kode yang buktinya belum cukup untuk disebut pasti, apa pun kata tabel meta.
 TENTATIVE_CODES = frozenset({
     "SSRF", "SSRF_FORM", "SSRF_TIMEOUT", "CORS_REFLECT", "XSS_STORED",
-    "ROBOTS", "SUBDOMAINS", "NO_RATE_LIMIT",
+    "ROBOTS", "SUBDOMAINS", "NO_RATE_LIMIT", "HISTORIC_URLS",
 })
 
 CONFIDENCE_LEVELS = ("certain", "firm", "tentative")
@@ -1155,10 +1223,12 @@ class FormParser(HTMLParser):
 
 # ── crawler ──
 class Crawler:
-    def __init__(self, sess, base_url, depth=1, max_p=30):
+    def __init__(self, sess, base_url, depth=1, max_p=30, extra_seeds=()):
         self.sess = sess; self.base = base_url.rstrip("/")
         self.netloc = urllib.parse.urlparse(base_url).netloc
         self.depth = depth; self.max_p = max_p
+        # Seed tambahan (mis. URL historis hasil recon) di-crawl seperti temuan link.
+        self.extra_seeds = [s for s in (extra_seeds or ()) if s]
         self.visited = set(); self.pages = {}
     def _norm(self, url):
         p = urllib.parse.urlparse(url)
@@ -1181,6 +1251,12 @@ class Crawler:
                 if self._internal(full) and n not in self.visited:
                     if not any(n.lower().endswith(e) for e in (".pdf",".zip",".png",".jpg",".gif",".css",".js",".svg",".ico")):
                         self.visited.add(n); level.append(n)
+
+        for seed in self.extra_seeds:
+            full = urllib.parse.urljoin(self.base, seed).split("#")[0]
+            n = self._norm(full)
+            if self._internal(full) and n not in self.visited:
+                self.visited.add(n); level.append(full)
 
         start_depth = 1 if seed_text is not None else 0
         for d in range(start_depth, self.depth + 1):
@@ -1687,17 +1763,20 @@ def scan_sqli(sess, base_url, ctx=None):
     errs = ["sql","mysql","syntax error","unclosed quotation","odbc","driver","warning: mysql","pg_query","sqlite","ora-"]
     tested = [0]
     # Cek URL params
-    def _check_url(p):
+    def _check_url(job):
+        url, p = job
         for payload, label in payloads:
             try:
-                r = sess.get(base_url, params={p: payload}, timeout=10)
+                r = sess.get(url, params={p: payload}, timeout=10)
                 if any(e in r.text.lower() for e in errs) and len(r.text)<50000:
-                    return [("HIGH","SQLI",f"Parameter URL '{p}' rentan SQL injection (error-based, payload: {label}). Attacker bisa membaca/mengubah database. URL: {base_url}?{p}={payload[:30]}", f"{base_url}?{p}={payload[:30]}", f"SQL injection via parameter '{p}' dengan payload '{label}'")]
+                    return [("HIGH","SQLI",f"Parameter URL '{p}' rentan SQL injection (error-based, payload: {label}). Attacker bisa membaca/mengubah database. URL: {url}?{p}={payload[:30]}", f"{url}?{p}={payload[:30]}", f"SQL injection via parameter '{p}' dengan payload '{label}'")]
             except: pass
         return []
-    # Parameter hasil panen spesifikasi API (kalau modul apispec jalan) ikut diuji.
+    # Parameter hasil panen spesifikasi API (kalau modul apispec jalan) ikut diuji,
+    # ditambah parameter nyata dari URL historis/JS hasil recon (berbatas).
     url_params = list(dict.fromkeys(["id","page","p","q","cat","user","uid"] + spec_injection_targets(ctx)))
-    out = pmap_until(_check_url, url_params)
+    out = pmap_until(_check_url, [(u, p) for u, job_params in injection_url_jobs(ctx, base_url)
+                                  for p in (job_params if job_params is not None else url_params)])
     if out:
         for sev, code, desc, url, msg in out:
             critical(msg)
@@ -1745,14 +1824,16 @@ def scan_xss(sess, base_url, ctx=None):
     
     # ── Reflected XSS via GET ──
     def _check_get(job):
-        p, payload = job
+        url, p, payload = job
         try:
-            r = sess.get(base_url, params={p: payload}, timeout=10)
+            r = sess.get(url, params={p: payload}, timeout=10)
             if payload in r.text:
                 return [("HIGH","XSS_REFLECTED",f"Parameter '{p}' memantulkan tag script mentah — reflected XSS. Attacker bisa menjalankan JavaScript di browser korban. URL: {r.url}", r.url, f"XSS terdeteksi di parameter '{p}' (GET)")]
         except: pass
         return []
-    out = pmap_until(_check_get, [(p, pl) for pl in payloads for p in params])
+    xss_jobs = [(u, p) for u, job_params in injection_url_jobs(ctx, base_url)
+                for p in (job_params if job_params is not None else params)]
+    out = pmap_until(_check_get, [(u, p, pl) for pl in payloads for u, p in xss_jobs])
     if out:
         for sev, code, desc, url, msg in out:
             critical(msg)
@@ -1809,14 +1890,18 @@ def scan_xss(sess, base_url, ctx=None):
 
 def open_redirect(sess, base_url, ctx=None):
     f = FindingList(); info("Menguji open redirect...")
-    def _check(param):
+    redirect_params = ["next","redirect","url","return","to","dest","goto"]
+    def _check(job):
+        url, param = job
         try:
-            r = sess.get(base_url, params={param: "https://evil.com"}, timeout=10, allow_redirects=False)
+            r = sess.get(url, params={param: "https://evil.com"}, timeout=10, allow_redirects=False)
             if r.status_code in (301,302,303,307,308) and "evil.com" in r.headers.get("Location",""):
-                return [("HIGH","OPEN_REDIRECT",f"Parameter '{param}' di {base_url} mengarahkan browser ke URL eksternal tanpa validasi. Attacker bisa memanfaatkan ini untuk phishing (mengelabui korban mengklik link yang mengarah ke situs jahat).", r.url, f"Open redirect via parameter '{param}'")]
+                return [("HIGH","OPEN_REDIRECT",f"Parameter '{param}' di {url} mengarahkan browser ke URL eksternal tanpa validasi. Attacker bisa memanfaatkan ini untuk phishing (mengelabui korban mengklik link yang mengarah ke situs jahat).", r.url, f"Open redirect via parameter '{param}'")]
         except: pass
         return []
-    out = pmap_until(_check, ["next","redirect","url","return","to","dest","goto"])
+    out = pmap_until(_check, [(u, p)
+                              for u, job_params in injection_url_jobs(ctx, base_url)
+                              for p in (job_params if job_params is not None else redirect_params)])
     if out:
         for sev, code, desc, url, msg in out:
             critical(msg)
@@ -1829,17 +1914,19 @@ def lfi_check(sess, base_url, ctx=None):
         info("  (dilewati: endpoint memantulkan input)")
         return f
     def _check(job):
-        param, payload = job
+        url, param, payload = job
         try:
-            r = sess.get(base_url, params={param: payload}, timeout=10)
+            r = sess.get(url, params={param: payload}, timeout=10)
             body = r.text.lower()
             if ("root:" in body or "daemon:" in body):
                 if "../../etc/passwd" not in r.text.lower()[:500]:
-                    return [("HIGH","LFI",f"Parameter '{param}' di {base_url} memungkinkan pembacaan file server (path traversal). Attacker bisa membaca /etc/passwd dan file sensitif lainnya. Payload: {payload}", r.url, f"LFI terdeteksi via parameter '{param}'")]
+                    return [("HIGH","LFI",f"Parameter '{param}' di {url} memungkinkan pembacaan file server (path traversal). Attacker bisa membaca /etc/passwd dan file sensitif lainnya. Payload: {payload}", r.url, f"LFI terdeteksi via parameter '{param}'")]
         except: pass
         return []
     lfi_params = list(dict.fromkeys(["file","page","include","path","doc","load"] + spec_injection_targets(ctx)))
-    out = pmap_until(_check, [(p, pl) for p in lfi_params for pl in ["../../etc/passwd","../../etc/hosts"]])
+    out = pmap_until(_check, [(u, p, pl) for u, job_params in injection_url_jobs(ctx, base_url)
+                              for p in (job_params if job_params is not None else lfi_params)
+                              for pl in ["../../etc/passwd","../../etc/hosts"]])
     if out:
         for sev, code, desc, url, msg in out:
             critical(msg)
@@ -2152,12 +2239,22 @@ def scan_js(sess, base_url, ctx=None):
         if r is None:
             info("Tidak bisa mengambil halaman utama"); return f
         js_urls = set()
-        for m in re.finditer(r'<script[^>]*src=["\']([^"\']+\.js[^"\']*)["\']', r.text, re.I):
+        js_pattern = re.compile(r'<script[^>]*src=["\']([^"\']+\.js[^"\']*)["\']', re.I)
+        for m in js_pattern.finditer(r.text):
             js_urls.add(urllib.parse.urljoin(base_url, m.group(1)))
+        crawler = ctx.get("crawler") if ctx else None
+        if crawler and crawler.pages:
+            for page_url, page_html in list(crawler.pages.items())[:RECON_JS_MAX_PAGES]:
+                for m in js_pattern.finditer(page_html or ""):
+                    js_urls.add(urllib.parse.urljoin(page_url, m.group(1)))
         if not js_urls: info("Tidak ada file JS"); return f
-        targets = list(js_urls)[:5]
+        targets = sorted(js_urls)[:RECON_JS_MAX_FILES]
         info(f"Ditemukan {len(js_urls)} file JS")
+        # Berkas hasil panen recon dipakai ulang supaya tidak diunduh dua kali.
+        harvested = (ctx or {}).get("js_texts") or {}
         def _fetch(js_url):
+            if js_url in harvested:
+                return js_url, harvested[js_url]
             try:
                 r2 = sess.get(js_url, timeout=10)
                 if r2.status_code==200:
@@ -2174,6 +2271,11 @@ def scan_js(sess, base_url, ctx=None):
                 if apis:
                     info(f"  {fn}: {len(apis)} endpoint API")
                     f.append(("INFO","JS_APIS",f"File {fn} mengandung {len(apis)} endpoint API. Endpoint ini mungkin tidak terdokumentasi: {', '.join(apis[:5])}"), evidence_url=js_url)
+                # Ekstraksi diperluas: literal path/URL di fetch/axios/url/map rute.
+                endpoints = extract_js_endpoints(t, (urllib.parse.urlparse(base_url).hostname or "").lower())
+                if endpoints:
+                    info(f"  {fn}: {len(endpoints)} endpoint/path")
+                    f.append(("INFO","JS_ENDPOINT",f"File {fn} memuat {len(endpoints)} endpoint/path, mis. {', '.join(endpoints[:5])}. Endpoint dari bundel JS sering tidak terdokumentasi dan bisa dipakai tanpa autentikasi.", js_url, f"Endpoint JS: {len(endpoints)}"), evidence_url=js_url)
                 # Hardcoded secrets
                 secrets = re.findall(r'(?:api[_-]?key|secret|password|token|auth)\s*[:=]\s*["\'](?!([A-Z][a-z]+\s))([a-zA-Z0-9_\-/@#$%^&*+=]{16,})["\']', t, re.I)
                 secrets = [s for s,_ in secrets]
@@ -2514,42 +2616,621 @@ def scan_jwt(sess, base_url, ctx=None):
                           url, f"Token tanpa klaim exp diterima di {url}", "tentative"), evidence_url=url)
     return f
 
-def scan_subdomains(sess, base_url, ctx=None):
-    f = FindingList(); info("Mencari subdomain...")
-    host = host_from_url(base_url)
-    host = re.sub(r'^www\.', '', host)
-    if not re.match(r'^[a-zA-Z0-9\-.]+\.[a-zA-Z]{2,}$', host): return f
-    crt_url = f"https://crt.sh/?q=%25.{host}&output=json"
-    f.default_evidence_url = crt_url   # bukti temuan subdomain = respons CRT.sh
-    subs = set()
+# ══════════════════════════════════════════════════════════════════
+# RECON (bagian 3) — enumerasi subdomain, URL historis, endpoint JS, port scan
+#
+# Semua sumber pasif diakses lewat API HTTP publik memakai session yang sama
+# (curl_cffi), jadi tidak butuh binary eksternal. Hasil recon dipakai dua kali:
+#   * seed crawler (URL historis), dan
+#   * pool parameter untuk modul injection (SQLi/XSS/LFI/open redirect).
+# Batas request/berkas ada di konstanta RECON_* / PORT_SCAN_*.
+# ══════════════════════════════════════════════════════════════════
+
+# Ekstensi aset statis yang tidak pernah dipakai sebagai seed crawl/endpoint.
+STATIC_ASSET_EXT = (".pdf", ".zip", ".png", ".jpg", ".jpeg", ".gif", ".css",
+                    ".js", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot",
+                    ".map", ".mp4", ".webp", ".gz", ".tar", ".rar")
+
+def _recon_is_static(url):
+    return (urllib.parse.urlparse(str(url)).path or "").lower().endswith(STATIC_ASSET_EXT)
+
+def _recon_timeout_status(exc):
+    """Bedakan timeout dari error lain supaya status sumber di laporan akurat."""
+    text = str(exc).lower()
+    if "timed out" in text or "timeout" in text:
+        return "timeout"
+    return "error"
+
+def _recon_target_host(base_url):
+    """Nama host yang boleh dienumerasi; "" untuk IP/localhost (scan offline)."""
+    host = (urllib.parse.urlparse(base_url).hostname or "").lower()
+    host = re.sub(r"^www\.", "", host)
+    if not host or host == "localhost" or ":" in host:
+        return ""
+    if re.fullmatch(r"[0-9.]+", host):        # IPv4: bukan domain publik
+        return ""
+    if not re.fullmatch(r"[a-z0-9]([a-z0-9\-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]*[a-z0-9])?)+", host):
+        return ""
+    if not re.search(r"\.[a-z]{2,}$", host):
+        return ""
+    return host
+
+def _recon_clean_names(values, host, limit=RECON_MAX_SUBDOMAINS):
+    """Normalisasi nama dari sumber sertifikat: lowercase, tanpa wildcard, unik."""
+    out = []
+    for raw in values or ():
+        name = str(raw or "").strip().lower().rstrip(".")
+        if name.startswith("*."):
+            name = name[2:]
+        if not name or name == host:
+            continue
+        if not name.endswith("." + host):
+            continue
+        if not re.fullmatch(r"[a-z0-9]([a-z0-9\-.]*[a-z0-9])?", name):
+            continue
+        if name not in out:
+            out.append(name)
+        if len(out) >= limit:
+            break
+    return out
+
+def _recon_fetch_json(sess, url, timeout):
+    """GET + parse JSON. Mengembalikan (data, status)."""
     try:
-        r = sess.get(crt_url, timeout=15)
-        if r.status_code==200:
-            try:
-                data = r.json()
-                if isinstance(data, list):
-                    for entry in data[:50]:
-                        for s in entry.get("name_value","").split("\n"):
-                            s=s.strip()
-                            if s.endswith(f".{host}") or s==host: subs.add(s)
-            except: pass
-    except: pass
-    common = ["www","mail","admin","api","dev","staging","test","beta","app","blog","cdn","static","docs","wiki","help","support","status","portal","shop"]
-    def _dns(sub):
-        fqdn = f"{sub}.{host}"
-        if fqdn in subs: return None
+        r = sess.get(url, timeout=timeout)
+    except Exception as exc:
+        return None, _recon_timeout_status(exc)
+    if getattr(r, "status_code", None) != 200:
+        return None, "error"
+    try:
+        return r.json(), "ok"
+    except Exception:
+        return None, "error"
+
+def _recon_source_crtsh(sess, base_url, host):
+    """Subdomain dari log transparansi sertifikat crt.sh."""
+    url = f"https://crt.sh/?q=%25.{host}&output=json"
+    data, status = _recon_fetch_json(sess, url, RECON_SOURCE_TIMEOUT)
+    if not isinstance(data, list):
+        return [], status, url
+    names = []
+    for entry in data:
+        if isinstance(entry, dict):
+            names.extend(str(entry.get("name_value", "")).split("\n"))
+    return _recon_clean_names(names, host), ("ok" if names else "empty"), url
+
+def _recon_source_certspotter(sess, base_url, host):
+    """Subdomain dari Cert Spotter (cadangan saat crt.sh kosong/lambat)."""
+    url = ("https://api.certspotter.com/v1/issuances?domain=" + host
+           + "&include_subdomains=true&expand=dns_names")
+    data, status = _recon_fetch_json(sess, url, RECON_SOURCE_TIMEOUT)
+    if not isinstance(data, list):
+        return [], status, url
+    names = []
+    for entry in data:
+        if isinstance(entry, dict):
+            names.extend(entry.get("dns_names") or [])
+    return _recon_clean_names(names, host), ("ok" if names else "empty"), url
+
+def _recon_source_wayback(sess, base_url, host):
+    """URL historis dari Wayback CDX (responsnya bisa lambat: timeout 45s)."""
+    url = ("https://web.archive.org/cdx/search/cdx?url=" + host
+           + "&matchType=domain&output=json&collapse=urlkey&fl=original&limit=1000")
+    data, status = _recon_fetch_json(sess, url, RECON_CDX_TIMEOUT)
+    if not isinstance(data, list):
+        return [], status, url
+    urls = []
+    for row in data[1:]:                       # baris pertama = header kolom
+        if isinstance(row, list) and row:
+            urls.append(str(row[0]))
+        elif isinstance(row, str):
+            urls.append(row)
+    return urls, ("ok" if urls else "empty"), url
+
+def _recon_source_commoncrawl(sess, base_url, host):
+    """URL historis dari indeks Common Crawl (koleksi terbaru)."""
+    collinfo = "https://index.commoncrawl.org/collinfo.json"
+    collections, status = _recon_fetch_json(sess, collinfo, RECON_SOURCE_TIMEOUT)
+    if not isinstance(collections, list) or not collections:
+        return [], status, collinfo
+    index = ""
+    for entry in collections:
+        if isinstance(entry, dict) and entry.get("cdx-api"):
+            index = str(entry["cdx-api"])
+            break
+    if not index:
+        return [], "error", collinfo
+    url = index + "?url=" + host + "&matchType=domain&output=json&limit=500"
+    try:
+        r = sess.get(url, timeout=RECON_CDX_TIMEOUT)
+    except Exception as exc:
+        return [], _recon_timeout_status(exc), url
+    if getattr(r, "status_code", None) != 200:
+        return [], "error", url
+    urls = []
+    for line in (getattr(r, "text", "") or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
         try:
-            socket.getaddrinfo(fqdn, 443, socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, socket.AI_NUMERICSERV)
-            return fqdn
-        except: pass
-        return None
-    for found in pmap(_dns, common):
-        if found: subs.add(found)
+            record = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(record, dict) and record.get("url"):
+            urls.append(str(record["url"]))
+    return urls, ("ok" if urls else "empty"), url
+
+def recon_sources():
+    """Registry sumber recon pasif.
+
+    Test mengganti isi registry ini (monkeypatch) supaya seluruh alur recon bisa
+    diuji offline tanpa menyentuh crt.sh/Wayback/Common Crawl.
+    """
+    return {
+        "crtsh": _recon_source_crtsh,
+        "certspotter": _recon_source_certspotter,
+        "wayback": _recon_source_wayback,
+        "commoncrawl": _recon_source_commoncrawl,
+    }
+
+def recon_dns_resolve(fqdn, timeout=RECON_DNS_TIMEOUT):
+    """True kalau `fqdn` punya alamat IP. Seam yang dipatch di test.
+
+    Lookup dijalankan di thread penjaga supaya resolver OS yang menggantung tidak
+    memblokir scan lebih lama dari `timeout`.
+    """
+    found = []
+
+    def _lookup():
+        try:
+            socket.getaddrinfo(fqdn, 443, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            found.append(True)
+        except Exception:
+            pass
+
+    worker = threading.Thread(target=_lookup, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    return bool(found)
+
+def recon_dns_brute(host, limit=RECON_MAX_SUBDOMAINS):
+    """Brute force DNS ringan dengan wordlist internal (paralel)."""
+    def _one(name):
+        fqdn = f"{name}.{host}"
+        return fqdn if recon_dns_resolve(fqdn) else None
+    found = []
+    for item in pmap(_one, RECON_DNS_WORDLIST):
+        if item and item not in found:
+            found.append(item)
+        if len(found) >= limit:
+            break
+    return found
+
+def recon_probe_host(sess, name):
+    """Probe ringan host hasil enumerasi: status + title + header Server.
+
+    Tidak ada modul kerentanan yang dijalankan di host ini — hanya bukti hidup.
+    """
+    for scheme in ("https", "http"):
+        url = f"{scheme}://{name}/"
+        try:
+            r = sess.get(url, timeout=RECON_HOST_TIMEOUT)
+        except Exception:
+            continue
+        text = getattr(r, "text", "") or ""
+        title = ""
+        m = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S)
+        if m:
+            title = " ".join(m.group(1).split())[:80]
+        headers = getattr(r, "headers", None) or {}
+        return {"url": url, "status": getattr(r, "status_code", None),
+                "title": title, "server": str(headers.get("Server", ""))[:60]}
+    return None
+
+def recon_port_open(host, port, timeout=PORT_SCAN_TIMEOUT):
+    """TCP connect scan sederhana. Seam yang dipatch di test."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+def recon_port_scan(hosts):
+    """Port scan ringan: host x PORT_SCAN_PORTS, hasil hanya port terbuka."""
+    found = []
+    for host in hosts:
+        def _one(port):
+            return port if recon_port_open(host, port) else None
+        for port in pmap(_one, PORT_SCAN_PORTS):
+            if port:
+                found.append((host, port, PORT_SCAN_SERVICES.get(port, "unknown")))
+    return found
+
+def _recon_clean_urls(urls, host, limit=RECON_MAX_HISTORIC_URLS):
+    """Buang URL di luar host target, non-http, dan aset statis; jaga urutan."""
+    out = []
+    for raw in urls or ():
+        try:
+            p = urllib.parse.urlparse(str(raw).strip())
+        except Exception:
+            continue
+        if p.scheme not in ("http", "https") or not p.netloc:
+            continue
+        netloc_host = p.netloc.split(":")[0].lower()
+        if netloc_host != host and not netloc_host.endswith("." + host):
+            continue
+        clean = f"{p.scheme}://{p.netloc}{p.path or '/'}"
+        if p.query:
+            clean += "?" + p.query
+        if _recon_is_static(clean) or clean in out:
+            continue
+        out.append(clean)
+        if len(out) >= limit:
+            break
+    return out
+
+def recon_param_targets(urls, max_urls=RECON_PARAM_URLS, max_names=RECON_PARAM_NAMES):
+    """[(url_tanpa_query, [nama parameter])] dari URL hasil recon.
+
+    Hanya parameter yang benar-benar ada di URL historis yang dipakai — bukan
+    wordlist — supaya modul injection tidak menembak parameter karangan.
+    """
+    out = []
+    seen = set()
+    for raw in urls or ():
+        try:
+            p = urllib.parse.urlparse(str(raw))
+        except Exception:
+            continue
+        if not p.query:
+            continue
+        names = []
+        for name, _value in urllib.parse.parse_qsl(p.query, keep_blank_values=True):
+            if name and name not in names:
+                names.append(name)
+        names = names[:max_names]
+        if not names:
+            continue
+        key = (p.scheme, p.netloc, p.path)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((f"{p.scheme}://{p.netloc}{p.path}", names))
+        if len(out) >= max_urls:
+            break
+    return out
+
+def recon_injection_targets(ctx):
+    """[(url, [param])] hasil recon untuk modul injection (selalu berbatas)."""
+    targets = ctx.get("recon_param_targets") if isinstance(ctx, dict) else None
+    out = []
+    for job in targets or ():
+        try:
+            url, params = job
+        except Exception:
+            continue
+        if not url or not params:
+            continue
+        out.append((url, list(params)[:RECON_PARAM_NAMES]))
+        if len(out) >= RECON_PARAM_URLS:
+            break
+    return out
+
+def injection_url_jobs(ctx, base_url):
+    """Target injection: (base_url, None) + URL hasil recon yang punya query.
+
+    `None` berarti "pakai daftar parameter bawaan modul" (perilaku lama, tidak
+    berubah saat recon tidak jalan).
+    """
+    jobs = [(base_url, None)]
+    for url, params in recon_injection_targets(ctx):
+        if url and url != base_url:
+            jobs.append((url, params))
+    return jobs
+
+def recon_seed_urls(ctx):
+    """Seed crawler tambahan dari URL historis (berbatas RECON_MAX_SEEDS)."""
+    urls = ctx.get("recon_urls") if isinstance(ctx, dict) else None
+    return [u for u in (urls or []) if not _recon_is_static(u)][:RECON_MAX_SEEDS]
+
+def _looks_like_endpoint(candidate):
+    """Filter hasil ekstraksi JS: hanya rute API/menarik, bukan aset statis."""
+    if not candidate.startswith("/") or len(candidate) > 200:
+        return False
+    if re.search(r"[\s{}#$<>\"'`]", candidate):
+        return False
+    path, _, query = candidate.partition("?")
+    if path.lower().endswith(STATIC_ASSET_EXT):
+        return False
+    if query and "=" in query:
+        return True
+    return bool(re.search(r"(?:^|/)(?:api|apis|rest|graphql|gql|rpc|json|v\d+|oauth|auth|"
+                          r"token|account|user|users|admin|search|upload|files?|order|payment|"
+                          r"webhook|internal|private|config|debug|export|report)(?:/|$|\?|=)",
+                          path, re.I))
+
+def extract_js_endpoints(text, host=""):
+    """Endpoint dari berkas JS: literal relatif dan absolut (host target saja)."""
+    found = []
+    pattern = re.compile(r"""["'`]([^"'`\s<>]{2,200})["'`]""")
+    for m in pattern.finditer(text or ""):
+        raw = m.group(1).strip()
+        if not raw:
+            continue
+        if raw.startswith(("http://", "https://", "//")):
+            p = urllib.parse.urlparse(raw if not raw.startswith("//") else "https:" + raw)
+            if host and p.netloc.split(":")[0].lower() != host:
+                continue
+            candidate = p.path or "/"
+            if p.query:
+                candidate += "?" + p.query
+        elif raw.startswith("/"):
+            candidate = raw
+        else:
+            continue
+        if _looks_like_endpoint(candidate) and candidate not in found:
+            found.append(candidate)
+        if len(found) >= RECON_JS_MAX_ENDPOINTS:
+            break
+    return found
+
+def recon_js(sess, base_url, ctx=None):
+    """Panen endpoint dari berkas JS (halaman utama + halaman crawl).
+
+    Hasilnya dimemoikan di ctx["recon_js"] dan teks JS disimpan di ctx["js_texts"]
+    supaya modul `js` tidak mengunduh berkas yang sama dua kali.
+    """
+    def _harvest():
+        host = (urllib.parse.urlparse(base_url).hostname or "").lower()
+        pages = []
+        response = get_base_response(sess, base_url, ctx)
+        if response is not None:
+            pages.append((base_url, getattr(response, "text", "") or ""))
+        crawler = ctx.get("crawler") if isinstance(ctx, dict) else None
+        if crawler and crawler.pages:
+            for page_url, page_html in list(crawler.pages.items()):
+                if page_url == base_url:
+                    continue
+                pages.append((page_url, page_html))
+                if len(pages) > RECON_JS_MAX_PAGES:
+                    break
+        pattern = re.compile(r"""<script[^>]*src=["']([^"']+)["']""", re.I)
+        js_urls = []
+        for page_url, page_html in pages:
+            for m in pattern.finditer(page_html or ""):
+                src = m.group(1).strip()
+                if ".js" not in src.split("?")[0].lower():
+                    continue
+                full = urllib.parse.urljoin(page_url, src)
+                if full.startswith(("http://", "https://")) and full not in js_urls:
+                    js_urls.append(full)
+        js_urls = js_urls[:RECON_JS_MAX_FILES]
+
+        def _fetch(js_url):
+            try:
+                r = sess.get(js_url, timeout=10)
+                if getattr(r, "status_code", None) == 200:
+                    return js_url, getattr(r, "text", "") or ""
+            except Exception:
+                pass
+            return js_url, None
+
+        texts = {}
+        by_file = {}
+        endpoints = []
+        for js_url, body in pmap(_fetch, js_urls):
+            if body is None:
+                continue
+            texts[js_url] = body
+            found = extract_js_endpoints(body, host)
+            if found:
+                by_file[js_url] = found
+            for endpoint in found:
+                if endpoint not in endpoints:
+                    endpoints.append(endpoint)
+        return {"endpoints": endpoints[:RECON_JS_MAX_ENDPOINTS],
+                "texts": texts, "by_file": by_file}
+    return ctx_get(ctx, ("recon_js", base_url), _harvest)
+
+def _recon_apply_ctx(ctx, data):
+    """Tulis hasil recon ke ctx supaya crawler/modul injection/js bisa memakainya."""
+    if not isinstance(ctx, dict):
+        return data
+    ctx["recon"] = data
+    ctx["recon_urls"] = list(data.get("historic_urls") or [])
+    ctx["recon_param_targets"] = list(data.get("param_targets") or [])
+    return data
+
+def recon_gather(sess, base_url, ctx=None):
+    """Tahap recon lengkap: subdomain, DNS brute, host probe, URL historis, port scan.
+
+    Mengembalikan dict hasil + status per sumber. Selalu selesai tanpa exception:
+    sumber yang gagal hanya tercatat sebagai status, karena laporan tidak boleh
+    mengklaim target bersih saat enumerasi tidak jalan.
+    """
+    def _produce():
+        data = {"sources": {}, "errors": [], "subdomains": [], "live_hosts": [],
+                "historic_urls": [], "param_targets": [], "open_ports": [],
+                "index_urls": {}, "counts": {}, "_raw_urls": []}
+        host = _recon_target_host(base_url)
+        if not host:
+            for name in ("crtsh", "certspotter", "dnsbrute", "wayback", "commoncrawl",
+                         "hostprobe", "portscan", "js"):
+                data["sources"][name] = "skipped"
+            return data
+
+        subs = []
+        def _run_source(item):
+            name, func = item
+            try:
+                names, status, url = func(sess, base_url, host)
+            except Exception as exc:                   # pengaman terakhir
+                return name, [], _recon_timeout_status(exc), "", f"{type(exc).__name__}: {exc}"
+            return name, list(names or []), status, url, ""
+        for name, names, status, index_url, err in pmap(_run_source, list(recon_sources().items())):
+            data["sources"][name] = status
+            if err:
+                data["errors"].append({"source": name, "error": err})
+            if index_url:
+                data["index_urls"][name] = index_url
+            if not names:
+                continue
+            if name in ("crtsh", "certspotter"):
+                # Normalisasi diulang di sini (sumber sudah melakukannya) supaya
+                # jaminan "subdomain selalu di dalam scope target" tidak bergantung
+                # pada kepatuhan tiap sumber yang didaftarkan di `recon_sources()`.
+                for found in _recon_clean_names(names, host):
+                    if found not in subs:
+                        subs.append(found)
+            else:
+                data["_raw_urls"].extend(names)
+        data["subdomains"] = sorted(subs)[:RECON_MAX_SUBDOMAINS]
+
+        brute = recon_dns_brute(host)
+        data["sources"]["dnsbrute"] = "ok" if brute else "empty"
+        for found in brute:
+            if found not in data["subdomains"]:
+                data["subdomains"].append(found)
+        data["subdomains"] = sorted(dict.fromkeys(data["subdomains"]))[:RECON_MAX_SUBDOMAINS]
+
+        probed = list(data["subdomains"])[:RECON_MAX_HOSTS_PROBED]
+        if probed:
+            live = []
+            for name, info in pmap(lambda n: (n, recon_probe_host(sess, n)), probed):
+                if info:
+                    info["name"] = name
+                    live.append(info)
+            data["live_hosts"] = live
+            data["sources"]["hostprobe"] = "ok" if live else "empty"
+        else:
+            data["sources"]["hostprobe"] = "empty"
+
+        urls = _recon_clean_urls(data["_raw_urls"], host)
+        data["historic_urls"] = urls
+        data["param_targets"] = recon_param_targets(urls)
+
+        if isinstance(ctx, dict) and ctx.get("port_scan"):
+            hosts = [host] + [item["name"] for item in data["live_hosts"] if item.get("name")]
+            hosts = list(dict.fromkeys(hosts))[:PORT_SCAN_MAX_HOSTS]
+            data["open_ports"] = recon_port_scan(hosts)
+            data["sources"]["portscan"] = "ok" if data["open_ports"] else "empty"
+        else:
+            data["sources"]["portscan"] = "skipped"
+
+        data["sources"]["js"] = "skipped"   # diisi modul recon (butuh hasil crawl)
+        data["counts"] = {
+            "subdomains": len(data["subdomains"]),
+            "live_hosts": len(data["live_hosts"]),
+            "historic_urls": len(data["historic_urls"]),
+            "js_endpoints": 0,
+            "open_ports": len(data["open_ports"]),
+        }
+        return data
+
+    data = ctx_get(ctx, ("recon_result", base_url), _produce)
+    return _recon_apply_ctx(ctx, data)
+
+def scan_recon(sess, base_url, ctx=None):
+    """Modul recon: laporkan hasil enumerasi + panen endpoint JS.
+
+    Modul kerentanan tidak dijalankan di host hasil enumerasi — host hanya
+    dibuktikan hidup (status/title/Server), sedangkan bahan yang dipanen dipakai
+    modul lain (seed crawler + pool parameter injection).
+    """
+    f = FindingList(base_url); info("Recon: enumerasi subdomain, URL historis, JS...")
+    data = recon_gather(sess, base_url, ctx)
+    for name, status in sorted((data.get("sources") or {}).items()):
+        if status in ("timeout", "error"):
+            reason = "timeout" if status == "timeout" else "gagal diakses"
+            warn(f"  Sumber recon '{name}' {reason} — hasil enumerasi tidak lengkap")
+            f.append(("INFO", "RECON_SOURCE_SKIPPED",
+                      f"Sumber recon '{name}' {reason} saat memindai {base_url}. Hasil enumerasi "
+                      f"tidak lengkap — temuan kosong di laporan ini bukan bukti target bersih.",
+                      None, None, "certain"), evidence_url=None)
+
+    subs = data.get("subdomains") or []
+    if subs:
+        info(f"  {len(subs)} subdomain unik")
+    for item in data.get("live_hosts") or []:
+        title = item.get("title") or "(tanpa judul)"
+        server = item.get("server") or "-"
+        f.append(("INFO", "SUBDOMAIN_LIVE",
+                  f"Host {item['name']} hidup (HTTP {item.get('status')}, title: '{title}', "
+                  f"Server: {server}). Host ini tidak ditautkan dari halaman utama — periksa apakah "
+                  f"surface ini masuk scope program dan butuh perlakuan berbeda.",
+                  item.get("url"), f"Host hidup: {item['name']}"), evidence_url=item.get("url"))
+
+    urls = data.get("historic_urls") or []
+    if urls:
+        indexes = data.get("index_urls") or {}
+        index_url = indexes.get("wayback") or indexes.get("commoncrawl") or base_url
+        warn(f"  {len(urls)} URL historis dari indeks pihak ketiga")
+        f.append(("INFO", "HISTORIC_URLS",
+                  f"Ditemukan {len(urls)} URL historis untuk {host_from_url(base_url)} "
+                  f"(Wayback/Common Crawl): {', '.join(urls[:5])}"
+                  f"{' ...' if len(urls) > 5 else ''}. Endpoint lama sering masih hidup tanpa "
+                  f"autentikasi/rate limit — verifikasi manual sebelum melaporkan.",
+                  index_url, f"URL historis: {len(urls)}"), evidence_url=index_url)
+
+    js = recon_js(sess, base_url, ctx)
+    by_file = js.get("by_file") or {}
+    if by_file:
+        data["sources"]["js"] = "ok"
+        data["counts"]["js_endpoints"] = len(js.get("endpoints") or [])
+        if isinstance(ctx, dict):
+            ctx["js_texts"] = dict(js.get("texts") or {})
+            merged = list(ctx.get("recon_param_targets") or [])
+            known = [u for u, _p in merged]
+            for extra in recon_param_targets(js.get("endpoints") or []):
+                if extra[0] not in known:
+                    merged.append(extra)
+                    known.append(extra[0])
+            ctx["recon_param_targets"] = merged[:RECON_PARAM_URLS]
+        for js_url, endpoints in list(by_file.items())[:8]:
+            info(f"  {js_url.split('/')[-1]}: {len(endpoints)} endpoint")
+            f.append(("INFO", "JS_ENDPOINT",
+                      f"Berkas JS {js_url.split('/')[-1]} memuat {len(endpoints)} endpoint "
+                      f"(mis. {', '.join(endpoints[:5])}). Endpoint dari bundel JS sering tidak "
+                      f"terdokumentasi dan bisa dipakai tanpa autentikasi.",
+                      js_url, f"Endpoint JS: {len(endpoints)}"), evidence_url=js_url)
+    elif js.get("texts"):
+        data["sources"]["js"] = "empty"
+
+    for host, port, service in data.get("open_ports") or []:
+        risky = port in PORT_SCAN_RISKY_PORTS
+        extra = (" Service ini seharusnya tidak terekspos ke internet — kalau memang terbuka, "
+                 "kredensial bawaan/default config jadi sasaran langsung.") if risky else ""
+        f.append(("LOW" if risky else "INFO", "PORT_OPEN",
+                  f"Port {port} ({service}) terbuka di {host}.{extra}",
+                  f"http://{host}:{port}/", f"Port terbuka: {host}:{port}"),
+                 evidence_url=None)
+    return f
+
+def scan_subdomains(sess, base_url, ctx=None):
+    """Subdomain hasil recon (bagian 3).
+
+    Enumerasi sudah dijalankan sekali di `recon_gather` (crt.sh + Cert Spotter +
+    brute force DNS internal); modul ini hanya merapikan irisannya jadi temuan.
+    Target IP/localhost tidak memicu request apa pun.
+    """
+    f = FindingList(); info("Mencari subdomain...")
+    host = _recon_target_host(base_url)
+    if not host: return f
+    data = recon_gather(sess, base_url, ctx)
+    subs = data.get("subdomains") or []
+    sources = data.get("sources") or {}
+    used = [label for key, label in (("crtsh", "CRT.sh"), ("certspotter", "Cert Spotter"),
+                                     ("dnsbrute", "DNS lookup"))
+            if sources.get(key) == "ok"]
+    f.default_evidence_url = (data.get("index_urls") or {}).get("crtsh") or base_url
     if subs:
         info(f"Ditemukan {len(subs)} subdomain")
-        for s in sorted(subs)[:10]: info(f"  {s}")
+        for s in subs[:10]: info(f"  {s}")
         if len(subs)>10: info(f"  +{len(subs)-10} lainnya")
-        f.append(("INFO","SUBDOMAINS",f"Ditemukan {len(subs)} subdomain untuk {host} via CRT.sh + DNS lookup. Periksa setiap subdomain untuk potensi serangan: {'; '.join(sorted(subs)[:10])}"))
+        f.append(("INFO","SUBDOMAINS",f"Ditemukan {len(subs)} subdomain untuk {host} via "
+                  f"{' + '.join(used) if used else 'sumber pasif'}. Periksa setiap subdomain untuk "
+                  f"potensi serangan: {'; '.join(subs[:10])}"))
+    else: info("Tidak ada subdomain ditemukan")
     return f
 
 def scan_forms_analyze(sess, base_url, ctx=None):
@@ -3817,6 +4498,7 @@ ALL_MODULES = OrderedDict([
     ("graphql",   ("GraphQL", scan_graphql)),
     ("js",        ("JS Analysis", scan_js)),
     ("jwt",       ("JWT", scan_jwt)),
+    ("recon",     ("Recon", scan_recon)),
     ("subdomains",("Subdomain", scan_subdomains)),
     ("apispec",   ("API Spec", scan_api_specs)),
     ("params",    ("Parameter Discovery", scan_params)),
@@ -3826,7 +4508,7 @@ ALL_MODULES = OrderedDict([
 
 QUICK_MODULES = ["tech","headers","robots","sensitive","cors","tls","ratelimit"]
 # Modul yang lebih lambat/intrusif hanya jalan di mode detailed.
-DETAILED_ONLY = {"xxe","ssti","nosqli","graphql","js","jwt","subdomains",
+DETAILED_ONLY = {"xxe","ssti","nosqli","graphql","js","jwt","recon","subdomains",
                  "apispec","params","hostheader","crlf","smuggling"}
 STANDARD_MODULES = [k for k in ALL_MODULES if k not in DETAILED_ONLY]
 
@@ -3844,7 +4526,9 @@ def main(argv=None):
   python3 spade.py example.com -o laporan.html       # custom output
   python3 spade.py example.com --csv hasil.csv       # export CSV
   python3 spade.py example.com --json hasil.json     # export JSON
-  python3 spade.py example.com --sarif hasil.sarif   # export SARIF""")
+  python3 spade.py example.com --sarif hasil.sarif   # export SARIF
+  python3 spade.py example.com --recon-only          # recon saja (subdomain + URL historis)
+  python3 spade.py example.com --detailed --port-scan # full + TCP connect scan""")
     parser.add_argument("target", nargs="?", default="", help="Target URL (opsional — akan diminta interaktif jika kosong)")
     parser.add_argument("-o","--output", default="", help="Laporan HTML")
     parser.add_argument("--csv", default="", help="Export CSV")
@@ -3856,7 +4540,7 @@ def main(argv=None):
                         help="Matikan redaksi cookie/token/password di laporan. HATI-HATI: jangan dibagikan.")
     parser.add_argument("--quick", action="store_true", help="Mode cepat (7 modul, basic checks)")
     parser.add_argument("--detailed", action="store_true",
-                        help="Mode lengkap (31 modul, crawl, param discovery, JWT, OOB)")
+                        help="Mode lengkap (32 modul, crawl, recon, param discovery, JWT, OOB)")
     parser.add_argument("--no-color", action="store_true", help="Output tanpa warna")
     parser.add_argument("--skip-ssl", action="store_true", help="Nonaktifkan verifikasi SSL (untuk sertifikat self-signed/expired)")
     parser.add_argument("--cookie", action="append", default=[], metavar="N=V;M=X",
@@ -3879,7 +4563,19 @@ def main(argv=None):
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help=f"Jumlah request paralel per scan (default: {DEFAULT_WORKERS}, 1 = sekuensial)")
     parser.add_argument("--crawl-depth", type=int, default=2, help="Kedalaman crawl mode detailed (default: 2)")
     parser.add_argument("--crawl-max", type=int, default=30, help="Maksimal halaman di-crawl mode detailed (default: 30)")
+    parser.add_argument("--port-scan", action="store_true",
+                        help="TCP connect scan ringan ke port umum (butuh --detailed atau --recon-only)")
+    parser.add_argument("--recon-only", action="store_true",
+                        help="Hanya jalankan recon (subdomain, URL historis, endpoint JS) tanpa modul vuln")
+    parser.add_argument("--no-recon", action="store_true",
+                        help="Lewati tahap recon di mode detailed (nama target tidak dikirim ke crt.sh/Wayback)")
     args = parser.parse_args(argv)
+    if args.recon_only and (args.quick or args.detailed):
+        parser.error("--recon-only tidak bisa digabung dengan --quick/--detailed")
+    if args.recon_only and args.no_recon:
+        parser.error("--recon-only butuh recon aktif — jangan digabung dengan --no-recon")
+    if args.port_scan and not (args.detailed or args.recon_only):
+        parser.error("--port-scan hanya berlaku bersama --detailed atau --recon-only")
     if args.no_color: DISABLE_COLOR = True
     if args.no_redact:
         REDACT_ENABLED = False
@@ -3938,7 +4634,7 @@ def main(argv=None):
         print("  Pilih mode scan:")
         print("    [1] Quick     — 7 modul, basic checks (cepat)")
         print("    [2] Standard  — 19 modul, recommended (default)")
-        print("    [3] Detailed  — 31 modul, full scan dengan crawl + subdomain")
+        print("    [3] Detailed  — 32 modul, full scan dengan crawl + recon + subdomain")
         mode_ch = input("  [>] Pilih [1/2/3] (default: 2): ").strip()
         while mode_ch and mode_ch not in ("1","2","3"):
             mode_ch = input("  [>] Pilih 1, 2, atau 3: ").strip()
@@ -3952,7 +4648,8 @@ def main(argv=None):
 
     target = normalize_url(args.target)
     host = host_from_url(target)
-    mode = "quick" if args.quick else ("detailed" if args.detailed else "standard")
+    mode = "quick" if args.quick else ("detailed" if args.detailed
+                                      else ("recon" if args.recon_only else "standard"))
 
     print()
     print(f"    {c('bold',c('cyan','+===========[ SPADE ]===========+'))}")
@@ -3974,6 +4671,10 @@ def main(argv=None):
         warn("ACTIVE WRITES ON — modul CSRF mengirim POST ke target (bisa mengubah data).")
     if args.check_smuggling:
         warn("REQUEST SMUGGLING ON — socket mentah CL.TE/TE.CL dikirim ke target.")
+    if args.port_scan:
+        warn("PORT SCAN ON — TCP connect scan ke port umum di target dan host hasil enumerasi.")
+    if args.recon_only:
+        warn("RECON ONLY — hanya enumerasi, modul kerentanan tidak dijalankan.")
     if jwt_secrets:
         info(f"JWT   : {len(jwt_secrets)} secret tambahan dari {args.jwt_secrets}")
     info(f"Start : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -4003,6 +4704,9 @@ def main(argv=None):
         "active_writes": bool(args.active_writes),
         "check_smuggling": bool(args.check_smuggling),
         "oob": bool(oob_host),
+        "recon": {"enabled": False, "sources": {}, "counts": {}, "errors": []},
+        "port_scan": bool(args.port_scan),
+        "recon_only": bool(args.recon_only),
         "modules": [],
         "errors": [],
         "redacted": bool(REDACT_ENABLED),
@@ -4015,6 +4719,13 @@ def main(argv=None):
         "check_smuggling": bool(args.check_smuggling),
         "oob_host": oob_host,
         "jwt_secrets": jwt_secrets,
+        "recon": None,
+        "recon_urls": [],
+        "recon_js_endpoints": [],
+        "recon_param_targets": [],
+        "js_texts": {},
+        "port_scan": bool(args.port_scan),
+        "recon_only": bool(args.recon_only),
     }
 
     wafs = waf_detect(sess, target, ctx)
@@ -4022,13 +4733,29 @@ def main(argv=None):
     # Ambil halaman utama sekali, agar modul pasif (headers/tech/js/jwt/crawl) tidak request berulang.
     base_resp = get_base_response(sess, target, ctx)
 
+    # ── Recon (bagian 3): dijalankan sebelum crawler supaya URL historis bisa
+    # dipakai sebagai seed, dan sebelum modul injection supaya pool parameter
+    # recon sudah tersedia saat modul itu jalan. ──
+    recon_on = mode in ("detailed", "recon") and not args.no_recon
+    if recon_on:
+        info("Recon: enumerasi subdomain, URL historis, dan host hidup...")
+        recon_data = recon_gather(sess, target, ctx)
+        counts = recon_data.get("counts") or {}
+        info(f"Recon: {counts.get('subdomains', 0)} subdomain, {counts.get('live_hosts', 0)} host hidup, "
+             f"{counts.get('historic_urls', 0)} URL historis")
+        scan["recon"] = {"enabled": True, "sources": recon_data.get("sources") or {},
+                         "counts": dict(counts), "errors": recon_data.get("errors") or []}
+
     if mode == "quick":
         modules = list(QUICK_MODULES)
         crawler = None
-    elif mode == "detailed":
-        modules = list(ALL_MODULES.keys())
+    elif mode in ("detailed", "recon"):
+        modules = list(ALL_MODULES.keys()) if mode == "detailed" else ["recon"]
+        if args.no_recon:
+            modules = [k for k in modules if k != "recon"]
         info("Merayapi halaman (depth 2)...")
-        crawler = Crawler(sess, target, depth=args.crawl_depth, max_p=args.crawl_max)
+        crawler = Crawler(sess, target, depth=args.crawl_depth, max_p=args.crawl_max,
+                          extra_seeds=recon_seed_urls(ctx))
         crawler.crawl(seed_text=base_resp.text if base_resp is not None else None)
         info(f"Merayapi {len(crawler.pages)} halaman")
         print()
@@ -4036,6 +4763,12 @@ def main(argv=None):
         modules = list(STANDARD_MODULES)
         crawler = None
     ctx["crawler"] = crawler
+    if recon_on:
+        # Panen endpoint JS setelah crawl supaya berkas JS dari halaman hasil
+        # crawl ikut terbaca, lalu dipakai modul `js` tanpa unduh ulang.
+        recon_js_data = recon_js(sess, target, ctx)
+        ctx["recon_js_endpoints"] = list(recon_js_data.get("endpoints") or [])
+        scan["recon"]["counts"]["js_endpoints"] = len(ctx["recon_js_endpoints"])
 
     info(f"Menjalankan {len(modules)} modul...")
     for key in modules:

@@ -3,7 +3,8 @@
 Dokumen ini menjelaskan setiap kelas kerentanan yang ada di Spade: apa yang
 diuji, flag/opsi CLI yang dibutuhkan, batas jumlah request, penjaga false
 positive, dan status defaultnya. Latar belakang roadmap-nya ada di
-[docs/bug-bounty-gaps.md](bug-bounty-gaps.md) bagian 2, model temuan/bukti ada di
+[docs/bug-bounty-gaps.md](bug-bounty-gaps.md) bagian 2, tahap recon ada di
+[docs/recon.md](recon.md), model temuan/bukti ada di
 [docs/findings-model.md](findings-model.md).
 
 Prinsip umum:
@@ -22,7 +23,7 @@ Prinsip umum:
 
 ## Mode dan kelas yang jalan
 
-| Kelas | Modul | QUICK (7) | STANDARD (19) | DETAILED (31) |
+| Kelas | Modul | QUICK (7) | STANDARD (19) | DETAILED (32) |
 |---|---|---|---|---|
 | IDOR / BOLA | `idor` | ❌ | ✅* | ✅* |
 | CSRF | `csrf` | ❌ | ✅* | ✅* |
@@ -34,6 +35,8 @@ Prinsip umum:
 | CRLF | `crlf` | ❌ | ❌ | ✅ |
 | Request smuggling | `smuggling` | ❌ | ❌ | ✅ (butuh flag) |
 | OOB (SSRF/XXE/CMDi) | di dalam `ssrf`/`xxe`/`cmdi` | ❌ | `ssrf`+`cmdi` | semua (`xxe` DETAILED) |
+| Recon (subdomain/URL historis/JS/host hidup) | `recon`, `subdomains` | ❌ | ❌ | ✅ |
+| Port scan TCP connect | di dalam `recon` | ❌ | ❌ | ✅ (butuh `--port-scan`) |
 
 `*` = cakupan berkurang kalau tidak ada sesi autentikasi atau flag aktivasi
 (lihat tabel flag di bawah).

@@ -246,7 +246,7 @@ def test_oob_flag_recorded_and_warns_on_self_reference(vuln_server, tmp_path, ca
 
 
 # ══════════════════════════════════════════════════════════════════
-# Mode scan: anggota modul 7/19/31
+# Mode scan: anggota modul 7/19/32
 # ══════════════════════════════════════════════════════════════════
 
 def test_standard_mode_excludes_detailed_only_modules(vuln_server, tmp_path):
@@ -278,4 +278,3 @@ def test_detailed_mode_without_auth_skips_auth_modules_cleanly(vuln_server, tmp_
     payload = json.loads(json_out.read_text(encoding="utf-8"))
     assert payload["scan"]["errors"] == []
     assert "SCAN_ERROR" not in {f["code"] for f in payload["findings"]}
-

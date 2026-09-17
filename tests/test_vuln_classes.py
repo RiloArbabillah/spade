@@ -357,9 +357,10 @@ def test_jwt_forgery_requires_auth_session(jwt_server, jwt_auth_sess):
 # ══════════════════════════════════════════════════════════════════
 
 def test_module_counts_match_cli_help():
-    assert len(spade.ALL_MODULES) == 31
+    assert len(spade.ALL_MODULES) == 32
     assert len(spade.QUICK_MODULES) == 7
     assert len(spade.STANDARD_MODULES) == 19
+    assert len(spade.DETAILED_ONLY) == 13
 
 
 def test_new_codes_have_finding_meta():
@@ -367,6 +368,8 @@ def test_new_codes_have_finding_meta():
                  "AUTH_BYPASS_HEADER", "AUTH_BYPASS_PATH", "HOST_HEADER_INJECTION",
                  "CACHE_POISONING", "CACHE_DECEPTION", "API_SPEC_EXPOSED", "PARAM_DISCOVERY",
                  "CRLF_INJECTION", "REQUEST_SMUGGLING", "SSRF_BLIND", "XXE_BLIND", "CMDI_BLIND",
+                 "SUBDOMAIN_LIVE", "HISTORIC_URLS", "JS_ENDPOINT", "PORT_OPEN",
+                 "RECON_SOURCE_SKIPPED", "SUBDOMAINS",
                  "JWT_WEAK_SECRET", "JWT_KID_TRAVERSAL", "JWT_ALG_CONFUSION",
                  "JWT_ALG_CONFUSION_SURFACE", "JWT_EXPIRED_ACCEPTED", "JWT_NO_EXPIRY",
                  "JWT_KID_SUSPECT", "JWT_COOKIE", "JWT_BEARER", "JWT_ALG_NONE"):
