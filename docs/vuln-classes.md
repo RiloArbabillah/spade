@@ -37,6 +37,7 @@ Prinsip umum:
 | OOB (SSRF/XXE/CMDi) | di dalam `ssrf`/`xxe`/`cmdi` | ❌ | `ssrf`+`cmdi` | semua (`xxe` DETAILED) |
 | Recon (subdomain/URL historis/JS/host hidup) | `recon`, `subdomains` | ❌ | ❌ | ✅ |
 | Port scan TCP connect | di dalam `recon` | ❌ | ❌ | ✅ (butuh `--port-scan`) |
+| Kredensial hardcode di JS | `js` | ❌ | ❌ | ✅ |
 
 `*` = cakupan berkurang kalau tidak ada sesi autentikasi atau flag aktivasi
 (lihat tabel flag di bawah).
@@ -338,6 +339,61 @@ User-Agent, dan waktu pemanggilan.
 memanggilnya, jadi jalankan hanya di lingkungan uji sendiri; kalau collector
 tidak bisa dihubungi, `oob_check()` mengembalikan pesan gagal dan **tidak ada
 temuan** yang dibuat (tidak ada klaim palsu).
+
+---
+
+## 10. Kredensial hardcode di JS (`js`)
+
+**Apa yang diuji.** Kredensial yang tertanam di sisi klien: API key, token,
+password, dan private key. Ada **dua sumber**, dan keduanya dipindai:
+
+- berkas `.js` hasil panen recon (`<script src>` halaman utama + halaman crawl,
+  dibatasi `RECON_JS_MAX_FILES = 15`) — teksnya dipakai ulang dari
+  `ctx["js_texts"]` sehingga tidak diunduh dua kali;
+- blok `<script>` **inline** di halaman-halaman yang sama; blok dengan `type`
+  JSON-LD/template HTML dilewati (`JS_INLINE_NON_JS_TYPES`).
+
+**Kenapa baru.** Modul `js` sebelumnya hanya punya satu pola regex dan
+regex-nya cacat: `re.findall` dengan **dua grup tangkap** mengembalikan tuple
+`('', '')`, lalu `[s for s, _ in secrets]` menghasilkan string kosong — jadi pola
+kredensial praktis **tidak pernah** dilaporkan. Perbaikan ini sekaligus
+memisahkan pola kuat dari string acak generik:
+
+| Kode | Severity | Confidence | Kriteria |
+|---|---|---|---|
+| `JS_SECRET` | CRITICAL | `firm` | Pola khas layanan: AWS (`AKIA`/`ASIA`), Stripe (`sk_live_`/`sk_test_`), GitHub (`ghp_`/`gho_`/`ghs_`/`ghu_`/`ghr_`), Slack (`xox[baprs]-`), Google API key (`AIza…`), SendGrid (`SG.…`), blok `-----BEGIN … PRIVATE KEY-----`, dan JWT (`eyJ…`) |
+| `JS_SECRET_MAYBE` | HIGH | `tentative` | Nilai ≥ 16 karakter di belakang nama key lazim (`api_key`, `secret`, `token`, `password`, `pwd`, `auth`, …) dengan pemisah `:` atau `=`, yang bukan placeholder |
+
+`JS_SECRET_MAYBE` didaftarkan di `TENTATIVE_CODES` supaya tidak pernah naik jadi
+`firm` (lihat [docs/findings-model.md](findings-model.md) § 3). Kandidat kuat
+selalu dilaporkan lebih dulu.
+
+**Penjaga false positive.** Untuk kandidat generik: minimal
+`JS_SECRET_MIN_LEN = 16` karakter, bukan placeholder (`your`, `example`,
+`changeme`, `dummy`, `xxx`, `default`, `apikey`, … lewat
+`JS_SECRET_PLACEHOLDER_RE`), bukan frasa kode (`unexpected`, `undefined`,
+`prototype`, `callback`, `return`, …), dan bukan kalimat huruf kecil tanpa
+angka/pemisah. Temuan dibatasi `JS_SECRET_MAX_FINDINGS = 5` per sumber supaya
+satu bundel JS tidak membanjiri laporan, dan nilai yang sama hanya dilaporkan
+sekali.
+
+**Rahasia tidak ikut ke laporan.** Deskripsi temuan memakai
+`mask_secret_value()` (4 karakter pertama + bintang, mis. `AKIA****…`) dan
+nilai asli tidak pernah ditulis; snippet respons bukti dimask lewat
+`mask_secrets_in_text()`/`masked_evidence()`. `--no-redact` mematikan masking
+untuk verifikasi manual lokal saja.
+
+**Anggaran request.** Deteksi kredensial **tidak menambah request sama sekali**:
+berkas JS sudah diunduh tahap recon dan blok inline sudah ada di HTML yang
+sudah diambil crawler. Modul `js` tetap hanya jalan di DETAILED.
+
+**Batasan (jujur).** Masking di atas berlaku untuk **temuan modul `js`**. Bukti
+yang ditempelkan modul lain (mis. `TECH`, header, rate limit) memakai snippet
+HTML halaman apa adanya dan hanya lewat redaksi standar (cookie, header, field
+body/URL) — jadi nilai kredensial yang tertulis di body HTML **masih bisa
+muncul utuh di snippet temuan modul lain**. Penerapan masking di satu titik
+(`Exchange`/serialisasi) untuk semua pola kredensial dicatat sebagai tindak
+lanjut di [docs/bug-bounty-gaps.md](bug-bounty-gaps.md) bagian 4.
 
 ---
 

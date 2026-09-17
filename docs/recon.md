@@ -106,6 +106,10 @@ Hasil itu dipakai di tiga tempat:
    ikut ditambahkan ke `ctx["recon_param_targets"]`, dan teks JS disimpan di
    `ctx["js_texts"]` supaya modul `js` **tidak mengunduh berkas yang sama dua
    kali**. `result["endpoints"]` juga disalin ke `ctx["recon_js_endpoints"]`.
+   Halaman yang sama juga jadi sumber blok `<script>` **inline** bagi modul
+   `js` (kredensial hardcode, lihat [docs/vuln-classes.md](vuln-classes.md)
+   § 10); blok inline sudah ada di HTML yang sudah diambil, jadi tidak ada
+   request tambahan.
 
 ## 5. Anggaran request (kasus terburuk)
 
@@ -119,6 +123,9 @@ Hasil itu dipakai di tiga tempat:
 
 Recon **tidak** mengirim request ke tiap URL historis — URL itu hanya jadi seed
 crawler (dibatasi `--crawl-max`) dan daftar parameter modul injection (5 URL).
+Pemindaian kredensial hardcode (modul `js`) memakai ulang teks JS yang sudah
+diunduh dan blok `<script>` inline yang sudah ada di HTML, jadi anggaran ini
+tidak bertambah.
 
 ## 6. Degradasi anggun
 
@@ -140,6 +147,7 @@ laporan tidak salah menyebut penyebab.
 | `SUBDOMAIN_LIVE` | INFO | `firm` | URL host hasil probe | Host hasil enumerasi menjawab HTTP — lengkap dengan status, `<title>`, dan header `Server` |
 | `HISTORIC_URLS` | INFO | `tentative` | URL indeks (Wayback/Common Crawl) | Ada URL historis untuk target; endpoint lama sering masih hidup tanpa autentikasi/rate limit |
 | `JS_ENDPOINT` | INFO | `firm` | URL berkas JS | Berkas JS memuat endpoint yang tidak terdokumentasi |
+| `JS_SECRET` | CRITICAL | `firm` | URL berkas JS / halaman (nilai dimask) | Kredensial layanan hardcode di berkas JS atau blok `<script>` inline (modul `js`, lihat [vuln-classes.md](vuln-classes.md) § 10). Pasangan `JS_SECRET_MAYBE` (`HIGH`, `tentative`) untuk string acak di belakang nama key lazim |
 | `PORT_OPEN` | INFO / LOW | `firm` | — (connect scan tanpa respons HTTP, jadi `evidence` sengaja kosong) | Port TCP terbuka; naik ke LOW kalau port termasuk `PORT_SCAN_RISKY_PORTS` (2375, 3306, 5432, 6379, 9200, 11211, 27017, 5601, 2049, 3389) |
 | `RECON_SOURCE_SKIPPED` | INFO | `certain` | — | Sumber recon timeout/gagal — laporan ini **bukan** bukti target bersih |
 | `SUBDOMAINS` | INFO | — | URL indeks crt.sh | Ringkasan daftar subdomain (modul `subdomains`, tetap ada sebagai alias tipis di atas `recon_gather`) |

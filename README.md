@@ -111,7 +111,7 @@ redaksi, dan skema output ada di
 | SSTI | ❌ | ❌ | ✅ |
 | NoSQL injection | ❌ | ❌ | ✅ |
 | GraphQL introspection | ❌ | ❌ | ✅ |
-| JS analysis | ❌ | ❌ | ✅ |
+| JS analysis (endpoint + kredensial hardcode) | ❌ | ❌ | ✅ |
 | JWT analysis | ❌ | ❌ | ✅ |
 | IDOR / BOLA (butuh `--cookie`) | ❌ | ✅ | ✅ |
 | CSRF | ❌ | ✅ | ✅ |
@@ -150,7 +150,7 @@ redaksi, dan skema output ada di
 - API spec OpenAPI/Swagger + parameter discovery
 - Recon: subdomain (crt.sh + Cert Spotter + 134 kata DNS internal), host hidup (status/title/Server)
 - URL historis (Wayback CDX + Common Crawl) → seed crawler + pool parameter modul injection
-- Endpoint dari berkas JS (`<script src>` halaman utama + crawl)
+- Analisis JS: endpoint dari berkas JS (`<script src>` halaman utama + crawl) + kredensial hardcode (berkas JS & blok `<script>` inline)
 - Port scan TCP connect 41 port umum (opt-in lewat `--port-scan`)
 
 ## Instalasi
@@ -200,7 +200,7 @@ python3 tools/oob_collector.py --help  # collector OOB (stdlib, tanpa dependency
 ```
 
 Test memakai fixture server lokal di `tests/conftest.py` (tanpa jaringan
-eksternal): 226 test mencakup 32 modul, flag CLI, recon, dan generator laporan.
+eksternal): 242 test mencakup 32 modul, flag CLI, recon, dan generator laporan.
 
 ## Catatan
 
@@ -225,8 +225,9 @@ eksternal): 226 test mencakup 32 modul, flag CLI, recon, dan generator laporan.
   cache deception) dilewati dengan catatan di log kalau `--cookie`/`-H`/
   `--bearer` tidak diberikan — bukan dilaporkan sebagai bersih.
 - Setiap temuan membawa bukti request/response dan perintah `curl` siap pakai.
-  Kredensial disensor otomatis (`***REDACTED***`); jangan pakai `--no-redact`
-  kalau hasilnya akan dibagikan.
+  Kredensial disensor otomatis (`***REDACTED***`) dan temuan `JS_SECRET`/
+  `JS_SECRET_MAYBE` hanya menampilkan nilai yang sudah dimask (4 karakter awal +
+  bintang); jangan pakai `--no-redact` kalau hasilnya akan dibagikan.
 - Request dijalankan paralel (default 10 worker). Naikkan `--workers` untuk target cepat, turunkan ke `--workers 1` jika target rate-limit/WAF sensitif.
 - Modul deteksi (SQLi, XSS, LFI, CMDi, SSTI, XXE, GraphQL, SSRF, NoSQLi, Open Redirect) berhenti lebih awal begitu temuan pertama ketemu, jadi mode DETAILED tidak selalu mengirim semua payload.
 - Halaman utama dan daftar form di-cache: satu request/parse dipakai ulang lintas modul, bukan diulang per modul.

@@ -118,7 +118,7 @@ status redaksi.
 ## 3. Metadata temuan
 
 `FindingMeta = namedtuple("FindingMeta", "vector score cwe owasp confidence")`.
-Tabel `FINDING_META` memetakan 65 kode temuan ke metadata itu, dan
+Tabel `FINDING_META` memetakan 71 kode temuan ke metadata itu, dan
 `META_PREFIX_RULES` menangani keluarga kode dinamis:
 
 | Prefix | Arti | Metadata |
@@ -139,8 +139,9 @@ Fungsi terkait:
   informasional (`vector` kosong) supaya laporan tidak menampilkan "skor 0.0".
 - `finding_confidence(code, declared=None)` -> `certain` / `firm` / `tentative`.
   Kode di `TENTATIVE_CODES` (`SSRF`, `SSRF_FORM`, `SSRF_TIMEOUT`,
-  `CORS_REFLECT`, `XSS_STORED`, `ROBOTS`, `SUBDOMAINS`, `NO_RATE_LIMIT`)
-  selalu `tentative`, apa pun kata tabel meta.
+  `CORS_REFLECT`, `XSS_STORED`, `ROBOTS`, `SUBDOMAINS`, `NO_RATE_LIMIT`,
+  `HISTORIC_URLS`, `JS_SECRET_MAYBE`) selalu `tentative`, apa pun kata tabel
+  meta.
 - `make_finding_id(code, url, desc)` -> `spade-` + sha256(`code|url|desc`)
   12 karakter pertama. ID stabil antar scan, dipakai sebagai
   `partialFingerprints` SARIF.
@@ -174,7 +175,15 @@ Kode baru dari ekspansi cakupan: `IDOR_ANON`, `IDOR_READ`, `CSRF_NO_TOKEN`,
 `API_SPEC_EXPOSED`, `PARAM_DISCOVERY`, `CRLF_INJECTION`, `REQUEST_SMUGGLING`,
 `SSRF_BLIND`, `XXE_BLIND`, `CMDI_BLIND`, `JWT_WEAK_SECRET`,
 `JWT_KID_TRAVERSAL`, `JWT_ALG_CONFUSION`, `JWT_ALG_CONFUSION_SURFACE`,
-`JWT_EXPIRED_ACCEPTED`, `JWT_NO_EXPIRY`, `JWT_KID_SUSPECT`.
+`JWT_EXPIRED_ACCEPTED`, `JWT_NO_EXPIRY`, `JWT_KID_SUSPECT`, `JS_SECRET`,
+`JS_SECRET_MAYBE`.
+
+Kredensial hardcode di JS punya aturan masking sendiri: `JS_SECRET`/
+`JS_SECRET_MAYBE` **tidak** menaruh nilai asli di deskripsi — nilai diganti
+`mask_secret_value()` (4 karakter pertama + bintang) — dan snippet respons bukti
+dimask lewat `mask_secrets_in_text()`/`masked_evidence()`. Ini berjalan di
+dalam modul `js` (bukan di `Exchange.__init__` global), jadi jalur bukti modul
+lain tidak berubah. `--no-redact` mematikan masking ini juga.
 
 ---
 

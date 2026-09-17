@@ -773,6 +773,7 @@ FINDING_META = {
     "NOSQLI":               FindingMeta("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N", 5.9, "CWE-943", "A03:2021", "tentative"),
     "GRAPHQL_INTROSPECTION": FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:L/I:N/A:N", 5.3, "CWE-200", "A01:2021", "firm"),
     "JS_SECRET":            FindingMeta("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N", 8.6, "CWE-798", "A07:2021", "firm"),
+    "JS_SECRET_MAYBE":      FindingMeta("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N", 8.6, "CWE-798", "A07:2021", "tentative"),
     "JWT_ALG_NONE":         FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:H/A:N", 9.1, "CWE-347", "A07:2021", "certain"),
     "CORS_WILDCARD":        FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:L/I:N/A:N", 5.3, "CWE-942", "A05:2021", "firm"),
     "CORS_WILDCARD_CRED":   FindingMeta("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:N", 8.1, "CWE-942", "A05:2021", "firm"),
@@ -839,6 +840,7 @@ META_PREFIX_RULES = (
 TENTATIVE_CODES = frozenset({
     "SSRF", "SSRF_FORM", "SSRF_TIMEOUT", "CORS_REFLECT", "XSS_STORED",
     "ROBOTS", "SUBDOMAINS", "NO_RATE_LIMIT", "HISTORIC_URLS",
+    "JS_SECRET_MAYBE",
 })
 
 CONFIDENCE_LEVELS = ("certain", "firm", "tentative")
@@ -2232,24 +2234,232 @@ def scan_graphql(sess, base_url, ctx=None):
         return f
     return f
 
+# ── Kredensial hardcode di JS (JS_SECRET / JS_SECRET_MAYBE) ──
+# Modul `js` memindai berkas .js (hasil panen recon dipakai ulang) DAN blok
+# <script> inline di halaman utama/halaman crawl. Pola kredensial layanan yang
+# khas (AWS/Stripe/GitHub/Slack/Google/private key/JWT) dipisahkan dari string
+# acak generik supaya severity-nya tidak disamakan:
+#   JS_SECRET       = pola kuat   -> CRITICAL, confidence firm
+#   JS_SECRET_MAYBE = string acak -> HIGH, confidence tentative (TENTATIVE_CODES)
+# Nilai secret TIDAK pernah ditulis utuh di laporan: deskripsi memakai
+# `mask_secret_value()` dan snippet respons bukti dimask lewat `masked_evidence()`.
+JS_SECRET_MIN_LEN = 16              # panjang minimum kandidat generik
+JS_SECRET_MAX_FINDINGS = 5          # batas temuan per sumber (berkas/halaman)
+
+# Nama key yang lazim dipakai untuk menyimpan kredensial, ditambah opsional
+# penutup kutip supaya bentuk JSON (`"api_key": "..."`) ikut tertangkap.
+JS_SECRET_KEY_RE = re.compile(
+    r"""(?P<key>api[_-]?key|access[_-]?key|secret[_-]?key|client[_-]?secret|private[_-]?key
+         |secret|passwd|password|pwd|token|auth)
+        \s*["']?\s*[:=]\s*["'](?P<value>[A-Za-z0-9_\-/@#$%^&*+=.:~!]{8,})["']""",
+    re.I | re.X,
+)
+
+# Pola kredensial yang bentuknya khas per layanan — hampir tidak mungkin muncul
+# sebagai string biasa, jadi langsung dicap kuat.
+JS_SECRET_STRONG_PATTERNS = (
+    ("AWS access key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("Stripe secret key", re.compile(r"\b[rsp]k_(?:live|test)_[0-9A-Za-z]{16,}\b")),
+    ("GitHub token", re.compile(r"\bgh[pousr]_[0-9A-Za-z]{36,}\b")),
+    ("Slack token", re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{10,}")),
+    ("Google API key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")),
+    ("SendGrid API key", re.compile(r"\bSG\.[0-9A-Za-z_\-]{16,}\.[0-9A-Za-z_\-]{16,}\b")),
+    ("private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("JWT", re.compile(r"\beyJ[0-9A-Za-z_\-]{8,}\.[0-9A-Za-z_\-]{8,}\.[0-9A-Za-z_\-]{0,}")),
+)
+
+# Nilai contoh/placeholder yang sering muncul di dokumentasi, bundel framework,
+# atau kode contoh — jangan dilaporkan sebagai kredensial.
+JS_SECRET_PLACEHOLDER_RE = re.compile(
+    r"your|example|sample|changeme|change_me|placeholder|dummy|redacted|"
+    r"xxx+|foobar|\bfoo\b|\bbar\b|lorem|ipsum|todo|secret_?here|"
+    r"apikey|api_?key|notasecret|test_?key|default",
+    re.I,
+)
+
+# Frasa kode generik yang lolos regex pasangan key=value tapi bukan kredensial
+# (perilaku lama yang dipertahankan).
+JS_SECRET_NOISE_WORDS = (
+    "unexpected", "duplicate", "undefined", "prototype", "function", "callback",
+    "return", "default", "configure", "property", "attribute", "disabled",
+    "required", "invalid", "unknown", "missing", "expired", "forbidden",
+)
+
+def js_secret_candidates(text):
+    """Kandidat kredensial hardcode dari satu potongan teks JS.
+
+    Mengembalikan list dict `{"value", "label", "strong", "offset"}`; `offset`
+    adalah posisi dalam `text` supaya reporter bisa mencari manual tanpa nilai
+    kredensialnya dibocorkan di laporan. Kandidat kuat (pola khas layanan)
+    dilaporkan lebih dulu; nilai yang sama hanya muncul sekali.
+    """
+    if not text:
+        return []
+    found, seen = [], set()
+
+    def _add(value, label, strong, offset):
+        if not value or value in seen:
+            return
+        seen.add(value)
+        found.append({"value": value, "label": label, "strong": bool(strong),
+                      "offset": int(offset)})
+
+    for label, pattern in JS_SECRET_STRONG_PATTERNS:
+        for m in pattern.finditer(text):
+            _add(m.group(0), label, True, m.start())
+    for m in JS_SECRET_KEY_RE.finditer(text):
+        value = m.group("value")
+        if len(value) < JS_SECRET_MIN_LEN:
+            continue
+        if JS_SECRET_PLACEHOLDER_RE.search(value):
+            continue
+        lowered = value.lower()
+        if any(word in lowered for word in JS_SECRET_NOISE_WORDS):
+            continue
+        # String huruf kecil semua tanpa angka/pemisah (mis. potongan kalimat)
+        # tidak dianggap kandidat kredensial.
+        if not re.search(r"[0-9A-Z_\-/@#$%^&*+=.:~!]", value):
+            continue
+        _add(value, "string acak", False, m.start("value"))
+    found.sort(key=lambda item: (not item["strong"], item["offset"]))
+    return found
+
+def mask_secret_value(value, enabled=None):
+    """Mask nilai kredensial: 4 karakter pertama + bintang (minimal 8 bintang)."""
+    if enabled is None:
+        enabled = REDACT_ENABLED
+    text = str(value or "")
+    if not enabled or not text:
+        return text
+    return text[:4] + "*" * max(8, len(text) - 4)
+
+def mask_secrets_in_text(text, enabled=None):
+    """Mask semua kandidat kredensial yang tertulis di dalam sebuah teks.
+
+    Dipakai untuk snippet bukti (respons server) supaya body yang memuat
+    kredensial hardcode tidak ikut tersimpan mentah di laporan.
+    """
+    if enabled is None:
+        enabled = REDACT_ENABLED
+    if not enabled or not text:
+        return text
+    spans = []
+    for _label, pattern in JS_SECRET_STRONG_PATTERNS:
+        spans.extend((m.start(), m.end()) for m in pattern.finditer(text))
+    spans.extend((m.start("value"), m.end("value")) for m in JS_SECRET_KEY_RE.finditer(text))
+    if not spans:
+        return text
+    out, cursor = [], 0
+    for start, end in sorted(spans):
+        if start < cursor:
+            continue
+        out.append(text[cursor:start])
+        out.append(mask_secret_value(text[start:end]))
+        cursor = end
+    out.append(text[cursor:])
+    return "".join(out)
+
+JS_INLINE_NON_JS_TYPES = re.compile(
+    r"^(?:application/(?:ld\+)?json|text/(?:template|html|x-template|plain)|text/ng-template)$",
+    re.I,
+)
+
+def extract_inline_scripts(html):
+    """Isi blok `<script>` inline (tanpa atribut `src`) dari sebuah halaman HTML.
+
+    Blok dengan `type` yang jelas bukan JavaScript (template/JSON-LD) dilewati.
+    Mengembalikan list teks body blok, satu entri per blok.
+    """
+    if not html:
+        return []
+    out = []
+    for m in re.finditer(r"<script([^>]*)>(.*?)</script\s*>", html, re.I | re.S):
+        attrs, body = m.group(1) or "", m.group(2) or ""
+        if re.search(r"\bsrc\s*=", attrs, re.I):
+            continue
+        type_match = re.search(r"""\btype\s*=\s*["']?([^"'\s>]+)""", attrs, re.I)
+        if type_match and JS_INLINE_NON_JS_TYPES.match(type_match.group(1)):
+            continue
+        if body.strip():
+            out.append(body)
+    return out
+
+def masked_evidence(exchange, enabled=None):
+    """Salinan `Exchange` dengan nilai kredensial di `response_snippet` dimask.
+
+    Masking dilakukan per temuan (bukan di `Exchange.__init__` global) supaya
+    perilaku bukti modul lain tidak berubah.
+    """
+    if exchange is None:
+        return None
+    if enabled is None:
+        enabled = REDACT_ENABLED
+    snippet = mask_secrets_in_text(exchange.response_snippet, enabled)
+    if not enabled or snippet == exchange.response_snippet:
+        return exchange
+    return Exchange(exchange.method, exchange.url, exchange.status,
+                    request_headers=exchange.request_headers,
+                    request_body=exchange.request_body,
+                    response_headers=exchange.response_headers,
+                    response_snippet=snippet,
+                    response_length=exchange.response_length,
+                    content_type=exchange.content_type,
+                    elapsed_ms=exchange.elapsed_ms,
+                    timestamp=exchange.timestamp,
+                    redact=False)
+
+def scan_js_secrets(f, label, src_url, text, evidence=None):
+    """Tambahkan temuan kredensial hardcode dari satu sumber JS ke `FindingList`.
+
+    `label` menjelaskan sumbernya di laporan (berkas JS atau blok inline),
+    `src_url` dipakai sebagai URL + bukti temuan. `evidence` yang sudah dimask
+    boleh dikirim pemanggil supaya tidak dihitung ulang. Mengembalikan jumlah
+    temuan.
+    """
+    candidates = js_secret_candidates(text)
+    if not candidates:
+        return 0
+    if evidence is None:
+        evidence = masked_evidence(evidence_for(src_url))
+    count = 0
+    for cand in candidates[:JS_SECRET_MAX_FINDINGS]:
+        strong = cand["strong"]
+        code, sev = ("JS_SECRET", "CRITICAL") if strong else ("JS_SECRET_MAYBE", "HIGH")
+        desc = (f"{label} mengandung kredensial/secret hardcode ({cand['label']}) pada "
+                f"offset {cand['offset']}: '{mask_secret_value(cand['value'])}'. "
+                f"Jika ini kredensial produksi, attacker bisa langsung mengakses resource "
+                f"yang dilindungi.")
+        if strong:
+            critical(f"Kredensial hardcode di {label}")
+        else:
+            warn(f"Kandidat kredensial hardcode di {label} ({cand['label']})")
+        f.append((sev, code, desc, src_url), evidence_url=src_url, evidence=evidence)
+        count += 1
+    return count
+
 def scan_js(sess, base_url, ctx=None):
     f = FindingList(base_url); info("Menganalisis JavaScript...")
     try:
         r = get_base_response(sess, base_url, ctx)
         if r is None:
             info("Tidak bisa mengambil halaman utama"); return f
-        js_urls = set()
-        js_pattern = re.compile(r'<script[^>]*src=["\']([^"\']+\.js[^"\']*)["\']', re.I)
-        for m in js_pattern.finditer(r.text):
-            js_urls.add(urllib.parse.urljoin(base_url, m.group(1)))
         crawler = ctx.get("crawler") if ctx else None
+        # Halaman sumber: halaman utama + halaman crawl (dipakai untuk <script src>
+        # maupun blok <script> inline).
+        pages = [(base_url, getattr(r, "text", "") or "")]
         if crawler and crawler.pages:
             for page_url, page_html in list(crawler.pages.items())[:RECON_JS_MAX_PAGES]:
-                for m in js_pattern.finditer(page_html or ""):
-                    js_urls.add(urllib.parse.urljoin(page_url, m.group(1)))
-        if not js_urls: info("Tidak ada file JS"); return f
+                if page_url == base_url:
+                    continue
+                pages.append((page_url, page_html or ""))
+        js_pattern = re.compile(r'<script[^>]*src=["\']([^"\']+\.js[^"\']*)["\']', re.I)
+        js_urls = set()
+        for page_url, page_html in pages:
+            for m in js_pattern.finditer(page_html):
+                js_urls.add(urllib.parse.urljoin(page_url, m.group(1)))
         targets = sorted(js_urls)[:RECON_JS_MAX_FILES]
-        info(f"Ditemukan {len(js_urls)} file JS")
+        if js_urls:
+            info(f"Ditemukan {len(js_urls)} file JS")
         # Berkas hasil panen recon dipakai ulang supaya tidak diunduh dua kali.
         harvested = (ctx or {}).get("js_texts") or {}
         def _fetch(js_url):
@@ -2261,32 +2471,39 @@ def scan_js(sess, base_url, ctx=None):
                     return js_url, r2.text
             except: pass
             return js_url, None
+        # Sumber pemindaian kredensial: (label laporan, URL bukti, teks JS).
+        secret_sources = []
         for js_url, t in pmap(_fetch, targets):
-            if t is not None:
-                fn = js_url.split('/')[-1]
-                # API endpoints
-                apis = re.findall(r'["\'](/[a-zA-Z0-9_\-./?&=]+)["\']', t)
-                apis = [x for x in set(apis) if re.search(r'/api/|/v1/|/v2/|graphql|rest', x, re.I)]
-                apis = [x for x in apis if not any(s in x.lower() for s in ["jquery","react","vue","angular","bootstrap","fontawesome"])]
-                if apis:
-                    info(f"  {fn}: {len(apis)} endpoint API")
-                    f.append(("INFO","JS_APIS",f"File {fn} mengandung {len(apis)} endpoint API. Endpoint ini mungkin tidak terdokumentasi: {', '.join(apis[:5])}"), evidence_url=js_url)
-                # Ekstraksi diperluas: literal path/URL di fetch/axios/url/map rute.
-                endpoints = extract_js_endpoints(t, (urllib.parse.urlparse(base_url).hostname or "").lower())
-                if endpoints:
-                    info(f"  {fn}: {len(endpoints)} endpoint/path")
-                    f.append(("INFO","JS_ENDPOINT",f"File {fn} memuat {len(endpoints)} endpoint/path, mis. {', '.join(endpoints[:5])}. Endpoint dari bundel JS sering tidak terdokumentasi dan bisa dipakai tanpa autentikasi.", js_url, f"Endpoint JS: {len(endpoints)}"), evidence_url=js_url)
-                # Hardcoded secrets
-                secrets = re.findall(r'(?:api[_-]?key|secret|password|token|auth)\s*[:=]\s*["\'](?!([A-Z][a-z]+\s))([a-zA-Z0-9_\-/@#$%^&*+=]{16,})["\']', t, re.I)
-                secrets = [s for s,_ in secrets]
-                real = []
-                for s in secrets:
-                    sl = s.lower()
-                    if any(kw in sl for kw in ["unexpected","duplicate","undefined","prototype","function","callback","return","default","configure","property","attribute"]): continue
-                    if re.search(r'[0-9]', s) or re.search(r'[A-Z]', s): real.append(s)
-                for s in real[:5]:
-                    critical(f"Kredensial hardcode di {fn}")
-                    f.append(("CRITICAL","JS_SECRET",f"File JS {fn} mengandung kredensial/secret hardcode: '{s[:20]}...'. Jika ini adalah kredensial produksi, attacker bisa langsung mengakses resource yang dilindungi."), evidence_url=js_url)
+            if t is None:
+                continue
+            fn = js_url.split('/')[-1]
+            # Snippet berkas JS bisa memuat kredensial hardcode, jadi bukti
+            # seluruh temuan modul ini dimask (bukan hanya temuan JS_SECRET).
+            evidence = masked_evidence(evidence_for(js_url))
+            secret_sources.append((f"berkas JS {fn}", js_url, t, evidence))
+            # API endpoints
+            apis = re.findall(r'["\'](/[a-zA-Z0-9_\-./?&=]+)["\']', t)
+            apis = [x for x in set(apis) if re.search(r'/api/|/v1/|/v2/|graphql|rest', x, re.I)]
+            apis = [x for x in apis if not any(s in x.lower() for s in ["jquery","react","vue","angular","bootstrap","fontawesome"])]
+            if apis:
+                info(f"  {fn}: {len(apis)} endpoint API")
+                f.append(("INFO","JS_APIS",f"File {fn} mengandung {len(apis)} endpoint API. Endpoint ini mungkin tidak terdokumentasi: {', '.join(apis[:5])}"), evidence_url=js_url, evidence=evidence)
+            # Ekstraksi diperluas: literal path/URL di fetch/axios/url/map rute.
+            endpoints = extract_js_endpoints(t, (urllib.parse.urlparse(base_url).hostname or "").lower())
+            if endpoints:
+                info(f"  {fn}: {len(endpoints)} endpoint/path")
+                f.append(("INFO","JS_ENDPOINT",f"File {fn} memuat {len(endpoints)} endpoint/path, mis. {', '.join(endpoints[:5])}. Endpoint dari bundel JS sering tidak terdokumentasi dan bisa dipakai tanpa autentikasi.", js_url, f"Endpoint JS: {len(endpoints)}"), evidence_url=js_url, evidence=evidence)
+        # Blok <script> inline: 0 request tambahan (halaman sudah diambil/di-crawl).
+        for page_url, page_html in pages:
+            blocks = extract_inline_scripts(page_html)
+            if not blocks:
+                continue
+            evidence = masked_evidence(evidence_for(page_url))
+            for block_no, body in enumerate(blocks, 1):
+                secret_sources.append((f"inline <script> #{block_no} di {page_url}",
+                                       page_url, body, evidence))
+        for label, src_url, text, evidence in secret_sources:
+            scan_js_secrets(f, label, src_url, text, evidence)
     except: pass
     return f
 

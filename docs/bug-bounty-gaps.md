@@ -9,7 +9,9 @@ Status: **bagian 1, 2, dan 3 sudah dikerjakan** — bagian 1 di PR
 [docs/findings-model.md](findings-model.md)), bagian 2 di PR
 `feat/vuln-class-coverage` (detail per kelas di
 [docs/vuln-classes.md](vuln-classes.md)), bagian 3 di PR `feat/recon-enum`
-(detail di [docs/recon.md](recon.md)). Bagian 4–6 masih terbuka. PR
+(detail di [docs/recon.md](recon.md)). Dari bagian 4, deteksi kredensial
+hardcode di JS sudah diperbaiki di PR `fix/js-secret-detection`. Bagian 5–6 dan
+sisa bagian 4 masih terbuka. PR
 `feat/curl-cffi-http-layer` sebelumnya hanya mengganti HTTP layer ke `curl_cffi`
 + menambah test + membuat dokumen ini.
 
@@ -101,8 +103,13 @@ saja** — sumber pasif diakses lewat API HTTP publik, tanpa binary eksternal
 
 ## 4. Kualitas deteksi modul yang sudah ada
 
+Satu baris di bawah sudah dikerjakan di PR `fix/js-secret-detection`
+(ditumpuk di `feat/recon-enum`); sisanya masih terbuka.
+
 | Area | Bukti di kode | Dampak | Tool / pendekatan konkret | Prioritas |
 |---|---|---|---|---|
+| Masking kredensial hanya per modul | `mask_secrets_in_text`/`masked_evidence` dipanggil di dalam modul `js` saja | Snippet bukti berisi body HTML (mis. temuan `TECH`/header pada halaman yang memuat kredensial inline) tetap menampilkan nilai mentah di laporan JSON/HTML | Terapkan masking di satu titik (`Exchange.__init__`/serialisasi) dengan pola kredensial yang sama, plus test regresi "tidak ada nilai kredensial di seluruh laporan" | P1 |
+| Kredensial hardcode di JS praktis tidak terdeteksi | `re.findall` pola `apiKey` dengan **dua grup tangkap** → `[s for s, _ in secrets]` selalu `['', '']`; hanya satu pola, hanya satu berkas | API key/token/private key yang tertanam di frontend lolos — padahal ini kelas temuan bounty paling cepat | Pisahkan pola kuat per layanan (AWS, Stripe, GitHub, Slack, Google, SendGrid, private key, JWT) dari kandidat generik; ikut pindai blok `<script>` inline; nilai dimask di laporan → `JS_SECRET` (CRITICAL, `firm`) / `JS_SECRET_MAYBE` (HIGH, `tentative`) | ✅ Selesai |
 | SSRF heuristik kasar | `if "169.254.169.254" in r.text or len(r.content) > 1000:` | FP besar pada respons normal >1 KB; blind SSRF lolos | Bandingkan respons dengan baseline (status + ukuran + waktu), tambah `interactsh` callback | P0 |
 | XSS tanpa konteks/encoding | Cek payload muncul mentah di HTML | FP (dalam komentar/atribut) dan FN (encoding parsial) | Analisis konteks (HTML/attr/JS/URL), uji varian encoding, verifikasi eksekusi via headless browser (Playwright) | P1 |
 | LFI hanya `/etc/passwd` & `/etc/hosts` | `["../../etc/passwd","../../etc/hosts"]` di param terbatas (`file,page,include,path,doc,load`) | FN besar (Windows, wrapper `php://filter`, log poisoning) | Tambah `php://filter/convert.base64-encode`, `C:\Windows\win.ini`, `/proc/self/environ`; integrasi `ffuf` wordlist LFI | P2 |
