@@ -1,11 +1,23 @@
 """Test generator laporan (HTML/CSV) dan perilaku CLI."""
 
 import csv
+import json
 from datetime import datetime
 
 import pytest
 
 import spade
+
+CSV_HEADER = ["Severity", "Category", "Detail", "URL", "Target", "Confidence", "CVSS_Score",
+              "CVSS_Vector", "CWE", "OWASP", "Repro_Curl", "Evidence_Status", "Evidence_URL"]
+
+
+@pytest.fixture(autouse=True)
+def _restore_redaction():
+    """`--no-redact` mengubah flag global; pastikan tidak bocor ke test lain."""
+    original = spade.REDACT_ENABLED
+    yield
+    spade.REDACT_ENABLED = original
 
 
 @pytest.fixture
@@ -59,11 +71,61 @@ def test_gen_csv_columns_and_rows(tmp_path, findings):
 
     with out.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.reader(handle))
-    assert rows[0] == ["Severity", "Category", "Detail", "URL", "Target"]
+    assert rows[0] == CSV_HEADER
     assert len(rows) == len(findings) + 1
     assert rows[1][0] == "CRITICAL"
     assert rows[1][4] == "http://target.test/"
     assert rows[3][3] == ""
+    # Lima kolom lama tetap di posisi semula supaya konsumen CSV lama tidak rusak.
+    assert rows[1][:5] == ["CRITICAL", "SENSITIVE_FILE", "File /.env dapat diakses publik",
+                           "http://target.test/.env", "http://target.test/"]
+
+
+def test_gen_csv_metadata_columns(tmp_path, findings):
+    """Kolom metadata/bukti baru terisi dari tabel meta dan exchange temuan."""
+    out = tmp_path / "report.csv"
+    spade.gen_csv(findings, "http://target.test/", str(out))
+
+    with out.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.reader(handle))
+    index = {name: i for i, name in enumerate(rows[0])}
+    sqli = rows[2]
+    assert sqli[index["Confidence"]] == "firm"
+    assert sqli[index["CVSS_Score"]] == "9.8"
+    assert sqli[index["CVSS_Vector"]].startswith("CVSS:3.1/")
+    assert sqli[index["CWE"]] == "CWE-89"
+    assert sqli[index["OWASP"]] == "A03:2021"
+    # Tanpa exchange, bukti tidak dikarang.
+    assert sqli[index["Evidence_Status"]] == "none"
+    assert sqli[index["Evidence_URL"]] == ""
+    assert sqli[index["Repro_Curl"]] == ""
+
+    cookie = rows[3]
+    assert cookie[index["Confidence"]] == "firm"
+    assert cookie[index["CVSS_Score"]] == "5.3"
+    assert cookie[index["CWE"]] == "CWE-614"
+
+
+def test_gen_csv_info_code_has_no_cvss(tmp_path):
+    """Temuan informasional tetap punya CWE/OWASP, tapi skor/vector CVSS-nya kosong."""
+    out = tmp_path / "info.csv"
+    spade.gen_csv([("INFO", "TECH", "Teknologi: nginx", None)], "http://t/", str(out))
+    with out.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.reader(handle))
+    index = {name: i for i, name in enumerate(rows[0])}
+    assert rows[1][index["CVSS_Score"]] == ""
+    assert rows[1][index["CVSS_Vector"]] == ""
+    assert rows[1][index["CWE"]] == "CWE-200"
+    assert rows[1][index["OWASP"]] == "A05:2021"
+
+
+def test_gen_csv_unknown_code_does_not_invent_cvss(tmp_path):
+    out = tmp_path / "unknown.csv"
+    spade.gen_csv([("LOW", "KODE_BARU", "belum dipetakan", None)], "http://t/", str(out))
+    with out.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.reader(handle))
+    assert rows[1][1] == "KODE_BARU"
+    assert rows[1][5:10] == ["firm", "", "", "", ""]
 
 
 def test_gen_csv_quotes_commas(tmp_path):
@@ -119,3 +181,42 @@ def test_cli_exits_cleanly_on_eof_at_target_prompt(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "EOF" in captured.err
     assert "Traceback" not in captured.err
+
+
+def test_cli_json_and_sarif_flags(vuln_server, tmp_path):
+    json_out = tmp_path / "report.json"
+    sarif_out = tmp_path / "report.sarif"
+    assert spade.main([vuln_server.base_url, "--quick", "--no-color",
+                       "-o", str(tmp_path / "r.html"),
+                       "--json", str(json_out), "--sarif", str(sarif_out)]) == 0
+
+    payload = json.loads(json_out.read_text(encoding="utf-8"))
+    assert payload["tool"]["name"] == "spade"
+    assert payload["scan"]["mode"] == "quick"
+    assert payload["scan"]["redacted"] is True
+    assert payload["summary"]["total"] == len(payload["findings"])
+    assert payload["findings"], "scan fixture harus menghasilkan temuan"
+    for finding in payload["findings"]:
+        assert finding["id"].startswith("spade-")
+        assert finding["confidence"] in spade.CONFIDENCE_LEVELS
+        assert set(finding) >= {"severity", "code", "confidence", "cvss", "evidence", "repro"}
+
+    document = json.loads(sarif_out.read_text(encoding="utf-8"))
+    assert document["version"] == "2.1.0"
+    run = document["runs"][0]
+    assert run["tool"]["driver"]["name"] == "spade"
+    assert run["results"], "SARIF harus memuat hasil"
+    assert run["tool"]["driver"]["rules"]
+    for result in run["results"]:
+        assert result["ruleId"]
+        assert result["level"] in {"error", "warning", "note"}
+        assert result["partialFingerprints"]["findingId"].startswith("spade-")
+
+def test_cli_no_redact_flag_disables_redaction(vuln_server, tmp_path, capsys):
+    json_out = tmp_path / "plain.json"
+    assert spade.main([vuln_server.base_url, "--quick", "--no-color",
+                       "--no-redact", "-o", str(tmp_path / "r.html"),
+                       "--json", str(json_out)]) == 0
+    assert "REDACT OFF" in capsys.readouterr().out
+    payload = json.loads(json_out.read_text(encoding="utf-8"))
+    assert payload["scan"]["redacted"] is False

@@ -12,6 +12,7 @@ Cara pakai:
 
 import argparse
 import csv
+import hashlib
 import html as htmlmod
 import json
 import re
@@ -22,7 +23,7 @@ import threading
 import time
 import typing
 import urllib.parse
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, namedtuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from html.parser import HTMLParser
@@ -159,6 +160,604 @@ def make_session(timeout=15, verify_ssl=True, impersonate=_DEFAULT):
         kwargs["impersonate"] = profile
     return CurlSession(**kwargs)
 
+# ══════════════════════════════════════════════════════════════════
+# EVIDENCE — rekaman request/response sebagai bukti temuan
+# ══════════════════════════════════════════════════════════════════
+
+SPADE_VERSION = "3.1"
+
+EVIDENCE_SNIPPET_CHARS = 500        # potongan respons di HTML & CSV
+EVIDENCE_SNIPPET_CHARS_JSON = 2000  # potongan respons di JSON
+EVIDENCE_MAX_KEYS = 512             # batas entri indeks bukti (per tipe indeks)
+EVIDENCE_MAX_THREADS = 64           # batas entri indeks "request terakhir per thread"
+
+# Redaksi aktif secara default: cookie, token, dan password tidak boleh ikut
+# tersimpan di memori proses maupun di laporan hasil scan.
+REDACT_ENABLED = True
+REDACT_PLACEHOLDER = "***REDACTED***"
+REDACTED_HEADERS = frozenset({
+    "cookie", "set-cookie", "authorization", "proxy-authorization",
+    "x-api-key", "x-csrf-token", "x-xsrf-token", "x-auth-token",
+})
+REDACT_BODY_KEY_RE = re.compile(
+    r"pass|pwd|secret|token|api[_-]?key|auth|csrf|xsrf|session|otp|pin|credential", re.I
+)
+
+class Exchange:
+    """Satu pasang request/response yang sudah di-redaksi, siap jadi bukti temuan.
+
+    Dibuat otomatis di funnel `ThreadLocalSession.request()` supaya setiap
+    temuan bisa menyertakan bukti asli (method, URL, status, header, body
+    request, dan potongan respons) tanpa mengubah call site modul.
+    """
+
+    __slots__ = ("method", "url", "status", "request_headers", "request_body",
+                 "response_headers", "response_snippet", "response_length",
+                 "content_type", "elapsed_ms", "timestamp")
+
+    def __init__(self, method, url, status, request_headers=None, request_body=None,
+                 response_headers=None, response_snippet="", response_length=0,
+                 content_type="", elapsed_ms=0.0, timestamp=None, redact=None):
+        # Redaksi dilakukan di sini (bukan hanya saat serialisasi) supaya objek
+        # Exchange yang dibuat langsung oleh pemanggil lain tidak pernah menyimpan
+        # header/body/URL mentah berisi kredensial.
+        self.method = (method or "GET").upper()
+        self.url = redact_url(url or "", redact)
+        self.status = status
+        self.request_headers = redact_headers(request_headers, redact)
+        self.request_body = redact_body(request_body, redact)
+        self.response_headers = redact_headers(response_headers, redact)
+        self.response_snippet = response_snippet or ""
+        self.response_length = response_length or 0
+        self.content_type = content_type or ""
+        self.elapsed_ms = round(float(elapsed_ms or 0.0), 1)
+        self.timestamp = timestamp or datetime.now().isoformat(timespec="seconds")
+
+    @property
+    def path(self):
+        return urllib.parse.urlparse(self.url).path or "/"
+
+    def to_dict(self, snippet_chars=EVIDENCE_SNIPPET_CHARS_JSON, redact=True):
+        snippet = self.response_snippet
+        truncated = len(snippet) > snippet_chars
+        if truncated:
+            snippet = snippet[:snippet_chars]
+        return {
+            "url": redact_url(self.url, redact),
+            "method": self.method,
+            "status": self.status,
+            "content_type": self.content_type,
+            "elapsed_ms": self.elapsed_ms,
+            "timestamp": self.timestamp,
+            "request_headers": self.request_headers,
+            "request_body": self.request_body,
+            "response_status": self.status,
+            "response_length": self.response_length,
+            "response_snippet": snippet,
+            "response_truncated": truncated,
+        }
+
+    def __repr__(self):
+        return f"Exchange({self.method} {self.url} -> {self.status})"
+
+def _mask_header_value(name, value):
+    """Sensor nilai header sensitif, tapi pertahankan bentuknya (mis. `sid=***`)."""
+    if name.lower() in ("cookie", "set-cookie"):
+        chunks = []
+        for chunk in str(value).split(";"):
+            chunk = chunk.strip()
+            if "=" in chunk:
+                chunks.append(f"{chunk.split('=', 1)[0]}={REDACT_PLACEHOLDER}")
+            elif chunk:
+                chunks.append(chunk)
+        return "; ".join(chunks) if chunks else REDACT_PLACEHOLDER
+    return REDACT_PLACEHOLDER
+
+def redact_headers(headers, enabled=None):
+    """Sensor header sensitif (Cookie/Authorization/API key) dari dict header."""
+    if enabled is None:
+        enabled = REDACT_ENABLED
+    out = {}
+    for name, value in (headers or {}).items():
+        if enabled and name.lower() in REDACTED_HEADERS:
+            out[name] = _mask_header_value(name, value)
+        else:
+            out[name] = value
+    return out
+
+def _redact_json_value(value):
+    if isinstance(value, dict):
+        return {k: (REDACT_PLACEHOLDER if REDACT_BODY_KEY_RE.search(str(k)) else _redact_json_value(v))
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_json_value(v) for v in value]
+    return value
+
+def redact_body(body, enabled=None):
+    """Sensor nilai field sensitif pada body request (form-urlencoded atau JSON)."""
+    if enabled is None:
+        enabled = REDACT_ENABLED
+    if not enabled or body is None:
+        return body
+    if isinstance(body, (dict, list)):
+        # Call site kadang sudah mengirim dict ke `data=`/`json=`; sensor
+        # langsung struktur aslinya, jangan lewat repr Python (kunci sensitif
+        # di repr tetap terbaca sebagai teks biasa).
+        return json.dumps(_redact_json_value(body), ensure_ascii=False)
+    text = body.decode("utf-8", "replace") if isinstance(body, bytes) else str(body)
+    stripped = text.strip()
+    if not stripped:
+        return text
+    if stripped[0] in "{[":
+        try:
+            return json.dumps(_redact_json_value(json.loads(stripped)), ensure_ascii=False)
+        except ValueError:
+            return text
+    if "=" in stripped and not stripped.startswith("<"):
+        chunks = []
+        for chunk in stripped.split("&"):
+            if "=" in chunk:
+                key, _sep, _value = chunk.partition("=")
+                chunks.append(f"{key}={REDACT_PLACEHOLDER}" if REDACT_BODY_KEY_RE.search(key) else chunk)
+            else:
+                chunks.append(chunk)
+        return "&".join(chunks)
+    return text
+
+def redact_url(url, enabled=None):
+    """Sensor nilai query parameter sensitif (mis. `?token=...`) di URL.
+
+    Parameter yang tidak sensitif dibiarkan apa adanya (tidak di-encode ulang)
+    supaya URL di laporan tetap identik dengan yang benar-benar dikirim.
+    """
+    if enabled is None:
+        enabled = REDACT_ENABLED
+    if not enabled or not url or "?" not in url:
+        return url
+    head, _sep, rest = url.partition("?")
+    fragment = ""
+    if "#" in rest:
+        rest, _sep, fragment = rest.partition("#")
+        fragment = "#" + fragment
+    if not rest:
+        return url
+    masked = []
+    for chunk in rest.split("&"):
+        key, sep, _value = chunk.partition("=")
+        if sep and REDACT_BODY_KEY_RE.search(urllib.parse.unquote_plus(key)):
+            masked.append(f"{key}={REDACT_PLACEHOLDER}")
+        else:
+            masked.append(chunk)
+    return head + "?" + "&".join(masked) + fragment
+
+_EVIDENCE_LOCK = threading.Lock()
+_EVIDENCE_BY_KEY = OrderedDict()          # (method, url) -> Exchange (terbaru menang)
+_EVIDENCE_BY_PATH = OrderedDict()         # (method, path) -> Exchange
+_EVIDENCE_LAST_BY_THREAD = {}             # thread id -> Exchange terakhir
+EVIDENCE_BASE_URL = None                  # base URL scan, dipakai sebagai fallback
+
+def set_evidence_base_url(url):
+    """Tandai base URL scan sebagai fallback bukti untuk temuan tanpa URL."""
+    global EVIDENCE_BASE_URL
+    EVIDENCE_BASE_URL = url
+
+def reset_evidence():
+    """Bersihkan indeks bukti (dipakai di awal scan agar tidak bocor antar run/test)."""
+    with _EVIDENCE_LOCK:
+        _EVIDENCE_BY_KEY.clear()
+        _EVIDENCE_BY_PATH.clear()
+        _EVIDENCE_LAST_BY_THREAD.clear()
+    set_evidence_base_url(None)
+
+def record_exchange(exchange):
+    """Simpan satu Exchange ke indeks bukti berbatas ukuran."""
+    if exchange is None or not exchange.url:
+        return exchange
+    thread_id = threading.get_ident()
+    with _EVIDENCE_LOCK:
+        # Dua indeks terpisah supaya GET /a dan POST /a tidak saling menimpa:
+        # kunci URL penuh untuk lookup persis, kunci path untuk fallback longgar.
+        _remember(_EVIDENCE_BY_KEY, (exchange.method, exchange.url), exchange)
+        _remember(_EVIDENCE_BY_PATH, (exchange.method, exchange.path), exchange)
+        _EVIDENCE_LAST_BY_THREAD[thread_id] = exchange
+        while len(_EVIDENCE_LAST_BY_THREAD) > EVIDENCE_MAX_THREADS:
+            _EVIDENCE_LAST_BY_THREAD.pop(next(iter(_EVIDENCE_LAST_BY_THREAD)))
+    return exchange
+
+def _remember(index, key, exchange):
+    """Simpan exchange ke OrderedDict berbatas, entri terlama dibuang lebih dulu."""
+    index[key] = exchange
+    index.move_to_end(key)
+    while len(index) > EVIDENCE_MAX_KEYS:
+        index.popitem(last=False)
+
+def _lookup_by_url(url, method=None):
+    """Cari exchange untuk URL ini; kalau `method` diberi, hanya cocokkan method itu."""
+    if method:
+        found = _EVIDENCE_BY_KEY.get((method.upper(), url))
+        if found is not None:
+            return found
+    for (known_method, known_url), exchange in reversed(_EVIDENCE_BY_KEY.items()):
+        if known_url == url:
+            if method is None or known_method == method.upper():
+                return exchange
+    return None
+
+def _lookup_by_path(path, method=None):
+    """Cari exchange untuk path ini (tanpa query/host)."""
+    if method:
+        found = _EVIDENCE_BY_PATH.get((method.upper(), path))
+        if found is not None:
+            return found
+    for (known_method, known_path), exchange in reversed(_EVIDENCE_BY_PATH.items()):
+        if known_path == path:
+            if method is None or known_method == method.upper():
+                return exchange
+    return None
+
+def evidence_for(url=None, method=None):
+    """Cari bukti request/response untuk sebuah temuan.
+
+    Urutan pencarian: (method, URL) persis -> URL apa pun -> (method, path) ->
+    path apa pun -> request terakhir di thread ini -> respons base URL scan ->
+    None. Fallback ke "request terakhir di thread" penting karena banyak modul
+    meng-append temuan langsung setelah request pemicunya di thread yang sama.
+    """
+    thread_id = threading.get_ident()
+    with _EVIDENCE_LOCK:
+        if url:
+            found = _lookup_by_url(url, method) or _lookup_by_url(url)
+            if found is not None:
+                return found
+            path = urllib.parse.urlparse(url).path or "/"
+            found = _lookup_by_path(path, method) or _lookup_by_path(path)
+            if found is not None:
+                return found
+        found = _EVIDENCE_LAST_BY_THREAD.get(thread_id)
+        if found is not None:
+            return found
+        if EVIDENCE_BASE_URL:
+            found = _lookup_by_url(EVIDENCE_BASE_URL) or _lookup_by_path(
+                urllib.parse.urlparse(EVIDENCE_BASE_URL).path or "/")
+            if found is not None:
+                return found
+    return None
+
+def exchange_from_response(resp, method, elapsed_ms=0.0, kwargs=None, session_cookies=None):
+    """Ubah Response curl_cffi menjadi Exchange yang sudah di-redaksi.
+
+    `session_cookies` adalah isi cookie jar milik session yang dipakai. Cookie
+    dikirim oleh curl di level engine (tidak muncul di `resp.request.headers`),
+    jadi ditambahkan ke header bukti supaya langkah reproduksi temuan pada
+    halaman terautentikasi tetap masuk akal — nilainya tetap disensor oleh
+    `redact_headers()`.
+    """
+    kwargs = kwargs or {}
+    request = getattr(resp, "request", None)
+    request_headers = {}
+    for source in (getattr(request, "headers", None), kwargs.get("headers")):
+        if source:
+            request_headers.update(dict(source))
+    if session_cookies and not any(name.lower() == "cookie" for name in request_headers):
+        jar = "; ".join(f"{name}={value}" for name, value in session_cookies)
+        if jar:
+            request_headers["Cookie"] = jar
+    body = getattr(request, "body", None)
+    if body is None:
+        body = kwargs.get("data")
+        if body is None:
+            body = kwargs.get("json")
+            if body is not None and not isinstance(body, (str, bytes)):
+                body = json.dumps(body, ensure_ascii=False)
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", "replace")
+    raw = getattr(resp, "content", b"") or b""
+    if not isinstance(raw, (bytes, bytearray)):
+        raw = str(raw).encode("utf-8", "replace")
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8", "replace")
+    response_headers = dict(getattr(resp, "headers", None) or {})
+    snippet = raw[:EVIDENCE_SNIPPET_CHARS_JSON * 4].decode("utf-8", "replace")[:EVIDENCE_SNIPPET_CHARS_JSON]
+    return Exchange(
+        method=method,
+        url=str(getattr(resp, "url", "") or ""),
+        status=getattr(resp, "status_code", None),
+        request_headers=request_headers,
+        request_body=body,
+        response_headers=response_headers,
+        response_snippet=snippet,
+        response_length=len(raw),
+        content_type=str(response_headers.get("Content-Type", "")),
+        elapsed_ms=elapsed_ms,
+    )
+
+# ══════════════════════════════════════════════════════════════════
+# FINDING — model temuan (kompatibel dengan tuple lama)
+# ══════════════════════════════════════════════════════════════════
+
+FindingMeta = namedtuple("FindingMeta", "vector score cwe owasp confidence")
+
+_CVSS_NO_SCOPE_CHANGE = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U"
+
+# Skor CVSS di tabel ini adalah skor referensi per kelas temuan (bukan hasil
+# pengukuran runtime) dan dihitung dari vector CVSS 3.1 yang tertulis.
+# Label severity Spade tetap jadi prioritas operasional; keduanya bisa berbeda.
+FINDING_META = {
+    "SENSITIVE_FILE":       FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:N/A:N", 7.5, "CWE-538", "A01:2021", "certain"),
+    "PHP_INFO":             FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:L/I:N/A:N", 5.3, "CWE-200", "A05:2021", "firm"),
+    "DIR_LISTING":          FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:L/I:N/A:N", 5.3, "CWE-548", "A01:2021", "firm"),
+    "HTTP_METHOD":          FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:N/I:H/A:N", 7.5, "CWE-650", "A01:2021", "firm"),
+    "TRACE_ENABLED":        FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:L/I:N/A:N", 5.3, "CWE-749", "A05:2021", "firm"),
+    "SQLI":                 FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:H/A:H", 9.8, "CWE-89", "A03:2021", "firm"),
+    "XSS_REFLECTED":        FindingMeta("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", 6.1, "CWE-79", "A03:2021", "firm"),
+    "XSS_POST":             FindingMeta("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", 6.1, "CWE-79", "A03:2021", "firm"),
+    "XSS_STORED":           FindingMeta("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", 6.1, "CWE-79", "A03:2021", "tentative"),
+    "LFI":                  FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:N/A:N", 7.5, "CWE-22", "A01:2021", "firm"),
+    "CMD_INJECTION":        FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:H/A:H", 9.8, "CWE-78", "A03:2021", "firm"),
+    "CMD_INJECTION_POST":   FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:H/A:H", 9.8, "CWE-78", "A03:2021", "firm"),
+    "SSRF":                 FindingMeta("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N", 5.9, "CWE-918", "A10:2021", "tentative"),
+    "SSRF_FORM":            FindingMeta("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N", 5.9, "CWE-918", "A10:2021", "tentative"),
+    "SSRF_TIMEOUT":         FindingMeta("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N", 3.7, "CWE-918", "A10:2021", "tentative"),
+    "OPEN_REDIRECT":        FindingMeta("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", 6.1, "CWE-601", "A01:2021", "firm"),
+    "XXE_DIRECT":           FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:N/A:N", 7.5, "CWE-611", "A05:2021", "firm"),
+    "XXE_FORM":             FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:N/A:N", 7.5, "CWE-611", "A05:2021", "firm"),
+    "SSTI":                 FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:H/A:H", 9.8, "CWE-1336", "A03:2021", "firm"),
+    "NOSQLI":               FindingMeta("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N", 5.9, "CWE-943", "A03:2021", "tentative"),
+    "GRAPHQL_INTROSPECTION": FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:L/I:N/A:N", 5.3, "CWE-200", "A01:2021", "firm"),
+    "JS_SECRET":            FindingMeta("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N", 8.6, "CWE-798", "A07:2021", "firm"),
+    "JWT_ALG_NONE":         FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:H/A:N", 9.1, "CWE-347", "A07:2021", "certain"),
+    "CORS_WILDCARD":        FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:L/I:N/A:N", 5.3, "CWE-942", "A05:2021", "firm"),
+    "CORS_WILDCARD_CRED":   FindingMeta("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:N", 8.1, "CWE-942", "A05:2021", "firm"),
+    "CORS_REFLECT":         FindingMeta("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:N/A:N", 4.3, "CWE-942", "A05:2021", "tentative"),
+    "TLS_EXPIRING":         FindingMeta("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N", 5.9, "CWE-298", "A02:2021", "firm"),
+    "TLS_EXP_SOON":         FindingMeta("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N", 3.7, "CWE-298", "A02:2021", "firm"),
+    "TLS_CERT_ERR":         FindingMeta("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:N", 7.4, "CWE-295", "A02:2021", "firm"),
+    "SERVER_LEAK":          FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:L/I:N/A:N", 5.3, "CWE-200", "A05:2021", "firm"),
+    "XPOWERED_LEAK":        FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:L/I:N/A:N", 5.3, "CWE-200", "A05:2021", "firm"),
+    "COOKIE_ISSUE":         FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:L/I:N/A:N", 5.3, "CWE-614", "A05:2021", "firm"),
+    "FORM_HTTP":            FindingMeta("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N", 5.9, "CWE-319", "A02:2021", "firm"),
+    # Temuan informasional: tidak ada skor CVSS yang berlaku, tapi CWE/OWASP tetap dipetakan.
+    "TECH":                 FindingMeta(None, 0.0, "CWE-200", "A05:2021", "firm"),
+    "JS_APIS":              FindingMeta(None, 0.0, "CWE-200", "A01:2021", "firm"),
+    "ROBOTS":               FindingMeta(None, 0.0, "CWE-200", "A01:2021", "tentative"),
+    "SUBDOMAINS":           FindingMeta(None, 0.0, "CWE-200", "A01:2021", "tentative"),
+    "JWT_COOKIE":           FindingMeta(None, 0.0, "CWE-522", "A07:2021", "firm"),
+    "JWT_BEARER":           FindingMeta(None, 0.0, "CWE-522", "A07:2021", "firm"),
+    "RATE_LIMIT":           FindingMeta(None, 0.0, "CWE-770", "A04:2021", "firm"),
+    "NO_RATE_LIMIT":        FindingMeta(None, 0.0, "CWE-770", "A04:2021", "tentative"),
+    "SCAN_ERROR":           FindingMeta(None, 0.0, None, None, "certain"),
+}
+
+# Keluarga kode dinamis: MISS_* (header tidak diset), HDR_* (header terpasang),
+# WEAK_* (protokol/kriptografi lemah).
+META_PREFIX_RULES = (
+    ("MISS_", FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:L/I:N/A:N", 5.3, "CWE-693", "A05:2021", "certain")),
+    ("HDR_", FindingMeta(None, 0.0, "CWE-693", "A05:2021", "certain")),
+    ("WEAK_", FindingMeta("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N", 5.9, "CWE-327", "A02:2021", "certain")),
+)
+
+# Kode yang buktinya belum cukup untuk disebut pasti, apa pun kata tabel meta.
+TENTATIVE_CODES = frozenset({
+    "SSRF", "SSRF_FORM", "SSRF_TIMEOUT", "CORS_REFLECT", "XSS_STORED",
+    "ROBOTS", "SUBDOMAINS", "NO_RATE_LIMIT",
+})
+
+CONFIDENCE_LEVELS = ("certain", "firm", "tentative")
+
+def finding_meta(code):
+    """Metadata CVSS/CWE/OWASP/confidence untuk satu kode temuan.
+
+    Kode yang belum dipetakan mengembalikan None — vector CVSS tidak pernah
+    dikarang untuk kode yang tidak dikenal.
+    """
+    if not code:
+        return None
+    meta = FINDING_META.get(code)
+    if meta is not None:
+        return meta
+    for prefix, prefix_meta in META_PREFIX_RULES:
+        if code.startswith(prefix):
+            return prefix_meta
+    return None
+
+def cvss_of(meta):
+    """Payload CVSS `{"vector": ..., "score": ...}` untuk sebuah FindingMeta.
+
+    Kembalikan None kalau meta tidak ada atau vector-nya kosong (temuan
+    informasional), supaya laporan tidak salah menampilkan "skor 0.0".
+    """
+    if meta is None or not meta.vector:
+        return None
+    return {"vector": meta.vector, "score": meta.score}
+
+def finding_confidence(code, declared=None):
+    """Tingkat keyakinan temuan: certain/firm/tentative."""
+    if declared:
+        base = declared
+    else:
+        meta = finding_meta(code)
+        base = meta.confidence if meta else "firm"
+    if code in TENTATIVE_CODES and base != "tentative":
+        return "tentative"
+    return base
+
+def make_finding_id(code, url, desc):
+    """ID temuan yang stabil antar scan: sha256(code|url|desc) 12 karakter pertama."""
+    raw = "|".join([code or "", url or "", desc or ""])
+    return "spade-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+def _shell_quote(value):
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+REPRO_SKIP_HEADERS = frozenset({"content-length", "host", "accept-encoding"})
+
+def repro_curl(exchange, impersonate=DEFAULT_IMPERSONATE, redact=None):
+    """Bangun langkah reproduksi dari satu Exchange.
+
+    Mengembalikan dict `{"curl": ..., "python_curl_cffi": ...}`. Perintah `curl`
+    portabel dipakai sebagai PoC utama; snippet `curl_cffi` disertakan supaya
+    fingerprint browser (impersonate) scan bisa direplikasi. Nilai cookie selalu
+    diganti placeholder — cookie hasil scan tidak valid untuk pembaca laporan.
+    """
+    if exchange is None:
+        return {"curl": "", "python_curl_cffi": ""}
+    if redact is None:
+        redact = REDACT_ENABLED
+    url = redact_url(exchange.url, redact)
+    headers = dict(exchange.request_headers or {})
+    header_args = []
+    py_headers = {}
+    content_type = ""
+    for name, value in headers.items():
+        lowered = name.lower()
+        if lowered == "cookie":
+            py_headers[name] = "COOKIE_ANDA"
+            header_args.append(f"-H {_shell_quote(f'{name}: COOKIE_ANDA')}")
+            continue
+        if lowered in REPRO_SKIP_HEADERS:
+            continue
+        if lowered == "content-type":
+            content_type = str(value)
+        py_headers[name] = value
+        header_args.append(f"-H {_shell_quote(f'{name}: {value}')}")
+    body = exchange.request_body or ""
+    segments = ["curl -sS -i", f"-X {exchange.method}"] + header_args
+    if body:
+        segments.append(f"--data-raw {_shell_quote(body)}")
+    segments.append(_shell_quote(url))
+    curl_command = " ".join(segments)
+    py_kwargs = [f"impersonate={impersonate!r}", "timeout=15"]
+    if py_headers:
+        py_kwargs.append(f"headers={py_headers!r}")
+    if body:
+        payload = body
+        if "json" in content_type.lower():
+            try:
+                payload = json.loads(body)
+                py_kwargs.append(f"json={payload!r}")
+            except ValueError:
+                py_kwargs.append(f"data={payload!r}")
+        else:
+            py_kwargs.append(f"data={payload!r}")
+    py_snippet = "\n".join([
+        "from curl_cffi import requests",
+        f"r = requests.{exchange.method.lower()}({url!r}, {', '.join(py_kwargs)})",
+        "print(r.status_code, len(r.content))",
+    ])
+    return {"curl": curl_command, "python_curl_cffi": py_snippet}
+
+class Finding:
+    """Temuan dengan bukti + metadata, tetap kompatibel dengan tuple lama.
+
+    Iterasi, `len()`, indexing, dan perbandingan tetap memakai bentuk lama
+    `(sev, code, desc, url)` supaya modul dan report yang sudah ada tidak perlu
+    diubah. Attribute tambahan: `evidence`, `confidence`, `meta`, `finding_id`.
+    """
+
+    __slots__ = ("sev", "code", "desc", "url", "evidence", "confidence", "meta", "finding_id")
+
+    def __init__(self, sev, code, desc, url=None, evidence=None, confidence=None, meta=None, finding_id=None):
+        self.sev = sev
+        self.code = code
+        self.desc = desc
+        self.url = url
+        self.evidence = evidence
+        self.meta = finding_meta(code) if meta is None else meta
+        self.confidence = finding_confidence(code, confidence)
+        self.finding_id = finding_id or make_finding_id(code, url, desc)
+
+    def _key(self):
+        return (self.sev, self.code, self.desc, self.url)
+
+    def __getitem__(self, index):
+        return self._key()[index]
+
+    def __len__(self):
+        return 4
+
+    def __iter__(self):
+        return iter(self._key())
+
+    def __eq__(self, other):
+        if isinstance(other, Finding):
+            return self._key() == other._key()
+        if isinstance(other, tuple):
+            return self._key()[:len(other)] == tuple(other)
+        return NotImplemented
+
+    def __hash__(self):
+        return hash(self._key())
+
+    def __repr__(self):
+        return f"Finding({self.sev!r}, {self.code!r}, url={self.url!r})"
+
+    def to_dict(self, snippet_chars=EVIDENCE_SNIPPET_CHARS_JSON, redact=None, impersonate=None):
+        """Serialisasi satu temuan untuk laporan JSON."""
+        if redact is None:
+            redact = REDACT_ENABLED
+        meta = self.meta
+        return {
+            "id": self.finding_id,
+            "severity": self.sev,
+            "code": self.code,
+            "description": self.desc,
+            "url": redact_url(self.url, redact) if self.url else self.url,
+            "confidence": self.confidence,
+            "cvss": cvss_of(meta),
+            "cwe": meta.cwe if meta else None,
+            "owasp": meta.owasp if meta else None,
+            "evidence": self.evidence.to_dict(snippet_chars, redact) if self.evidence else None,
+            "repro": repro_curl(self.evidence, impersonate or DEFAULT_IMPERSONATE, redact),
+        }
+
+def as_finding(item):
+    """Normalisasi tuple lama atau Finding menjadi Finding."""
+    if isinstance(item, Finding):
+        return item
+    values = list(item) if isinstance(item, (tuple, list)) else [item]
+    values = (values + [None, None, None, None])[:4]
+    return Finding(values[0], values[1], values[2], values[3])
+
+class FindingList(list):
+    """List temuan yang otomatis mengubah tuple lama menjadi Finding + menempelkan bukti.
+
+    `default_evidence_url` dipakai kalau temuan tidak punya URL sendiri (modul
+    pasif seperti security headers). `capture=False` untuk modul yang memang
+    tidak menembak HTTP (mis. pemeriksaan TLS via socket).
+    """
+
+    def __init__(self, default_evidence_url=None, capture=True, iterable=()):
+        super().__init__()
+        self.default_evidence_url = default_evidence_url
+        self.capture = capture
+        if iterable:
+            self.extend(iterable)
+
+    def append(self, item, evidence_url=_DEFAULT, evidence=None, confidence=None):
+        # `evidence_url=None` eksplisit berarti "temuan ini tidak punya request
+        # pemicu" (mis. SCAN_ERROR), jadi jangan tempelkan bukti apa pun.
+        explicit_no_evidence = evidence_url is None
+        lookup = self.default_evidence_url if evidence_url is _DEFAULT else evidence_url
+        if isinstance(item, Finding):
+            finding = item
+        else:
+            finding = as_finding(item)
+        if confidence is not None:
+            finding.confidence = finding_confidence(finding.code, confidence)
+        if evidence is None and finding.evidence is None and self.capture and not explicit_no_evidence:
+            lookup = lookup if lookup is not None else finding.url
+            if lookup:
+                evidence = evidence_for(lookup)
+        if evidence is not None and finding.evidence is None:
+            finding.evidence = evidence
+        super().append(finding)
+
+    def extend(self, items):
+        if isinstance(items, (Finding, tuple)):
+            self.append(items)
+            return
+        for item in items:
+            self.append(item)
 
 class ThreadLocalSession:
     """Proxy Session yang membuat curl_cffi Session terpisah per thread.
@@ -195,13 +794,29 @@ class ThreadLocalSession:
         kwargs.setdefault("timeout", self.timeout)
         method = method.upper()
         max_attempts = self.retries if method in RETRY_METHODS else 0
+        started = time.monotonic()
         resp = None
         for attempt in range(max_attempts + 1):
             resp = self._session().request(method, url, **kwargs)
             if resp.status_code not in RETRY_STATUS or attempt >= max_attempts:
-                return resp
+                break
             time.sleep(_retry_after_seconds(resp.headers.get("Retry-After")))
+        # Bukti direkam di satu-satunya funnel request, termasuk respons 4xx/5xx,
+        # supaya setiap temuan punya request/response pendukungnya.
+        record_exchange(exchange_from_response(resp, method, (time.monotonic() - started) * 1000,
+                                               kwargs, session_cookies=self._cookie_items()))
         return resp
+
+    def _cookie_items(self):
+        """Isi cookie jar session thread ini, atau None kalau tidak tersedia.
+
+        Dipakai hanya untuk menambah header Cookie ke bukti; kegagalan di sini
+        tidak boleh menggagalkan request yang sudah berhasil.
+        """
+        try:
+            return list(self._session().cookies.items())
+        except Exception:
+            return None
 
     def get(self, url, **kwargs):     return self.request("GET", url, **kwargs)
     def post(self, url, **kwargs):    return self.request("POST", url, **kwargs)
@@ -457,7 +1072,7 @@ def get_baseline_fingerprint(sess, base_url):
 
 def sec_headers(sess, base_url, ctx=None):
     """Cek HTTP security headers + info server + cookie."""
-    f = []
+    f = FindingList(base_url)
     r = get_base_response(sess, base_url, ctx)
     try:
         h = r.headers
@@ -517,7 +1132,7 @@ def sec_headers(sess, base_url, ctx=None):
 
 def tech_finger(sess, base_url, ctx=None):
     """Deteksi teknologi dari header dan HTML."""
-    f = []; info("Mendeteksi teknologi website...")
+    f = FindingList(base_url); info("Mendeteksi teknologi website...")
     r = get_base_response(sess, base_url, ctx)
     try:
         techs = []
@@ -541,7 +1156,7 @@ def tech_finger(sess, base_url, ctx=None):
 
 def robots_txt(sess, base_url, ctx=None):
     """Analisis robots.txt."""
-    f = []
+    f = FindingList(join(base_url, "/robots.txt"))
     try:
         r = sess.get(join(base_url,"/robots.txt"), timeout=10)
         if r.status_code==200 and "Disallow" in r.text:
@@ -583,7 +1198,7 @@ def sensitive_files(sess, base_url, ctx=None):
              ("/.env.dev","File env development."),
              ("/storage/logs/laravel.log","Laravel log — bisa berisi stack trace, query, data sensitif.")]
 
-    f = []; info("Mencari file sensitif...")
+    f = FindingList(); info("Mencari file sensitif...")
 
     def _is_false_positive(r, path):
         """Cek apakah response adalah SPA catch-all / default page, bukan file asli."""
@@ -628,7 +1243,7 @@ def sensitive_files(sess, base_url, ctx=None):
     def _check(item):
         """Periksa satu path. Return (findings, log_lines)."""
         p, desc = item
-        out = []; logs = []
+        out = FindingList(); logs = []
         try:
             r = sess.get(join(base_url, p), timeout=8)
             if r.status_code==200 and len(r.content)>0 and r.url.rstrip("/")!=base_url.rstrip("/"):
@@ -710,12 +1325,12 @@ def dir_listing(sess, base_url, ctx=None):
     dirs = [("/images/","direktori gambar"),("/uploads/","direktori upload"),("/backup/","direktori backup"),
             ("/admin/","direktori admin"),("/assets/","direktori assets"),("/files/","direktori file"),
             ("/css/","direktori CSS"),("/js/","direktori JS")]
-    f = []; info("Mengecek directory listing...")
+    f = FindingList(); info("Mengecek directory listing...")
     baseline = ctx.get("baseline") if ctx else None
 
     def _check(item):
         d, label = item
-        out = []
+        out = FindingList()
         try:
             r = sess.get(join(base_url, d), timeout=8)
             if r.status_code==200:
@@ -732,39 +1347,43 @@ def dir_listing(sess, base_url, ctx=None):
         return out
 
     for out in pmap(_check, dirs):
-        for sev, code, desc, url in out:
-            critical(f"Directory listing aktif: {urllib.parse.urlparse(url).path}")
-            f.append((sev, code, desc, url))
+        for item in out:
+            critical(f"Directory listing aktif: {urllib.parse.urlparse(item[3] or '').path}")
+            f.append(item)
     return f
 
 def http_methods(sess, base_url, ctx=None):
-    f = []; info("Memeriksa metode HTTP...")
+    f = FindingList(); info("Memeriksa metode HTTP...")
     def _check(m):
-        out = []
+        out = FindingList()
         try:
             r = sess.request(m, base_url, timeout=8)
+            # Bukti diambil per metode: TRACE/OPTIONS menembak URL yang sama,
+            # jadi lookup longgar bisa menempelkan respons metode lain.
+            proof = evidence_for(r.url, m)
             if m=="OPTIONS":
                 a = r.headers.get("Allow","")
                 if a and ("PUT" in a.upper() or "DELETE" in a.upper()):
-                    out.append(("HIGH","HTTP_METHOD",f"Server mengizinkan metode PUT/DELETE: {a}. PUT bisa dipakai unggah file berbahaya, DELETE bisa hapus resource.", None))
+                    out.append(("HIGH","HTTP_METHOD",f"Server mengizinkan metode PUT/DELETE: {a}. PUT bisa dipakai unggah file berbahaya, DELETE bisa hapus resource.", None),
+                               evidence=proof)
             if m=="TRACE" and r.status_code==200:
-                out.append(("MEDIUM","TRACE_ENABLED","Metode HTTP TRACE aktif. Bisa dieksploitasi untuk Cross-Site Tracing (XST) — mencuri cookie HttpOnly via JavaScript.", None))
+                out.append(("MEDIUM","TRACE_ENABLED","Metode HTTP TRACE aktif. Bisa dieksploitasi untuk Cross-Site Tracing (XST) — mencuri cookie HttpOnly via JavaScript.", None),
+                           evidence=proof)
         except: pass
         return out
 
     results = pmap(_check, ["PUT","DELETE","TRACE","OPTIONS"])
     for out in results:
         for item in out:
-            sev, code, desc = item[0], item[1], item[2]
-            if code == "HTTP_METHOD":
+            if item[1] == "HTTP_METHOD":
                 critical("Metode berbahaya diizinkan di target")
             else:
                 critical("Metode TRACE aktif")
-            f.append((sev, code, desc))
+            f.append(item)
     return f
 
 def cors_check(sess, base_url, ctx=None):
-    f = []
+    f = FindingList(base_url)
     try:
         r = sess.get(base_url, headers={"Origin":"https://evil.com","Host":host_from_url(base_url)}, timeout=10)
         acao = r.headers.get("Access-Control-Allow-Origin")
@@ -782,7 +1401,8 @@ def cors_check(sess, base_url, ctx=None):
     return f
 
 def tls_ssl(sess, base_url, ctx=None):
-    f = []; host = host_from_url(base_url)
+    # Pemeriksaan TLS memakai socket, bukan HTTP: tidak ada exchange untuk dijadikan bukti.
+    f = FindingList(capture=False); host = host_from_url(base_url)
     if scheme_from_url(base_url)!="https": return f
     info("Memeriksa TLS/SSL...")
     try:
@@ -821,7 +1441,7 @@ def tls_ssl(sess, base_url, ctx=None):
     return f
 
 def scan_sqli(sess, base_url, ctx=None):
-    f = []; info("Menguji SQL injection...")
+    f = FindingList(); info("Menguji SQL injection...")
     if echo_skip(sess, base_url, ctx):
         info("  (dilewati: endpoint memantulkan input)")
         return f
@@ -847,6 +1467,7 @@ def scan_sqli(sess, base_url, ctx=None):
     # Cek form params
     def _check_form(job):
         action, method, inputs, page, inp = job
+        # List biasa: tuple di sini membawa pesan log ke-5 yang tidak dipakai Finding.
         out = []
         for payload, label in payloads:
             try:
@@ -869,12 +1490,12 @@ def scan_sqli(sess, base_url, ctx=None):
         if out:
             for sev, code, desc, url, msg in out:
                 critical(msg)
-                f.append((sev, code, desc, url))
+                f.append((sev, code, desc, url), evidence_url=url)
     info(f"SQLi: {tested[0]} parameter diuji")
     return f
 
 def scan_xss(sess, base_url, ctx=None):
-    f = []; info("Menguji XSS...")
+    f = FindingList(); info("Menguji XSS...")
     payloads = [
         "<script>alert(1)</script>",
         "<img src=x onerror=alert(1)>",
@@ -948,7 +1569,7 @@ def scan_xss(sess, base_url, ctx=None):
     return f
 
 def open_redirect(sess, base_url, ctx=None):
-    f = []; info("Menguji open redirect...")
+    f = FindingList(); info("Menguji open redirect...")
     def _check(param):
         try:
             r = sess.get(base_url, params={param: "https://evil.com"}, timeout=10, allow_redirects=False)
@@ -964,7 +1585,7 @@ def open_redirect(sess, base_url, ctx=None):
     return f
 
 def lfi_check(sess, base_url, ctx=None):
-    f = []; info("Menguji LFI / path traversal...")
+    f = FindingList(); info("Menguji LFI / path traversal...")
     if echo_skip(sess, base_url, ctx):
         info("  (dilewati: endpoint memantulkan input)")
         return f
@@ -986,7 +1607,7 @@ def lfi_check(sess, base_url, ctx=None):
     return f
 
 def cmd_injection(sess, base_url, ctx=None):
-    f = []; info("Menguji command injection...")
+    f = FindingList(); info("Menguji command injection...")
     if echo_skip(sess, base_url, ctx):
         info("  (dilewati: endpoint memantulkan input)")
         return f
@@ -1048,7 +1669,7 @@ def cmd_injection(sess, base_url, ctx=None):
     return f
 
 def ssrf_check(sess, base_url, ctx=None):
-    f = []; info("Menguji SSRF...")
+    f = FindingList(); info("Menguji SSRF...")
     ssrf_url = "http://169.254.169.254/"
     ssrf_payloads = ["url","uri","link","href","src","ref","reference","callback","redirect","return","next","path","file","document","image","img","target"]
     
@@ -1081,6 +1702,7 @@ def ssrf_check(sess, base_url, ctx=None):
             for i in inputs:
                 if i["name"]:
                     data[i["name"]] = ssrf_url if i["name"] == url_field else "test"
+            # List biasa: tuple di sini membawa pesan log ke-5 yang tidak dipakai Finding.
             out = []
             try:
                 r = sess.post(action, data=data, timeout=10)
@@ -1100,11 +1722,11 @@ def ssrf_check(sess, base_url, ctx=None):
         if out:
             for sev, code, desc, url, msg in out:
                 warn(msg)
-                f.append((sev, code, desc, url))
+                f.append((sev, code, desc, url), evidence_url=url)
     return f
 
 def rate_limit(sess, base_url, ctx=None):
-    f = []; info("Menguji rate limiting...")
+    f = FindingList(base_url); info("Menguji rate limiting...")
     def _probe(_):
         try:
             r = sess.get(base_url, timeout=8)
@@ -1123,7 +1745,7 @@ def rate_limit(sess, base_url, ctx=None):
 # ── DETAILED modules ──
 
 def scan_ssti(sess, base_url, ctx=None):
-    f = []; info("Menguji SSTI (Server-Side Template Injection)...")
+    f = FindingList(); info("Menguji SSTI (Server-Side Template Injection)...")
     if echo_skip(sess, base_url, ctx):
         info("  (dilewati: endpoint memantulkan input)")
         return f
@@ -1152,7 +1774,7 @@ def scan_ssti(sess, base_url, ctx=None):
     return f
 
 def scan_xxe(sess, base_url, ctx=None):
-    f = []; info("Menguji XXE (XML External Entity)...")
+    f = FindingList(); info("Menguji XXE (XML External Entity)...")
     
     # Payload XXE — baca /etc/passwd via entity eksternal
     xxe_payloads = [
@@ -1218,7 +1840,7 @@ def scan_xxe(sess, base_url, ctx=None):
     return f
 
 def scan_nosqli(sess, base_url, ctx=None):
-    f = []; info("Menguji NoSQL injection...")
+    f = FindingList(); info("Menguji NoSQL injection...")
     if echo_skip(sess, base_url, ctx):
         info("  (dilewati: endpoint memantulkan input)")
         return f
@@ -1238,7 +1860,7 @@ def scan_nosqli(sess, base_url, ctx=None):
     return f
 
 def scan_graphql(sess, base_url, ctx=None):
-    f = []; info("Memeriksa GraphQL...")
+    f = FindingList(); info("Memeriksa GraphQL...")
     # Introspection query mentah (tanpa double-encode)
     q_raw = "{__schema{types{name fields{name}}}}"
     paths = ["/graphql","/api/graphql","/gql","/graphiql","/v1/graphql","/query"]
@@ -1274,7 +1896,7 @@ def scan_graphql(sess, base_url, ctx=None):
     return f
 
 def scan_js(sess, base_url, ctx=None):
-    f = []; info("Menganalisis JavaScript...")
+    f = FindingList(base_url); info("Menganalisis JavaScript...")
     try:
         r = get_base_response(sess, base_url, ctx)
         if r is None:
@@ -1301,7 +1923,7 @@ def scan_js(sess, base_url, ctx=None):
                 apis = [x for x in apis if not any(s in x.lower() for s in ["jquery","react","vue","angular","bootstrap","fontawesome"])]
                 if apis:
                     info(f"  {fn}: {len(apis)} endpoint API")
-                    f.append(("INFO","JS_APIS",f"File {fn} mengandung {len(apis)} endpoint API. Endpoint ini mungkin tidak terdokumentasi: {', '.join(apis[:5])}"))
+                    f.append(("INFO","JS_APIS",f"File {fn} mengandung {len(apis)} endpoint API. Endpoint ini mungkin tidak terdokumentasi: {', '.join(apis[:5])}"), evidence_url=js_url)
                 # Hardcoded secrets
                 secrets = re.findall(r'(?:api[_-]?key|secret|password|token|auth)\s*[:=]\s*["\'](?!([A-Z][a-z]+\s))([a-zA-Z0-9_\-/@#$%^&*+=]{16,})["\']', t, re.I)
                 secrets = [s for s,_ in secrets]
@@ -1312,12 +1934,12 @@ def scan_js(sess, base_url, ctx=None):
                     if re.search(r'[0-9]', s) or re.search(r'[A-Z]', s): real.append(s)
                 for s in real[:5]:
                     critical(f"Kredensial hardcode di {fn}")
-                    f.append(("CRITICAL","JS_SECRET",f"File JS {fn} mengandung kredensial/secret hardcode: '{s[:20]}...'. Jika ini adalah kredensial produksi, attacker bisa langsung mengakses resource yang dilindungi."))
+                    f.append(("CRITICAL","JS_SECRET",f"File JS {fn} mengandung kredensial/secret hardcode: '{s[:20]}...'. Jika ini adalah kredensial produksi, attacker bisa langsung mengakses resource yang dilindungi."), evidence_url=js_url)
     except: pass
     return f
 
 def scan_jwt(sess, base_url, ctx=None):
-    f = []; info("Menganalisis JWT...")
+    f = FindingList(base_url); info("Menganalisis JWT...")
     try:
         r = get_base_response(sess, base_url, ctx)
         if r is None:
@@ -1344,13 +1966,15 @@ def scan_jwt(sess, base_url, ctx=None):
     return f
 
 def scan_subdomains(sess, base_url, ctx=None):
-    f = []; info("Mencari subdomain...")
+    f = FindingList(); info("Mencari subdomain...")
     host = host_from_url(base_url)
     host = re.sub(r'^www\.', '', host)
     if not re.match(r'^[a-zA-Z0-9\-.]+\.[a-zA-Z]{2,}$', host): return f
+    crt_url = f"https://crt.sh/?q=%25.{host}&output=json"
+    f.default_evidence_url = crt_url   # bukti temuan subdomain = respons CRT.sh
     subs = set()
     try:
-        r = sess.get(f"https://crt.sh/?q=%25.{host}&output=json", timeout=15)
+        r = sess.get(crt_url, timeout=15)
         if r.status_code==200:
             try:
                 data = r.json()
@@ -1380,7 +2004,7 @@ def scan_subdomains(sess, base_url, ctx=None):
     return f
 
 def scan_forms_analyze(sess, base_url, ctx=None):
-    f = []; info("Menganalisis form...")
+    f = FindingList(); info("Menganalisis form...")
     crawler = ctx.get("crawler") if ctx else None
     if not crawler: return f
     forms = get_forms(ctx)
@@ -1396,7 +2020,7 @@ def scan_forms_analyze(sess, base_url, ctx=None):
             if any("pass" in n.lower() for n in names):
                 if not action.startswith("https") and base_url.startswith("https"):
                     warn(f"Form password dikirim lewat HTTP: {action}")
-                    f.append(("MEDIUM","FORM_HTTP",f"Form dengan field password di {page} mengirim data ke {action} (HTTP, bukan HTTPS). Password dikirim dalam teks mentah — bisa dicegat attacker di jaringan yang sama (WiFi publik, dll)."))
+                    f.append(("MEDIUM","FORM_HTTP",f"Form dengan field password di {page} mengirim data ke {action} (HTTP, bukan HTTPS). Password dikirim dalam teks mentah — bisa dicegat attacker di jaringan yang sama (WiFi publik, dll)."), evidence_url=page)
     else: info("Tidak ada form")
     return f
 
@@ -1421,19 +2045,112 @@ def waf_detect(sess, base_url, ctx=None):
 # ── report ──
 SEV_ORDER = {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"INFO":4}
 
-def gen_html(finds, target, start, end, out):
+def _normalize_findings(finds):
+    return [as_finding(f) for f in finds]
+
+def _finding_meta(finding):
+    """Metadata temuan: pakai milik Finding kalau ada, kalau tidak lihat kode."""
+    meta = getattr(finding, "meta", None)
+    return meta if meta is not None else finding_meta(finding[1])
+
+def _finding_confidence(finding):
+    declared = getattr(finding, "confidence", None)
+    return declared or finding_confidence(finding[1])
+
+def _truncate(text, limit=EVIDENCE_SNIPPET_CHARS):
+    text = text or ""
+    return text if len(text) <= limit else text[:limit] + "… (dipotong)"
+
+def confidence_badge(finding):
+    """Baris kecil berisi confidence + CVSS/CWE/OWASP untuk satu temuan."""
+    meta = _finding_meta(finding)
+    bits = [f"confidence: {_finding_confidence(finding)}"]
+    if meta and meta.vector:
+        bits.append(f"CVSS {meta.score} ({meta.vector})")
+    if meta and meta.cwe:
+        bits.append(meta.cwe)
+    if meta and meta.owasp:
+        bits.append(meta.owasp)
+    return " · ".join(bits)
+
+def evidence_html(finding, impersonate=None):
+    """Blok `<details>` berisi bukti request/response + langkah reproduksi."""
+    exchange = getattr(finding, "evidence", None)
+    meta_line = htmlmod.escape(confidence_badge(finding))
+    if exchange is None:
+        return (f'<details><summary>Bukti &amp; repro</summary><div class="meta">{meta_line}</div>'
+                '<p class="note">Tidak ada bukti HTTP untuk temuan ini '
+                '(diperoleh dari pemeriksaan non-HTTP, mis. handshake TLS/socket).</p></details>')
+    head = [
+        f'<div class="meta">{meta_line}</div>',
+        f'<p class="note">{htmlmod.escape(exchange.method)} {htmlmod.escape(redact_url(exchange.url))} '
+        f'&rarr; HTTP {htmlmod.escape(str(exchange.status))} '
+        f'({exchange.response_length} byte, {exchange.elapsed_ms} ms, {htmlmod.escape(exchange.timestamp)})</p>',
+    ]
+    header_lines = "\n".join(f"{k}: {v}" for k, v in exchange.request_headers.items())
+    if header_lines:
+        head.append("<h4>Request headers (redaksi)</h4>")
+        head.append(f"<pre>{htmlmod.escape(header_lines)}</pre>")
+    if exchange.request_body:
+        head.append("<h4>Request body</h4>")
+        head.append(f"<pre>{htmlmod.escape(_truncate(exchange.request_body))}</pre>")
+    if exchange.response_snippet:
+        head.append("<h4>Potongan respons</h4>")
+        head.append(f"<pre>{htmlmod.escape(_truncate(exchange.response_snippet))}</pre>")
+    repro = repro_curl(exchange, impersonate or DEFAULT_IMPERSONATE)
+    if repro["curl"]:
+        head.append("<h4>Reproduksi (curl)</h4>")
+        head.append(f"<pre>{htmlmod.escape(repro['curl'])}</pre>")
+        head.append("<h4>Reproduksi (curl_cffi)</h4>")
+        head.append(f"<pre>{htmlmod.escape(repro['python_curl_cffi'])}</pre>")
+        head.append('<p class="note">Scan ini memakai impersonasi browser '
+                    f"({htmlmod.escape(str(impersonate or DEFAULT_IMPERSONATE))}), jadi header dan TLS "
+                    "fingerprint-nya ikut disamarkan. `curl` polos bisa memberi hasil berbeda — "
+                    "pakai snippet curl_cffi di atas untuk mereplikasi kondisi scan.</p>")
+    return f'<details><summary>Bukti &amp; repro</summary>{"".join(head)}</details>'
+
+def evidence_status(finding):
+    """Status bukti untuk CSV: `http` kalau ada exchange, `none` kalau tidak."""
+    return "http" if getattr(finding, "evidence", None) is not None else "none"
+
+def evidence_url(finding):
+    exchange = getattr(finding, "evidence", None)
+    return redact_url(exchange.url) if exchange is not None else ""
+
+def scan_summary(finds):
+    """Ringkasan jumlah temuan per severity dan per confidence."""
+    by_severity = defaultdict(int)
+    by_confidence = defaultdict(int)
+    for finding in finds:
+        by_severity[finding[0]] += 1
+        by_confidence[_finding_confidence(finding)] += 1
+    return {
+        "total": len(finds),
+        "by_severity": {s: by_severity[s] for s in sorted(by_severity, key=lambda x: SEV_ORDER.get(x, 99))},
+        "by_confidence": dict(sorted(by_confidence.items())),
+    }
+
+def gen_html(finds, target, start, end, out, impersonate=None):
+    """Laporan HTML. `impersonate` dipakai untuk menuliskan konteks PoC reproduksi."""
+    finds = _normalize_findings(finds)
     def sk(f): return (SEV_ORDER.get(f[0],99), f[2] if len(f)>2 else "")
     sf = sorted(finds, key=sk)
     rows = ""
     for fi in sf:
         sev = fi[0].lower()
         url_cell = ""
-        if len(fi) > 3 and fi[3]:
+        if fi[3]:
             url_cell = f'<td style="word-break:break-all"><a href="{htmlmod.escape(fi[3])}" target="_blank" rel="noopener" style="color:#58a6ff">{htmlmod.escape(fi[3])}</a></td>'
-        rows += f"""<tr class="{sev}"><td><span class="sev-badge {sev}">{fi[0]}</span></td><td>{htmlmod.escape(fi[1]) if len(fi)>1 else ""}</td><td>{htmlmod.escape(fi[2]) if len(fi)>2 else ""}</td>{url_cell}</tr>\n"""
+        rows += (f'<tr class="{sev}"><td><span class="sev-badge {sev}">{htmlmod.escape(str(fi[0]))}</span></td>'
+                 f'<td>{htmlmod.escape(str(fi[1]))}</td><td>{htmlmod.escape(str(fi[2]))}'
+                 f'{evidence_html(fi, impersonate)}</td>{url_cell}</tr>\n')
     sc = defaultdict(int)
     for fi in sf: sc[fi[0]]+=1
     summary = "".join(f'<div class="sev-count {s.lower()}"><strong>{s}:</strong> {c}</div>' for s,c in sorted(sc.items(), key=lambda x: SEV_ORDER.get(x[0],99)))
+    with_evidence = sum(1 for fi in sf if getattr(fi, "evidence", None) is not None)
+    evidence_card = (f'<div class="card"><h3>Bukti</h3><div class="val">{with_evidence}/{len(sf)}</div>'
+                     f'<div style="margin-top:8px"><span class="sev-count">confidence: '
+                     f'{htmlmod.escape(", ".join(f"{k} {v}" for k, v in sorted(scan_summary(sf)["by_confidence"].items())))}</span></div></div>')
     dur = (end-start).total_seconds()
     html = f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Spade Scan - {htmlmod.escape(target)}</title>
@@ -1461,11 +2178,18 @@ tr.low{{border-left:3px solid #58a6ff}}
 .low .sev-badge{{background:#58a6ff;color:#0d1117}}
 tr.info{{border-left:3px solid #8b949e}}
 .info .sev-badge{{background:#8b949e;color:#0d1117}}
+details{{margin-top:8px}}
+summary{{cursor:pointer;color:#58a6ff;font-size:.8rem}}
+details h4{{font-size:.75rem;color:#8b949e;text-transform:uppercase;margin:10px 0 4px}}
+pre{{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px;overflow-x:auto;
+     font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;white-space:pre-wrap;word-break:break-all}}
+.meta{{font-size:.78rem;color:#8b949e;margin-top:6px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}}
+.note{{font-size:.78rem;color:#8b949e;margin-top:6px}}
 .footer{{margin-top:32px;text-align:center;color:#484f58;font-size:.8rem}}
 </style></head><body><div class="container">
 <h1>Spade Scan Report</h1>
 <p class="subtitle">{htmlmod.escape(target)} &mdash; {end.strftime('%Y-%m-%d %H:%M:%S')}</p>
-<div class="summary"><div class="card"><h3>Duration</h3><div class="val">{dur:.1f}s</div></div><div class="card"><h3>Findings</h3><div class="val">{len(sf)}</div></div><div class="card"><h3>Severity</h3><div style="margin-top:8px">{summary}</div></div></div>
+<div class="summary"><div class="card"><h3>Duration</h3><div class="val">{dur:.1f}s</div></div><div class="card"><h3>Findings</h3><div class="val">{len(sf)}</div></div><div class="card"><h3>Severity</h3><div style="margin-top:8px">{summary}</div></div>{evidence_card}</div>
 <table><thead><tr><th style="width:90px">Severity</th><th style="width:200px">Category</th><th>Detail</th><th style="width:300px">URL</th></tr></thead><tbody>{rows}</tbody></table>
 <div class="footer">spade &mdash; {end.strftime('%Y-%m-%d %H:%M:%S')}</div>
 </div></body></html>"""
@@ -1473,10 +2197,135 @@ tr.info{{border-left:3px solid #8b949e}}
     return out
 
 def gen_csv(finds, target, out):
+    """CSV temuan. Lima kolom lama tetap di posisi semula; kolom bukti/metadata menyusul di belakang."""
+    finds = _normalize_findings(finds)
     with open(out,"w",newline="",encoding="utf-8") as f:
-        w = csv.writer(f); w.writerow(["Severity","Category","Detail","URL","Target"])
+        w = csv.writer(f)
+        w.writerow(["Severity","Category","Detail","URL","Target","Confidence","CVSS_Score","CVSS_Vector",
+                    "CWE","OWASP","Repro_Curl","Evidence_Status","Evidence_URL"])
         for fi in finds:
-            w.writerow([fi[0], fi[1] if len(fi)>1 else "", fi[2] if len(fi)>2 else "", fi[3] if len(fi)>3 else "", target])
+            meta = _finding_meta(fi)
+            repro = repro_curl(getattr(fi, "evidence", None))
+            w.writerow([fi[0], fi[1], fi[2], fi[3] or "", target,
+                        _finding_confidence(fi),
+                        "" if meta is None or meta.vector is None else meta.score,
+                        (meta.vector if meta else "") or "",
+                        (meta.cwe if meta else "") or "",
+                        (meta.owasp if meta else "") or "",
+                        repro["curl"],
+                        evidence_status(fi),
+                        evidence_url(fi)])
+
+SarifLevels = {"CRITICAL": "error", "HIGH": "error", "MEDIUM": "warning", "LOW": "note", "INFO": "note"}
+
+def _cvss_score(meta):
+    """Skor CVSS, atau None kalau temuan tidak punya vector (informasional)."""
+    payload = cvss_of(meta)
+    return payload["score"] if payload else None
+
+def _cvss_help_uri(meta):
+    if meta and meta.cwe:
+        number = meta.cwe.split("-")[-1]
+        return f"https://cwe.mitre.org/data/definitions/{number}.html"
+    return "https://owasp.org/Top10/"
+
+def gen_json(finds, target, out, scan=None):
+    """Laporan JSON mesin-baca: metadata scan + ringkasan + temuan lengkap dengan bukti."""
+    scan = scan or {}
+    finds = _normalize_findings(finds)
+    impersonate = scan.get("impersonate")
+    payload = {
+        "tool": {"name": "spade", "version": SPADE_VERSION},
+        "target": target,
+        "scan": {
+            "mode": scan.get("mode"),
+            "started_at": scan.get("started_at"),
+            "finished_at": scan.get("finished_at"),
+            "duration_s": scan.get("duration_s"),
+            "impersonate": impersonate,
+            "workers": scan.get("workers"),
+            "modules": scan.get("modules", []),
+            "errors": scan.get("errors", []),
+            "redacted": REDACT_ENABLED,
+        },
+        "summary": scan_summary(finds),
+        "findings": [f.to_dict(EVIDENCE_SNIPPET_CHARS_JSON, None, impersonate) for f in finds],
+    }
+    with open(out, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    return out
+
+def gen_sarif(finds, target, out, scan=None):
+    """Laporan SARIF 2.1.0 supaya temuan bisa diunggah ke GitHub code scanning/dashboard SARIF."""
+    scan = scan or {}
+    finds = _normalize_findings(finds)
+    rules = []
+    rule_index = {}
+    for finding in finds:
+        if finding.code in rule_index:
+            continue
+        meta = _finding_meta(finding)
+        rule_index[finding.code] = len(rules)
+        rules.append({
+            "id": finding.code,
+            "name": finding.code,
+            "shortDescription": {"text": finding.code},
+            "fullDescription": {"text": finding.desc},
+            "defaultConfiguration": {"level": SarifLevels.get(finding[0], "note")},
+            "helpUri": _cvss_help_uri(meta),
+            "properties": {
+                "severity": finding[0],
+                "confidence": _finding_confidence(finding),
+                "cvssScore": _cvss_score(meta),
+                "cvssVector": meta.vector if meta else None,
+                "cwe": meta.cwe if meta else None,
+                "owasp": meta.owasp if meta else None,
+                "tags": ["security", "web"],
+            },
+        })
+    results = []
+    for finding in finds:
+        meta = _finding_meta(finding)
+        results.append({
+            "ruleId": finding.code,
+            "ruleIndex": rule_index[finding.code],
+            "level": SarifLevels.get(finding[0], "note"),
+            "message": {"text": f"{finding.code}: {finding[2]}" + (f" ({finding[3]})" if finding[3] else "")},
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": {"uri": redact_url(finding[3] or target)},
+                    "region": {"startLine": 1},
+                },
+            }],
+            "partialFingerprints": {"findingId": finding.finding_id},
+            "properties": {
+                "confidence": _finding_confidence(finding),
+                "cvssScore": _cvss_score(meta),
+                "cwe": meta.cwe if meta else None,
+                "owasp": meta.owasp if meta else None,
+                "evidenceUrl": evidence_url(finding),
+            },
+        })
+    document = {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {"name": "spade", "version": SPADE_VERSION, "informationUri": "https://github.com/RiloArbabillah/spade",
+                                "rules": rules}},
+            "invocations": [{
+                "executionSuccessful": True,
+                "startTimeUtc": scan.get("started_at"),
+                "endTimeUtc": scan.get("finished_at"),
+                "properties": {"target": target, "mode": scan.get("mode")},
+            }],
+            "results": results,
+        }],
+    }
+    with open(out, "w", encoding="utf-8") as handle:
+        json.dump(document, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    return out
 
 # ══════════════════════════════════════════════════════════════════
 # MAIN
@@ -1517,7 +2366,7 @@ STANDARD_MODULES = [k for k in ALL_MODULES if k not in DETAILED_ONLY]
 
 def main(argv=None):
     """Entry point CLI. argv=None berarti pakai sys.argv (dipakai test dengan list eksplisit)."""
-    global DISABLE_COLOR
+    global DISABLE_COLOR, REDACT_ENABLED
     parser = argparse.ArgumentParser(
         description="spade — Automated Web Vulnerability Scanner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1526,10 +2375,18 @@ def main(argv=None):
   python3 spade.py example.com --quick               # quick check
   python3 spade.py example.com --detailed            # full scan
   python3 spade.py example.com -o laporan.html       # custom output
-  python3 spade.py example.com --csv hasil.csv       # export CSV""")
+  python3 spade.py example.com --csv hasil.csv       # export CSV
+  python3 spade.py example.com --json hasil.json     # export JSON
+  python3 spade.py example.com --sarif hasil.sarif   # export SARIF""")
     parser.add_argument("target", nargs="?", default="", help="Target URL (opsional — akan diminta interaktif jika kosong)")
     parser.add_argument("-o","--output", default="", help="Laporan HTML")
     parser.add_argument("--csv", default="", help="Export CSV")
+    parser.add_argument("--json", default="", metavar="FILE",
+                        help="Export JSON (metadata scan + temuan + bukti, cocok untuk pipeline)")
+    parser.add_argument("--sarif", default="", metavar="FILE",
+                        help="Export SARIF 2.1.0 (untuk GitHub code scanning/CI)")
+    parser.add_argument("--no-redact", action="store_true",
+                        help="Matikan redaksi cookie/token/password di laporan. HATI-HATI: jangan dibagikan.")
     parser.add_argument("--quick", action="store_true", help="Mode cepat (7 modul, basic checks)")
     parser.add_argument("--detailed", action="store_true", help="Mode lengkap (23 modul, crawl)")
     parser.add_argument("--no-color", action="store_true", help="Output tanpa warna")
@@ -1542,6 +2399,10 @@ def main(argv=None):
     parser.add_argument("--crawl-max", type=int, default=30, help="Maksimal halaman di-crawl mode detailed (default: 30)")
     args = parser.parse_args(argv)
     if args.no_color: DISABLE_COLOR = True
+    if args.no_redact:
+        REDACT_ENABLED = False
+        print()
+        warn("REDACT OFF — cookie/token/password ikut tersimpan di laporan. Jangan bagikan hasil scan ini.")
 
     # Validasi profil impersonasi sebelum request apa pun dikirim.
     profiles = supported_impersonate_profiles()
@@ -1600,8 +2461,22 @@ def main(argv=None):
     verify_ssl = not args.skip_ssl
     set_request_executor(args.workers)
     sess = ThreadLocalSession(timeout=15, verify_ssl=verify_ssl, impersonate=args.impersonate)
-    finds = []
+    # Bukti (request/response) hanya boleh berasal dari scan yang sedang berjalan.
+    reset_evidence()
+    set_evidence_base_url(target)
+    finds = FindingList(target)
     start = datetime.now()
+    scan = {
+        "mode": mode,
+        "started_at": start.isoformat(timespec="seconds"),
+        "finished_at": None,
+        "duration_s": None,
+        "impersonate": args.impersonate,
+        "workers": args.workers,
+        "modules": [],
+        "errors": [],
+        "redacted": bool(REDACT_ENABLED),
+    }
     ctx = {"crawler": None}
 
     wafs = waf_detect(sess, target, ctx)
@@ -1628,14 +2503,24 @@ def main(argv=None):
     for key in modules:
         name, func = ALL_MODULES[key]
         print(f"\n  {c('bold',c('magenta','---'))} {c('bold',name)}")
+        scan["modules"].append(key)
         try:
             res = func(sess, target, ctx)
             if res: finds.extend(res)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Satu modul gagal tidak boleh membatalkan scan, tapi juga tidak boleh
+            # hilang diam-diam: catat sebagai temuan INFO + masuk ke scan["errors"].
+            detail = f"Modul '{key}' ({name}) gagal dijalankan: {type(exc).__name__}: {exc}"
+            scan["errors"].append({"module": key, "error": f"{type(exc).__name__}: {exc}"})
+            err(detail)
+            # Bukti HTTP tidak relevan untuk kegagalan modul, jadi tempel bukti
+            # dimatikan supaya laporan tidak menyesatkan.
+            finds.append(("INFO", "SCAN_ERROR", detail, target), evidence_url=None)
 
     end = datetime.now()
     dur = (end-start).total_seconds()
+    scan["finished_at"] = end.isoformat(timespec="seconds")
+    scan["duration_s"] = round(dur, 2)
     print(f"\n  {c('bold',c('magenta','+==============================+'))}")
     print()
     info(f"Selesai dalam {dur:.1f}s")
@@ -1646,11 +2531,19 @@ def main(argv=None):
     print()
 
     outpath = args.output or f"spade_{host}.html"
-    gen_html(finds, target, start, end, outpath)
+    gen_html(finds, target, start, end, outpath, impersonate=args.impersonate)
     good(f"Laporan: {outpath}")
     if args.csv:
         gen_csv(finds, target, args.csv)
         good(f"CSV   : {args.csv}")
+    if args.json:
+        gen_json(finds, target, args.json, scan=scan)
+        good(f"JSON  : {args.json}")
+    if args.sarif:
+        gen_sarif(finds, target, args.sarif, scan=scan)
+        good(f"SARIF : {args.sarif}")
+    if scan["errors"]:
+        warn(f"{len(scan['errors'])} modul gagal — lihat temuan SCAN_ERROR di laporan.")
     print()
     return 0
 

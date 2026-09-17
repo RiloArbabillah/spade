@@ -4,6 +4,8 @@ Test ini adalah jaring pengaman migrasi HTTP: setiap modul harus tetap
 menghasilkan temuan yang sama setelah transport diganti ke curl_cffi.
 """
 
+import json
+
 import pytest
 
 import spade
@@ -217,3 +219,24 @@ def test_all_modules_are_registered_once():
     assert len(keys) == len(set(keys))
     assert set(spade.QUICK_MODULES) <= set(keys)
     assert set(spade.STANDARD_MODULES) | set(spade.DETAILED_ONLY) == set(keys)
+
+def test_module_crash_is_reported_as_scan_error(vuln_server, tmp_path, monkeypatch):
+    """Modul yang meledak harus muncul sebagai temuan INFO SCAN_ERROR, bukan hilang diam-diam."""
+
+    def _boom(sess, target, ctx):
+        raise RuntimeError("fixture meledak")
+
+    monkeypatch.setitem(spade.ALL_MODULES, "headers", ("Security Headers", _boom))
+    json_out = tmp_path / "err.json"
+    code = spade.main([vuln_server.base_url, "--quick", "--no-color", "--workers", "1",
+                       "-o", str(tmp_path / "err.html"), "--json", str(json_out)])
+    assert code == 0
+    payload = json.loads(json_out.read_text(encoding="utf-8"))
+    errors = payload["scan"]["errors"]
+    assert len(errors) == 1
+    assert errors[0]["module"] == "headers"
+    assert "RuntimeError" in errors[0]["error"]
+    scan_error = [f for f in payload["findings"] if f["code"] == "SCAN_ERROR"]
+    assert len(scan_error) == 1
+    assert scan_error[0]["severity"] == "INFO"
+    assert scan_error[0]["evidence"] is None

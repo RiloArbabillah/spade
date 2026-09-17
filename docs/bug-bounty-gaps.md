@@ -2,19 +2,25 @@
 
 Dokumen ini memetakan celah Spade sebagai alat *bug bounty* (bukan sekadar
 scanner pasif), bukti konkret di kode saat ini, dampaknya, dan tool/target
-perbaikan yang realistis. Semua baris di bawah **belum dikerjakan** pada PR
-`feat/curl-cffi-http-layer` (PR tersebut hanya mengganti HTTP layer ke
-`curl_cffi` + menambah test + dokumen ini).
+perbaikan yang realistis.
+
+Status: **bagian 1 sudah dikerjakan** di PR `feat/finding-evidence-metadata`
+(detail teknis di [docs/findings-model.md](findings-model.md)). Bagian 2–6
+masih terbuka. PR `feat/curl-cffi-http-layer` sebelumnya hanya mengganti HTTP
+layer ke `curl_cffi` + menambah test + membuat dokumen ini.
 
 Kondisi kode yang jadi basis analisis (per commit `main` saat dokumen ditulis):
 
 - `spade.py` = 23 modul terdaftar di `ALL_MODULES`; `QUICK_MODULES` 7,
   `DETAILED_ONLY` 7, `STANDARD_MODULES` 16.
 - 40 blok `except:` (bare) dan 42 titik `except ...: pass` — banyak modul gagal
-  secara diam-diam.
-- Semua temuan berbentuk tuple `(severity, kode, deskripsi, url)`
+  secara diam-diam. (Sejak `feat/finding-evidence-metadata`, kegagalan modul di
+  `main()` tercatat sebagai `INFO SCAN_ERROR` + masuk `scan.errors`.)
+- Temuan ditulis sebagai tuple `(severity, kode, deskripsi, url)`
   (mis. `f.append((sev, code, desc, url))`) — tanpa bukti request/response,
-  tanpa CVSS, tanpa tingkat keyakinan, tanpa langkah reproduksi.
+  tanpa CVSS, tanpa tingkat keyakinan, tanpa langkah reproduksi. (Sejak
+  `feat/finding-evidence-metadata`, tuple itu tetap valid tapi sekarang
+  otomatis jadi `Finding` lengkap dengan bukti + metadata; lihat bagian 1.)
 
 Kolom **Prioritas**: P0 = wajib sebelum dipakai untuk bounty berbayar,
 P1 = nilai tinggi/cepat, P2 = nilai menengah, P3 = nice-to-have.
@@ -23,13 +29,16 @@ P1 = nilai tinggi/cepat, P2 = nilai menengah, P3 = nice-to-have.
 
 ## 1. Kualitas temuan (evidence & pelaporan)
 
-| Area | Bukti di kode | Dampak | Tool / pendekatan konkret | Prioritas |
+Dikerjakan di `feat/finding-evidence-metadata` (semua baris di bawah **selesai**).
+
+| Area | Bukti lama di kode | Dampak | Yang dikerjakan | Status |
 |---|---|---|---|---|
-| Tidak ada bukti request/response | Temuan hanya tuple `(sev, code, desc, url)`; `gen_html`/`gen_csv` menulis 4 kolom + target | Triager menolak laporan; tidak bisa dibuktikan tanpa reproduce manual | Simpan `Evidence` dataclass: `method, url, request_headers, request_body, status, resp_snippet, timestamp`; tulis ke HTML/CSV/JSON | P0 |
-| Tidak ada perintah reproduce | Tidak ada generator `curl` | Reporter kehilangan waktu menulis PoC | Emit `curl -sS '<url>' -H ... --data ...` per temuan (pakai profil impersonate yang dipakai scan) | P0 |
-| Tidak ada CVSS / OWASP mapping | Hanya label `CRITICAL/HIGH/MEDIUM/LOW/INFO` | Severity subjektif, sulit diprioritaskan | Tambah `cvss_vector` (CVSS 3.1/4.0) + kategori OWASP Top 10/CWE per kode temuan | P1 |
-| Tidak ada confidence & deteksi FP | Modul langsung `f.append(...)` saat pola cocok | False positive menggerus kepercayaan | Field `confidence: certain/firm/tentative`; heuristik skor (mis. SQLi error + status 500 + perbedaan respons) | P1 |
-| Output hanya HTML/CSV | `-o/--csv` saja | Tidak bisa dipakai di pipeline/CI | Tambah `--json` dan `--sarif`; tambah `--diff <scan.json>` untuk membandingkan dua scan | P1 |
+| Tidak ada bukti request/response | Temuan hanya tuple `(sev, code, desc, url)`; `gen_html`/`gen_csv` menulis 4 kolom + target | Triager menolak laporan; tidak bisa dibuktikan tanpa reproduce manual | `class Exchange` + `exchange_from_response()` merekam request/response otomatis di funnel `ThreadLocalSession.request()`; `FindingList` menempelkan bukti dari indeks `evidence_for()`; bukti tampil di HTML/CSV/JSON | ✅ Selesai |
+| Tidak ada perintah reproduce | Tidak ada generator `curl` | Reporter kehilangan waktu menulis PoC | `repro_curl()` menghasilkan `curl -sS -i -X … -H … --data-raw …` portabel + snippet `curl_cffi` (memakai profil `--impersonate` scan); cookie selalu `COOKIE_ANDA` | ✅ Selesai |
+| Tidak ada CVSS / OWASP mapping | Hanya label `CRITICAL/HIGH/MEDIUM/LOW/INFO` | Severity subjektif, sulit diprioritaskan | `FINDING_META` (CVSS 3.1 + CWE + OWASP Top 10 per kode) + `META_PREFIX_RULES` untuk `MISS_*`/`HDR_*`/`WEAK_*`; `cvss_of()` mengosongkan skor temuan informasional | ✅ Selesai |
+| Tidak ada confidence & deteksi FP | Modul langsung `f.append(...)` saat pola cocok | False positive menggerus kepercayaan | Field `confidence: certain/firm/tentative` via `finding_confidence()`; kode heuristik (`SSRF*`, `CORS_REFLECT`, `XSS_STORED`, `NO_RATE_LIMIT`, …) dipaksa `tentative`; hitungan per confidence ada di ringkasan laporan | ✅ Selesai |
+| Output hanya HTML/CSV | `-o/--csv` saja | Tidak bisa dipakai di pipeline/CI | `--json` (metadata scan + temuan + bukti) dan `--sarif` (SARIF 2.1.0, siap GitHub code scanning) | ✅ Selesai |
+| Tidak ada pembandingan antar scan | — | Sulit melihat temuan baru/hilang | `--diff <scan.json>` — **sengaja ditunda** ke PR terpisah | ⏳ Ditunda |
 
 ## 2. Cakupan kelas kerentanan yang hilang
 
@@ -91,10 +100,10 @@ P1 = nilai tinggi/cepat, P2 = nilai menengah, P3 = nice-to-have.
 
 ## Catatan penting soal anti-deteksi bot
 
-PR ini sudah memindahkan seluruh HTTP request ke `curl_cffi` dengan
-*browser impersonation* aktif secara default (profil `chrome`, dapat diubah
-lewat `--impersonate`, dimatikan dengan `--no-impersonate`) sehingga TLS
-fingerprint (JA3) dan header klien menyerupai browser asli.
+HTTP layer sudah memakai `curl_cffi` dengan *browser impersonation* aktif
+secara default (profil `chrome`, dapat diubah lewat `--impersonate`, dimatikan
+dengan `--no-impersonate`) sehingga TLS fingerprint (JA3) dan header klien
+menyerupai browser asli.
 
 Yang **belum** ada dan tetap jadi celah deteksi:
 
@@ -108,7 +117,9 @@ Item 1–2 ada di tabel bagian 5 (P0/P1) dan akan dikerjakan di PR terpisah.
 
 ## Urutan pengerjaan yang disarankan
 
-1. **P0 laporan**: evidence + `curl` repro + CVSS/OWASP (bagian 1).
+1. ~~**P0 laporan**: evidence + `curl` repro + CVSS/OWASP (bagian 1).~~
+   **Sudah selesai** di `feat/finding-evidence-metadata` — sisa yang tertunda
+   hanya `--diff <scan.json>`.
 2. **P0 operasional**: `--cookie/-H`, `--delay/--max-rps`, `--scope-file`,
    `--safe-mode` (bagian 5 & 6).
 3. **P0 akurasi**: perbaiki heuristik SSRF dan tambah IDOR/BOLA (bagian 2 & 4).
