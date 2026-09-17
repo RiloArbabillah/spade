@@ -1,0 +1,2 @@
+# Runtime spade: HTTP client dengan browser impersonation (anti-deteksi bot).
+curl_cffi>=0.15,<0.17

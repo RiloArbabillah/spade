@@ -1,0 +1,17 @@
+# Konfigurasi tooling untuk spade (bukan packaging metadata: proyek ini
+# didistribusikan sebagai satu file `spade.py`).
+
+[tool.ruff]
+line-length = 140
+target-version = "py39"
+
+[tool.ruff.lint]
+# Fokus pada bug nyata (pyflakes) + kerapian import. Aturan gaya yang lebih luas
+# (E501/E7xx, S110, BLE001) sengaja belum diaktifkan: `spade.py` masih memakai
+# gaya compact satu-baris dan `except: pass` yang jumlahnya didata di
+# docs/bug-bounty-gaps.md sebelum dibersihkan bertahap.
+select = ["F", "E9", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
