@@ -4,11 +4,12 @@ Dokumen ini memetakan celah Spade sebagai alat *bug bounty* (bukan sekadar
 scanner pasif), bukti konkret di kode saat ini, dampaknya, dan tool/target
 perbaikan yang realistis.
 
-Status: **bagian 1 dan 2 sudah dikerjakan** — bagian 1 di PR
+Status: **bagian 1, 2, dan 3 sudah dikerjakan** — bagian 1 di PR
 `feat/finding-evidence-metadata` (detail di
 [docs/findings-model.md](findings-model.md)), bagian 2 di PR
 `feat/vuln-class-coverage` (detail per kelas di
-[docs/vuln-classes.md](vuln-classes.md)). Bagian 3–6 masih terbuka. PR
+[docs/vuln-classes.md](vuln-classes.md)), bagian 3 di PR `feat/recon-enum`
+(detail di [docs/recon.md](recon.md)). Bagian 4–6 masih terbuka. PR
 `feat/curl-cffi-http-layer` sebelumnya hanya mengganti HTTP layer ke `curl_cffi`
 + menambah test + membuat dokumen ini.
 
@@ -16,7 +17,8 @@ Kondisi kode yang jadi basis analisis (per commit `main` saat dokumen ditulis):
 
 - `spade.py` = 23 modul terdaftar di `ALL_MODULES`; `QUICK_MODULES` 7,
   `DETAILED_ONLY` 7, `STANDARD_MODULES` 16. (Setelah bagian 2: 31 modul,
-  `DETAILED_ONLY` 12, `STANDARD_MODULES` 19.)
+  `DETAILED_ONLY` 12; setelah bagian 3: 32 modul, `DETAILED_ONLY` 13,
+  `STANDARD_MODULES` 19 — `QUICK_MODULES` tetap 7.)
 - 40 blok `except:` (bare) dan 42 titik `except ...: pass` — banyak modul gagal
   secara diam-diam. (Sejak `feat/finding-evidence-metadata`, kegagalan modul di
   `main()` tercatat sebagai `INFO SCAN_ERROR` + masuk `scan.errors`.)
@@ -74,14 +76,28 @@ rincian per kelas, flag, dan batas request ada di
 
 ## 3. Recon
 
-| Area | Bukti di kode | Dampak | Tool / pendekatan konkret | Prioritas |
+Dikerjakan di `feat/recon-enum` (detail sumber, batas request, alur data, dan
+privasi ada di [docs/recon.md](recon.md)). Pendekatannya **stdlib + `curl_cffi`
+saja** — sumber pasif diakses lewat API HTTP publik, tanpa binary eksternal
+(`subfinder`/`dnsx`/`httpx`/`gau`/`katana`/`naabu`) dan tanpa `subprocess`.
+
+| Area | Bukti lama di kode | Dampak | Yang dikerjakan | Status |
 |---|---|---|---|---|
-| Subdomain enum terbatas | `scan_subdomains` = CRT.sh (50 entry) + 20 kata statis via `socket.getaddrinfo` | Attack surface sebagian besar tidak terlihat | `subfinder` + `dnsx` + `httpx` (resolve + status + title), fallback ke wordlist besar | P1 |
-| Tanpa crawling URL historis | Crawler hanya BFS dari HTML halaman seed (`Crawler`) | Endpoint lama/parameter tidak terlihat | `gau`/`waymore` untuk URL dari Wayback/Common Crawl, lalu umpan ke modul injection | P1 |
-| Tanpa crawling JS/endpoint modern | Modul `js` hanya regex `apiKey` + path `/api/v1/...` di 1 file | Endpoint SPA terlewat | `katana` (headless crawl) atau `jsluice` untuk ekstraksi endpoint dari JS | P2 |
-| Tanpa port/ service scan | Tidak ada | Service non-HTTP (8080, 8443, dsb) terlewat | `naabu`/`nmap` ringan untuk port umum lalu `httpx` untuk filter | P2 |
-| Tanpa visual recon / screenshot | Tidak ada | Sulit memvalidasi temuan visual | `gowitness` / Playwright screenshot per host | P3 |
-| Scope & multi-target | Argumen `target` tunggal; tidak ada file scope | Tidak bisa batch host dari program bounty | Tambah `-l targets.txt` + `--scope-file` (allowlist domain) | P0 |
+| Subdomain enum terbatas | `scan_subdomains` = CRT.sh (50 entry) + 20 kata statis via `socket.getaddrinfo` | Attack surface sebagian besar tidak terlihat | Modul `recon`: crt.sh + Cert Spotter + brute force DNS 134 kata (paralel, timeout 1,5s/lookup), normalisasi scope via `_recon_clean_names`, cap 200; host hidup di-probe (status, `<title>`, header `Server`) → `SUBDOMAIN_LIVE` | ✅ Selesai |
+| Tanpa crawling URL historis | Crawler hanya BFS dari HTML halaman seed (`Crawler`) | Endpoint lama/parameter tidak terlihat | Sumber `wayback` (CDX) + `commoncrawl` → `HISTORIC_URLS`; URL non-statis jadi `extra_seeds` crawler (maks 6) dan pool parameter modul injection (5 URL × 5 nama parameter **yang benar-benar ada** di URL historis) | ✅ Selesai |
+| Tanpa crawling JS/endpoint modern | Modul `js` hanya regex `apiKey` + path `/api/v1/...` di 1 file | Endpoint SPA terlewat | `recon_js`: panen `<script src>` halaman utama + halaman crawl (15 berkas), `extract_js_endpoints` menyaring rute menarik → `JS_ENDPOINT`; teks JS dipakai ulang modul `js` supaya tidak diunduh dua kali | ✅ Selesai |
+| Tanpa port/ service scan | Tidak ada | Service non-HTTP (8080, 8443, dsb) terlewat | `--port-scan` (opt-in, butuh `--detailed`/`--recon-only`): TCP connect ke 41 port di 5 host → `PORT_OPEN` (LOW untuk 10 port berisiko: 3306, 5432, 6379, 9200, 11211, 27017, …) | ✅ Selesai |
+| Tanpa visual recon / screenshot | Tidak ada | Sulit memvalidasi temuan visual | `gowitness`/Playwright per host | ⏳ Ditunda (P3) |
+| Scope & multi-target | Argumen `target` tunggal; tidak ada file scope | Tidak bisa batch host dari program bounty | `-l targets.txt` + `--scope-file` (allowlist domain) — menyentuh entry point CLI + model target | ⏳ Ditunda (P0, PR operasional) |
+
+### Ditunda dari bagian 3
+
+| Item | Alasan ditunda | Rencana |
+|---|---|---|
+| Screenshot / visual recon (`gowitness`, Playwright) | Butuh binary/dependency baru, sedangkan proyek ini sengaja stdlib + `curl_cffi` | PR terpisah (P3) kalau ada kebutuhan verifikasi temuan visual |
+| `-l targets.txt` + `--scope-file` (bagian 3 & 6) | Menyentuh entry point CLI dan model target (saat ini satu target) | PR "operasional & scope" bersama `--delay`/`--max-rps` (bagian 5) |
+| Brute force parameter penuh (`arjun`/`x8`) & penguraian **YAML** OpenAPI | Menambah ribuan request / butuh parser YAML (dependency baru) | Setelah bagian 5 (`--delay`/`--max-rps`) selesai |
+| Zone transfer, S3/GCS bucket, subdomain takeover | Butuh sumber data dan uji tulis di luar model request HTTP biasa | Belum dijadwalkan |
 
 ## 4. Kualitas deteksi modul yang sudah ada
 
@@ -131,6 +147,9 @@ Yang **belum** ada dan tetap jadi celah deteksi:
 3. Fingerprint perilaku: tidak ada jeda berpikir, tidak memuat aset statis,
    tidak ada `Referer` realistis antar halaman.
 4. Cookie/sesi palsu dan `Accept-Language` tetap seragam untuk semua target.
+5. Recon pasif mengirim **nama target** ke API pihak ketiga (crt.sh, Cert
+   Spotter, Wayback, Common Crawl) dari IP tester — request ini tidak bisa
+   di-impersonate. Opt-out: `--no-recon` (mode DETAILED).
 
 Item 1–2 ada di tabel bagian 5 (P0/P1) dan akan dikerjakan di PR terpisah.
 
@@ -150,6 +169,8 @@ Item 1–2 ada di tabel bagian 5 (P0/P1) dan akan dikerjakan di PR terpisah.
    (bagian 5 & 6).
 4. **P0 akurasi**: perbaiki heuristik SSRF in-band dan perluas cakupan
    XSS/LFI (bagian 4).
-5. **P1 recon**: `subfinder`/`dnsx`/`httpx`, `gau`/`waymore`, `katana`/`jsluice`
-   (bagian 3).
+5. ~~**P1 recon** (bagian 3): enumerasi subdomain, URL historis, endpoint JS,
+   host hidup, port scan.~~ **Sudah selesai** di `feat/recon-enum` (detail di
+   [docs/recon.md](recon.md)) memakai API publik lewat `curl_cffi` tanpa binary
+   eksternal. Sisa yang ditunda: screenshot (P3) dan `-l`/`--scope-file`.
 6. Sisanya P2/P3 sesuai kebutuhan program bounty yang diikuti.
