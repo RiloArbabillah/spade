@@ -34,6 +34,10 @@ request paralel (`--workers`) tidak berbagi session/cookie state.
   tersedia di `curl_cffi`. Set `retries=0` untuk mematikannya.
 - Atribut lain (`cookies`, `headers`, `close`) didelegasikan ke Session milik
   thread terkait lewat `__getattr__`.
+- Funnel yang sama merekam setiap request/response menjadi objek `Exchange`
+  (sudah tersensor) lewat `record_exchange()`, sehingga temuan bisa membawa
+  bukti + langkah repro. Detailnya di
+  [findings-model.md](findings-model.md).
 
 ### `supported_impersonate_profiles()`
 

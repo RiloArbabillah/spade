@@ -30,6 +30,9 @@ python3 spade.py example.com
 | `--detailed` | Mode lengkap (23 modul, crawl depth 2) |
 | `-o file.html` | Output HTML report |
 | `--csv file.csv` | Export hasil ke CSV |
+| `--json file.json` | Export JSON (metadata scan + temuan + bukti request/response, cocok untuk pipeline) |
+| `--sarif file.sarif` | Export SARIF 2.1.0 (untuk GitHub code scanning / CI) |
+| `--no-redact` | Matikan sensor cookie/token/password. **Hati-hati: jangan dibagikan.** |
 | `--no-color` | Output terminal tanpa warna |
 | `--impersonate PROFIL` | Profil browser untuk impersonation (default `chrome`). Contoh: `chrome136`, `safari184`, `firefox147` |
 | `--no-impersonate` | Matikan browser impersonation (fingerprint default curl, untuk debugging) |
@@ -44,7 +47,29 @@ python3 spade.py https://example.com -o laporan.html
 python3 spade.py https://example.com --csv hasil.csv
 python3 spade.py https://example.com --detailed -o full-report.html --csv full.csv
 python3 spade.py https://example.com --impersonate safari184   # impersonate profil lain
+python3 spade.py https://example.com --json hasil.json --sarif hasil.sarif  # untuk pipeline/CI
 ```
+
+## Struktur laporan
+
+Setiap temuan disertai bukti request/response (method, URL, status, header,
+body request, potongan respons, waktu) dan langkah reproduksi siap tempel.
+Rahasia (Cookie, `Authorization`, field `password`/`token`, parameter URL
+sensitif) disensor otomatis sebagai `***REDACTED***`; cookie di perintah
+repro selalu jadi `COOKIE_ANDA`.
+
+| Format | Flag | Isi |
+|---|---|---|
+| HTML | `-o file.html` (default `spade_<host>.html`) | Tabel temuan + blok `<details>` berisi bukti, metadata (confidence/CVSS/CWE/OWASP), dan dua langkah repro |
+| CSV | `--csv file.csv` | 5 kolom lama + `Confidence`, `CVSS_Score`, `CVSS_Vector`, `CWE`, `OWASP`, `Repro_Curl`, `Evidence_Status`, `Evidence_URL` |
+| JSON | `--json file.json` | `tool`, `target`, `scan` (mode, durasi, worker, `errors`, `redacted`), `summary`, dan `findings` lengkap dengan `evidence` + `repro` |
+| SARIF | `--sarif file.sarif` | SARIF 2.1.0: satu rule per kode temuan + `partialFingerprints` supaya temuan tidak dobel di dashboard |
+
+Metadata per temuan: skor + vector CVSS 3.1, CWE, kategori OWASP Top 10, dan
+tingkat keyakinan (`certain` / `firm` / `tentative`). Kode yang belum
+dipetakan tidak diberi skor CVSS karangan. Detail lengkap model temuan, aturan
+redaksi, dan skema output ada di
+[docs/findings-model.md](docs/findings-model.md).
 
 ## Perbandingan Mode
 
@@ -109,7 +134,8 @@ dimatikan dengan `--no-impersonate`.
 
 Yang belum tersedia: rotasi IP/proxy, delay/jitter, dan pola request manusiawi.
 Daftar lengkapnya ada di [docs/bug-bounty-gaps.md](docs/bug-bounty-gaps.md).
-Detail HTTP layer ada di [docs/http-layer.md](docs/http-layer.md).
+Detail HTTP layer ada di [docs/http-layer.md](docs/http-layer.md), dan model
+temuan/bukti/laporan ada di [docs/findings-model.md](docs/findings-model.md).
 
 ## Development
 
@@ -122,8 +148,14 @@ python3 -m ruff check .                # lint (config di pyproject.toml)
 ## Catatan
 
 - Scan ini non-intrusive. Tapi hanya gunakan di situs sendiri/terotorisasi.
-- Roadmap celah fitur bug bounty (evidence, IDOR, OOB, proxy/rate limit, scope,
-  dll) ada di [docs/bug-bounty-gaps.md](docs/bug-bounty-gaps.md).
+- Roadmap celah fitur bug bounty (IDOR, OOB, proxy/rate limit, scope, dll) ada
+  di [docs/bug-bounty-gaps.md](docs/bug-bounty-gaps.md). Bagian 1 (kualitas
+  temuan: bukti, repro, CVSS/CWE/OWASP, confidence, JSON/SARIF) sudah selesai;
+  model datanya didokumentasikan di
+  [docs/findings-model.md](docs/findings-model.md).
+- Setiap temuan membawa bukti request/response dan perintah `curl` siap pakai.
+  Kredensial disensor otomatis (`***REDACTED***`); jangan pakai `--no-redact`
+  kalau hasilnya akan dibagikan.
 - Request dijalankan paralel (default 10 worker). Naikkan `--workers` untuk target cepat, turunkan ke `--workers 1` jika target rate-limit/WAF sensitif.
 - Modul deteksi (SQLi, XSS, LFI, CMDi, SSTI, XXE, GraphQL, SSRF, NoSQLi, Open Redirect) berhenti lebih awal begitu temuan pertama ketemu, jadi mode DETAILED tidak selalu mengirim semua payload.
 - Halaman utama dan daftar form di-cache: satu request/parse dipakai ulang lintas modul, bukan diulang per modul.
