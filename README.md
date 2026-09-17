@@ -1,6 +1,6 @@
 # Spade
 
-Automated web vulnerability scanner dengan 3 mode + mode interaktif. Detect SQLi, XSS, LFI, CMDi, SSRF, XXE, GraphQL introspection, open redirect, sensitive files, TLS, CORS, WAF, dan masih banyak lagi.
+Automated web vulnerability scanner dengan 3 mode + mode interaktif. Detect SQLi, XSS, LFI, CMDi, SSRF (termasuk blind/OOB), XXE, GraphQL introspection, IDOR/BOLA, CSRF, JWT, auth bypass, host header/cache poisoning, CRLF, request smuggling, open redirect, sensitive files, TLS, CORS, WAF, dan masih banyak lagi.
 
 **File:** `spade.py` (Python 3, dependensi minimal)
 
@@ -10,9 +10,9 @@ Automated web vulnerability scanner dengan 3 mode + mode interaktif. Detect SQLi
 
 ```bash
 python3 spade.py                          # INTERAKTIF — minta domain & mode
-python3 spade.py https://target.com       # STANDARD (16 modul)
+python3 spade.py https://target.com       # STANDARD (19 modul)
 python3 spade.py https://target.com --quick   # QUICK (7 modul, basic)
-python3 spade.py https://target.com --detailed # DETAILED (23 modul, full)
+python3 spade.py https://target.com --detailed # DETAILED (31 modul, full)
 ```
 
 URL boleh pakai `https://` atau langsung domain:
@@ -27,7 +27,7 @@ python3 spade.py example.com
 |---|---|
 | Tanpa argumen | Mode interaktif — minta target & pilih mode |
 | `--quick` | Mode cepat (7 modul, no crawl) |
-| `--detailed` | Mode lengkap (23 modul, crawl depth 2) |
+| `--detailed` | Mode lengkap (31 modul, crawl depth 2, parameter discovery, JWT, OOB) |
 | `-o file.html` | Output HTML report |
 | `--csv file.csv` | Export hasil ke CSV |
 | `--json file.json` | Export JSON (metadata scan + temuan + bukti request/response, cocok untuk pipeline) |
@@ -36,6 +36,13 @@ python3 spade.py example.com
 | `--no-color` | Output terminal tanpa warna |
 | `--impersonate PROFIL` | Profil browser untuk impersonation (default `chrome`). Contoh: `chrome136`, `safari184`, `firefox147` |
 | `--no-impersonate` | Matikan browser impersonation (fingerprint default curl, untuk debugging) |
+| `--cookie "N=V;M=X"` | Cookie sesi untuk area terautentikasi (boleh diulang). Mengaktifkan modul IDOR, CSRF, JWT forgery, dan cache deception |
+| `-H "Nama: nilai"` | Header tambahan untuk semua request, mis. token API (boleh diulang) |
+| `--bearer TOKEN` | Isi header `Authorization: Bearer …` (bentrok dengan `-H 'Authorization: …'` → exit 2) |
+| `--jwt-secrets FILE` | File daftar secret JWT (satu per baris) untuk crack HMAC offline |
+| `--active-writes` | Izinkan uji yang mengirim data (submit form CSRF dengan token palsu). **Default: mati** |
+| `--check-smuggling` | Aktifkan uji request smuggling CL.TE/TE.CL lewat socket mentah. **Default: mati** |
+| `--oob-host HOST[:PORT]` | Host collector OOB milik tester untuk membuktikan blind SSRF/XXE/CMDi (jalankan `tools/oob_collector.py`) |
 | `--workers N` | Jumlah request paralel (default 10, 1 = sekuensial) |
 | `--crawl-depth N` | Kedalaman crawl mode detailed (default 2) |
 | `--crawl-max N` | Maksimal halaman di-crawl mode detailed (default 30) |
@@ -48,6 +55,13 @@ python3 spade.py https://example.com --csv hasil.csv
 python3 spade.py https://example.com --detailed -o full-report.html --csv full.csv
 python3 spade.py https://example.com --impersonate safari184   # impersonate profil lain
 python3 spade.py https://example.com --json hasil.json --sarif hasil.sarif  # untuk pipeline/CI
+
+# Area terautentikasi (wajib untuk IDOR/CSRF aktif/JWT forgery)
+python3 spade.py https://example.com --detailed --cookie "session=..." -H "X-Api-Key: ..."
+
+# Uji tulis + OOB (hanya di target yang mengizinkan)
+python3 tools/oob_collector.py --host 0.0.0.0 --port 9000 &
+python3 spade.py https://example.com --detailed --active-writes --oob-host 10.0.0.5:9000
 ```
 
 ## Struktur laporan
@@ -62,7 +76,7 @@ repro selalu jadi `COOKIE_ANDA`.
 |---|---|---|
 | HTML | `-o file.html` (default `spade_<host>.html`) | Tabel temuan + blok `<details>` berisi bukti, metadata (confidence/CVSS/CWE/OWASP), dan dua langkah repro |
 | CSV | `--csv file.csv` | 5 kolom lama + `Confidence`, `CVSS_Score`, `CVSS_Vector`, `CWE`, `OWASP`, `Repro_Curl`, `Evidence_Status`, `Evidence_URL` |
-| JSON | `--json file.json` | `tool`, `target`, `scan` (mode, durasi, worker, `errors`, `redacted`), `summary`, dan `findings` lengkap dengan `evidence` + `repro` |
+| JSON | `--json file.json` | `tool`, `target`, `scan` (mode, durasi, worker, `errors`, `redacted`, plus flag audit `auth`/`active_writes`/`check_smuggling`/`oob`), `summary`, dan `findings` lengkap dengan `evidence` + `repro` |
 | SARIF | `--sarif file.sarif` | SARIF 2.1.0: satu rule per kode temuan + `partialFingerprints` supaya temuan tidak dobel di dashboard |
 
 Metadata per temuan: skor + vector CVSS 3.1, CWE, kategori OWASP Top 10, dan
@@ -76,7 +90,7 @@ redaksi, dan skema output ada di
 | Fitur | QUICK | STANDARD | DETAILED |
 |---|---|---|---|
 | Durasi | ~15-30s | ~45-90s | ~1-3mnt (paralel + early-exit) |
-| Modul | 7 | 16 | 23 |
+| Modul | 7 | 19 | 31 |
 | Crawl | ❌ | ❌ | ✅ depth 2 |
 | Security headers | ✅ | ✅ | ✅ |
 | TLS/SSL | ✅ | ✅ | ✅ |
@@ -94,6 +108,16 @@ redaksi, dan skema output ada di
 | GraphQL introspection | ❌ | ❌ | ✅ |
 | JS analysis | ❌ | ❌ | ✅ |
 | JWT analysis | ❌ | ❌ | ✅ |
+| IDOR / BOLA (butuh `--cookie`) | ❌ | ✅ | ✅ |
+| CSRF | ❌ | ✅ | ✅ |
+| Auth bypass (401/403) | ❌ | ✅ | ✅ |
+| Parameter discovery | ❌ | ❌ | ✅ |
+| API spec (OpenAPI/Swagger) | ❌ | ❌ | ✅ |
+| Host header injection / cache poisoning | ❌ | ❌ | ✅ |
+| CRLF injection | ❌ | ❌ | ✅ |
+| Request smuggling (butuh `--check-smuggling`) | ❌ | ❌ | ✅ |
+| Blind SSRF/CMDi (butuh `--oob-host`) | ❌ | ✅ | ✅ |
+| Blind XXE (butuh `--oob-host`) | ❌ | ❌ | ✅ |
 | Subdomain enum | ❌ | ❌ | ✅ |
 
 ## Semua Modul
@@ -111,6 +135,12 @@ redaksi, dan skema output ada di
 - XXE (direct XML endpoint + via form upload)
 - SSTI (Jinja2/Twig/Freemarker/Velocity), NoSQLi
 - GraphQL introspection (GET + POST), JS analysis, JWT analysis
+- IDOR/BOLA (dua sesi: anonim vs `--cookie`), CSRF (pasif + aktif)
+- Auth bypass via header internal & normalisasi path
+- Host header injection, cache poisoning, cache deception
+- CRLF injection/response splitting, request smuggling CL.TE/TE.CL (opt-in)
+- Blind SSRF/XXE/CMDi lewat collector OOB sendiri (opt-in)
+- API spec OpenAPI/Swagger + parameter discovery
 - Subdomain enumeration (CRT.sh + DNS wordlist)
 
 ## Instalasi
@@ -132,10 +162,15 @@ header, `sec-ch-ua*`, dan `User-Agent` menyerupai browser asli dan tidak langsun
 diklasifikasikan sebagai bot. Profil bisa diganti dengan `--impersonate` atau
 dimatikan dengan `--no-impersonate`.
 
+Request smuggling dan payload CRLF dikirim lewat socket mentah justru **karena**
+`curl_cffi` menormalkan `Content-Length`/`Transfer-Encoding`/escape URL, sehingga
+payload desync harus dikirim apa adanya.
+
 Yang belum tersedia: rotasi IP/proxy, delay/jitter, dan pola request manusiawi.
 Daftar lengkapnya ada di [docs/bug-bounty-gaps.md](docs/bug-bounty-gaps.md).
-Detail HTTP layer ada di [docs/http-layer.md](docs/http-layer.md), dan model
-temuan/bukti/laporan ada di [docs/findings-model.md](docs/findings-model.md).
+Detail HTTP layer ada di [docs/http-layer.md](docs/http-layer.md), model
+temuan/bukti/laporan ada di [docs/findings-model.md](docs/findings-model.md), dan
+rincian kelas kerentanan ada di [docs/vuln-classes.md](docs/vuln-classes.md).
 
 ## Development
 
@@ -143,16 +178,31 @@ temuan/bukti/laporan ada di [docs/findings-model.md](docs/findings-model.md).
 pip3 install -r requirements-dev.txt   # pytest + ruff
 python3 -m pytest -q                   # test memakai fixture server lokal (tanpa internet)
 python3 -m ruff check .                # lint (config di pyproject.toml)
+python3 tools/oob_collector.py --help  # collector OOB (stdlib, tanpa dependency)
 ```
+
+Test memakai fixture server lokal di `tests/conftest.py` (tanpa jaringan
+eksternal): 176 test mencakup 31 modul, flag CLI, dan generator laporan.
 
 ## Catatan
 
-- Scan ini non-intrusive. Tapi hanya gunakan di situs sendiri/terotorisasi.
-- Roadmap celah fitur bug bounty (IDOR, OOB, proxy/rate limit, scope, dll) ada
-  di [docs/bug-bounty-gaps.md](docs/bug-bounty-gaps.md). Bagian 1 (kualitas
-  temuan: bukti, repro, CVSS/CWE/OWASP, confidence, JSON/SARIF) sudah selesai;
-  model datanya didokumentasikan di
-  [docs/findings-model.md](docs/findings-model.md).
+- Scan ini non-intrusive **kecuali** tiga uji opt-in: `--active-writes` (kirim
+  POST), `--check-smuggling` (socket mentah), dan `--oob-host` (callback ke
+  collector Anda). Semuanya mati secara default. Hanya gunakan di situs
+  sendiri/terotorisasi.
+- Roadmap celah fitur bug bounty (proxy/rate limit, scope file, multi-target,
+  recon lanjutan) ada di [docs/bug-bounty-gaps.md](docs/bug-bounty-gaps.md).
+  Bagian 1 (kualitas temuan: bukti, repro, CVSS/CWE/OWASP, confidence,
+  JSON/SARIF) dan bagian 2 (cakupan kelas kerentanan: IDOR, CSRF, JWT, auth
+  bypass, API spec, host header/cache, CRLF, smuggling, blind OOB) sudah
+  selesai.
+- Model data temuan ada di [docs/findings-model.md](docs/findings-model.md);
+  rincian tiap kelas kerentanan (apa yang diuji, flag yang dibutuhkan, batas
+  request, penjaga false positive) ada di
+  [docs/vuln-classes.md](docs/vuln-classes.md).
+- Modul yang **butuh sesi autentikasi** (`idor`, `csrf` aktif, JWT forgery,
+  cache deception) dilewati dengan catatan di log kalau `--cookie`/`-H`/
+  `--bearer` tidak diberikan — bukan dilaporkan sebagai bersih.
 - Setiap temuan membawa bukti request/response dan perintah `curl` siap pakai.
   Kredensial disensor otomatis (`***REDACTED***`); jangan pakai `--no-redact`
   kalau hasilnya akan dibagikan.

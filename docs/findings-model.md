@@ -118,7 +118,7 @@ status redaksi.
 ## 3. Metadata temuan
 
 `FindingMeta = namedtuple("FindingMeta", "vector score cwe owasp confidence")`.
-Tabel `FINDING_META` memetakan sekitar 45 kode temuan ke metadata itu, dan
+Tabel `FINDING_META` memetakan 65 kode temuan ke metadata itu, dan
 `META_PREFIX_RULES` menangani keluarga kode dinamis:
 
 | Prefix | Arti | Metadata |
@@ -146,9 +146,35 @@ Fungsi terkait:
   `partialFingerprints` SARIF.
 
 Kode informasional (`TECH`, `ROBOTS`, `JS_APIS`, `JWT_COOKIE`, `JWT_BEARER`,
-`RATE_LIMIT`, `NO_RATE_LIMIT`, `SUBDOMAINS`, `SCAN_ERROR`, dan `HDR_*`) punya
+`RATE_LIMIT`, `NO_RATE_LIMIT`, `SUBDOMAINS`, `SCAN_ERROR`, `PARAM_DISCOVERY`,
+`JWT_KID_SUSPECT`, `JWT_ALG_CONFUSION_SURFACE`, dan `HDR_*`) punya
 `vector = None`, jadi `cvss` bernilai `null` di JSON dan kolom CVSS-nya kosong
 di CSV.
+
+### Confidence eksplisit vs `TENTATIVE_CODES`
+
+`TENTATIVE_CODES` adalah jaring pengaman terakhir untuk kode heuristik yang
+**tidak punya contoh pembuktian langsung**. Sejak cakupan kelas kerentanan
+bertambah (lihat [docs/vuln-classes.md](vuln-classes.md)), banyak temuan baru
+justru punya bukti langsung, jadi confidence-nya dideklarasikan per temuan lewat
+argumen `confidence=` di `FindingList.append(...)`:
+
+- `firm` — ada respons server yang membuktikan perilakunya (token palsu
+  diterima, header ACL dilewati, canary pantul di respons, callback OOB masuk).
+- `tentative` — indikasi kuat tapi masih bisa dijelaskan hal lain (form tanpa
+  token, host dipantulkan di body, token kedaluwarsa diterima di salah satu
+  endpoint).
+
+Confidence yang dideklarasikan tidak menimpa `TENTATIVE_CODES`: kode di daftar
+itu tetap dipaksa `tentative` walau modul mendeklarasikan `firm`.
+
+Kode baru dari ekspansi cakupan: `IDOR_ANON`, `IDOR_READ`, `CSRF_NO_TOKEN`,
+`CSRF_TOKEN_IGNORED`, `AUTH_BYPASS_HEADER`, `AUTH_BYPASS_PATH`,
+`HOST_HEADER_INJECTION`, `CACHE_POISONING`, `CACHE_DECEPTION`,
+`API_SPEC_EXPOSED`, `PARAM_DISCOVERY`, `CRLF_INJECTION`, `REQUEST_SMUGGLING`,
+`SSRF_BLIND`, `XXE_BLIND`, `CMDI_BLIND`, `JWT_WEAK_SECRET`,
+`JWT_KID_TRAVERSAL`, `JWT_ALG_CONFUSION`, `JWT_ALG_CONFUSION_SURFACE`,
+`JWT_EXPIRED_ACCEPTED`, `JWT_NO_EXPIRY`, `JWT_KID_SUSPECT`.
 
 ---
 
@@ -229,7 +255,8 @@ Skor/vector CVSS dikosongkan untuk kode informasional dan kode tanpa mapping.
     "duration_s": 61.2, "impersonate": "chrome", "workers": 10,
     "modules": ["tech", "headers", "..."],
     "errors": [{"module": "xss", "error": "RuntimeError: ..."}],
-    "redacted": true
+    "redacted": true,
+    "auth": false, "active_writes": false, "check_smuggling": false, "oob": false
   },
   "summary": {
     "total": 24,
@@ -260,6 +287,12 @@ Skor/vector CVSS dikosongkan untuk kode informasional dan kode tanpa mapping.
 Potongan respons dipotong ke `EVIDENCE_SNIPPET_CHARS_JSON` karakter
 (`response_truncated: true` bila terpotong). `evidence` bernilai `null` kalau
 temuan tidak punya bukti HTTP.
+
+Empat flag terakhir di `scan` merekam **cakupan uji yang aktif** supaya hasil bisa
+diaudit: `auth` (sesi autentikasi dipakai), `active_writes` (uji tulis dikirim),
+`check_smuggling` (socket mentah dikirim), `oob` (collector OOB aktif). Semuanya
+`false` secara default. Nilainya tidak pernah memuat kredensial — cookie/token
+hanya hidup di memori proses dan di-redaksi di bukti.
 
 ### SARIF 2.1.0 (`--sarif`)
 
