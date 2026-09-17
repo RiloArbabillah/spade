@@ -212,6 +212,26 @@ def test_cli_json_and_sarif_flags(vuln_server, tmp_path):
         assert result["level"] in {"error", "warning", "note"}
         assert result["partialFingerprints"]["findingId"].startswith("spade-")
 
+
+def test_reports_never_leak_response_secrets(vuln_server, tmp_path):
+    """Kredensial di body respons apa pun tidak boleh masuk format laporan mana pun."""
+    html_out = tmp_path / "report.html"
+    csv_out = tmp_path / "report.csv"
+    json_out = tmp_path / "report.json"
+    sarif_out = tmp_path / "report.sarif"
+    assert spade.main([vuln_server.base_url, "--quick", "--no-color",
+                       "-o", str(html_out), "--csv", str(csv_out),
+                       "--json", str(json_out), "--sarif", str(sarif_out)]) == 0
+
+    for report in (html_out, csv_out, json_out, sarif_out):
+        raw = report.read_text(encoding="utf-8")
+        assert "fixture-secret" not in raw, report
+        assert "DB_RESPONSE_SECRET_9876543210" not in raw, report
+        assert "sk_test_RESPONSE_SECRET_0123456789" not in raw, report
+        assert "DB_RESPONSE_SECRET" not in raw, report
+    assert "sk_test_RESPONSE_SECRET" not in raw, report
+
+
 def test_cli_no_redact_flag_disables_redaction(vuln_server, tmp_path, capsys):
     json_out = tmp_path / "plain.json"
     assert spade.main([vuln_server.base_url, "--quick", "--no-color",
@@ -220,3 +240,11 @@ def test_cli_no_redact_flag_disables_redaction(vuln_server, tmp_path, capsys):
     assert "REDACT OFF" in capsys.readouterr().out
     payload = json.loads(json_out.read_text(encoding="utf-8"))
     assert payload["scan"]["redacted"] is False
+
+
+def test_cli_timing_probes_metadata(vuln_server, tmp_path):
+    json_out = tmp_path / "timing.json"
+    assert spade.main([vuln_server.base_url, "--quick", "--no-color", "--timing-probes",
+                       "-o", str(tmp_path / "timing.html"), "--json", str(json_out)]) == 0
+    payload = json.loads(json_out.read_text(encoding="utf-8"))
+    assert payload["scan"]["timing_probes"] is True

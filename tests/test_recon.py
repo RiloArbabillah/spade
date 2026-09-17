@@ -296,7 +296,7 @@ def test_lfi_uses_recon_urls():
     recon_calls = [c for c in session.calls if c[1] == "https://recon.example.com/dl"]
     assert recon_calls
     assert {(call[2] or {}).get("file") for call in recon_calls} == {
-        "../../etc/passwd", "../../etc/hosts"}
+        *spade.LFI_PAYLOADS}
 
 def test_crawler_does_not_inject_recon_params_without_recon():
     """Tanpa recon, modul injection tetap memakai daftar parameter bawaan."""

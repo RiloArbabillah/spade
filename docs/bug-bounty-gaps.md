@@ -4,14 +4,16 @@ Dokumen ini memetakan celah Spade sebagai alat *bug bounty* (bukan sekadar
 scanner pasif), bukti konkret di kode saat ini, dampaknya, dan tool/target
 perbaikan yang realistis.
 
-Status: **bagian 1, 2, dan 3 sudah dikerjakan** — bagian 1 di PR
+Status: **bagian 1, 2, 3, dan 4 sudah dikerjakan** — bagian 1 di PR
 `feat/finding-evidence-metadata` (detail di
 [docs/findings-model.md](findings-model.md)), bagian 2 di PR
 `feat/vuln-class-coverage` (detail per kelas di
 [docs/vuln-classes.md](vuln-classes.md)), bagian 3 di PR `feat/recon-enum`
 (detail di [docs/recon.md](recon.md)). Dari bagian 4, deteksi kredensial
-hardcode di JS sudah diperbaiki di PR `fix/js-secret-detection`. Bagian 5–6 dan
-sisa bagian 4 masih terbuka. PR
+hardcode di JS sudah diperbaiki di PR `fix/js-secret-detection`; sisa bagian 4
+sekarang ditangani di `feat/module-detection-quality`. Integrasi binary
+eksternal (`sqlmap`, `ffuf`, `nuclei`, Playwright) sengaja tidak ditambahkan.
+Bagian 5–6 masih terbuka. PR
 `feat/curl-cffi-http-layer` sebelumnya hanya mengganti HTTP layer ke `curl_cffi`
 + menambah test + membuat dokumen ini.
 
@@ -103,20 +105,21 @@ saja** — sumber pasif diakses lewat API HTTP publik, tanpa binary eksternal
 
 ## 4. Kualitas deteksi modul yang sudah ada
 
-Satu baris di bawah sudah dikerjakan di PR `fix/js-secret-detection`
-(ditumpuk di `feat/recon-enum`); sisanya masih terbuka.
+Semua baris di bawah sudah dikerjakan di `feat/module-detection-quality`
+dengan pendekatan tanpa dependency runtime baru. Rincian orakel ada di
+[docs/detection-quality.md](detection-quality.md).
 
 | Area | Bukti di kode | Dampak | Tool / pendekatan konkret | Prioritas |
 |---|---|---|---|---|
 | Masking kredensial hanya per modul | `mask_secrets_in_text`/`masked_evidence` dipanggil di dalam modul `js` saja | Snippet bukti berisi body HTML (mis. temuan `TECH`/header pada halaman yang memuat kredensial inline) tetap menampilkan nilai mentah di laporan JSON/HTML | Terapkan masking di satu titik (`Exchange.__init__`/serialisasi) dengan pola kredensial yang sama, plus test regresi "tidak ada nilai kredensial di seluruh laporan" | P1 |
 | Kredensial hardcode di JS praktis tidak terdeteksi | `re.findall` pola `apiKey` dengan **dua grup tangkap** → `[s for s, _ in secrets]` selalu `['', '']`; hanya satu pola, hanya satu berkas | API key/token/private key yang tertanam di frontend lolos — padahal ini kelas temuan bounty paling cepat | Pisahkan pola kuat per layanan (AWS, Stripe, GitHub, Slack, Google, SendGrid, private key, JWT) dari kandidat generik; ikut pindai blok `<script>` inline; nilai dimask di laporan → `JS_SECRET` (CRITICAL, `firm`) / `JS_SECRET_MAYBE` (HIGH, `tentative`) | ✅ Selesai |
-| SSRF heuristik kasar | `if "169.254.169.254" in r.text or len(r.content) > 1000:` | FP besar pada respons normal >1 KB; blind SSRF lolos | Bandingkan respons dengan baseline (status + ukuran + waktu), tambah `interactsh` callback | P0 |
-| XSS tanpa konteks/encoding | Cek payload muncul mentah di HTML | FP (dalam komentar/atribut) dan FN (encoding parsial) | Analisis konteks (HTML/attr/JS/URL), uji varian encoding, verifikasi eksekusi via headless browser (Playwright) | P1 |
-| LFI hanya `/etc/passwd` & `/etc/hosts` | `["../../etc/passwd","../../etc/hosts"]` di param terbatas (`file,page,include,path,doc,load`) | FN besar (Windows, wrapper `php://filter`, log poisoning) | Tambah `php://filter/convert.base64-encode`, `C:\Windows\win.ini`, `/proc/self/environ`; integrasi `ffuf` wordlist LFI | P2 |
-| SQLi tanpa eksploitasi lanjut | Error-based + `SLEEP(3)` saja | Banyak DBMS/Varian tidak terdeteksi | Validasi silang dengan `sqlmap` (`--batch --level 2 --risk 1`) hanya saat indikasi ditemukan | P2 |
-| CMDi/XXE hanya in-band | Output dicek di respons | Blind tidak terdeteksi | Payload time-based (`; sleep 5`) + OOB (`interactsh`) | P1 |
-| Baseline SPA scope | `get_baseline_fingerprint` memakai 2 path acak | FP/FN pada SPA dengan route dinamis | Perluas baseline (3-5 path + perbandingan similarity) | P2 |
-| Template/pattern kaku | Semua deteksi berbasis daftar payload hardcoded | Mudah diblokir WAF dan cepat usang | Tambah dukungan template `nuclei` (jalankan `nuclei -t` opsional) | P2 |
+| SSRF heuristik kasar | `if "169.254.169.254" in r.text or len(r.content) > 1000:` | FP besar pada respons normal >1 KB; blind SSRF lolos | Bandingkan respons dengan baseline (status + ukuran + waktu), tambah `interactsh` callback | ✅ Selesai dengan metadata/differential + OOB sendiri |
+| XSS tanpa konteks/encoding | Cek payload muncul mentah di HTML | FP (dalam komentar/atribut) dan FN (encoding parsial) | Analisis konteks (HTML/attr/JS/URL), uji varian encoding, verifikasi eksekusi via headless browser (Playwright) | ✅ Selesai tanpa Playwright |
+| LFI hanya `/etc/passwd` & `/etc/hosts` | `["../../etc/passwd","../../etc/hosts"]` di param terbatas (`file,page,include,path,doc,load`) | FN besar (Windows, wrapper `php://filter`, log poisoning) | Tambah `php://filter/convert.base64-encode`, `C:\Windows\win.ini`, `/proc/self/environ`; integrasi `ffuf` wordlist LFI | ✅ Selesai tanpa ffuf |
+| SQLi tanpa eksploitasi lanjut | Error-based + `SLEEP(3)` saja | Banyak DBMS/Varian tidak terdeteksi | Validasi silang dengan `sqlmap` (`--batch --level 2 --risk 1`) hanya saat indikasi ditemukan | ✅ DBMS + boolean selesai; `sqlmap` tetap opsional |
+| CMDi/XXE hanya in-band | Output dicek di respons | Blind tidak terdeteksi | Payload time-based (`; sleep 5`) + OOB (`interactsh`) | ✅ OOB ada; time-based opt-in |
+| Baseline SPA scope | `get_baseline_fingerprint` memakai 2 path acak | FP/FN pada SPA dengan route dinamis | Perluas baseline (3-5 path + perbandingan similarity) | ✅ Empat probe + similarity |
+| Template/pattern kaku | Semua deteksi berbasis daftar payload hardcoded | Mudah diblokir WAF dan cepat usang | Tambah dukungan template `nuclei` (jalankan `nuclei -t` opsional) | ✅ Katalog internal; `nuclei` tidak dependency |
 
 ## 5. Mesin scan / operasional
 
@@ -174,8 +177,9 @@ Item 1–2 ada di tabel bagian 5 (P0/P1) dan akan dikerjakan di PR terpisah.
 3. **P0 operasional sisanya**: `--delay/--max-rps`, `--proxy/--proxy-file`,
    `--scope-file`, `-l targets.txt`, `--safe-mode`, `--i-have-authorization`
    (bagian 5 & 6).
-4. **P0 akurasi**: perbaiki heuristik SSRF in-band dan perluas cakupan
-   XSS/LFI (bagian 4).
+4. ~~**P0 akurasi**: perbaiki heuristik SSRF in-band dan perluas cakupan
+   XSS/LFI (bagian 4).~~ **Sudah selesai** di `feat/module-detection-quality`;
+   integrasi binary eksternal tetap tidak ditambahkan.
 5. ~~**P1 recon** (bagian 3): enumerasi subdomain, URL historis, endpoint JS,
    host hidup, port scan.~~ **Sudah selesai** di `feat/recon-enum` (detail di
    [docs/recon.md](recon.md)) memakai API publik lewat `curl_cffi` tanpa binary

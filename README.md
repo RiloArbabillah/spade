@@ -43,6 +43,7 @@ python3 spade.py example.com
 | `--bearer TOKEN` | Isi header `Authorization: Bearer …` (bentrok dengan `-H 'Authorization: …'` → exit 2) |
 | `--jwt-secrets FILE` | File daftar secret JWT (satu per baris) untuk crack HMAC offline |
 | `--active-writes` | Izinkan uji yang mengirim data (submit form CSRF dengan token palsu). **Default: mati** |
+| `--timing-probes` | Izinkan probe time-based SQLi/CMDi dengan delay 3 detik. **Default: mati** |
 | `--check-smuggling` | Aktifkan uji request smuggling CL.TE/TE.CL lewat socket mentah. **Default: mati** |
 | `--oob-host HOST[:PORT]` | Host collector OOB milik tester untuk membuktikan blind SSRF/XXE/CMDi (jalankan `tools/oob_collector.py`) |
 | `--workers N` | Jumlah request paralel (default 10, 1 = sekuensial) |
@@ -228,6 +229,8 @@ eksternal): 242 test mencakup 32 modul, flag CLI, recon, dan generator laporan.
   Kredensial disensor otomatis (`***REDACTED***`) dan temuan `JS_SECRET`/
   `JS_SECRET_MAYBE` hanya menampilkan nilai yang sudah dimask (4 karakter awal +
   bintang); jangan pakai `--no-redact` kalau hasilnya akan dibagikan.
+- Orakel deteksi, batas payload, dan penjaga false positive per modul ada di
+  [docs/detection-quality.md](docs/detection-quality.md).
 - Request dijalankan paralel (default 10 worker). Naikkan `--workers` untuk target cepat, turunkan ke `--workers 1` jika target rate-limit/WAF sensitif.
 - Modul deteksi (SQLi, XSS, LFI, CMDi, SSTI, XXE, GraphQL, SSRF, NoSQLi, Open Redirect) berhenti lebih awal begitu temuan pertama ketemu, jadi mode DETAILED tidak selalu mengirim semua payload.
 - Halaman utama dan daftar form di-cache: satu request/parse dipakai ulang lintas modul, bukan diulang per modul.

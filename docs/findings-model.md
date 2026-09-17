@@ -118,7 +118,7 @@ status redaksi.
 ## 3. Metadata temuan
 
 `FindingMeta = namedtuple("FindingMeta", "vector score cwe owasp confidence")`.
-Tabel `FINDING_META` memetakan 71 kode temuan ke metadata itu, dan
+Tabel `FINDING_META` memetakan 76 kode temuan ke metadata itu, dan
 `META_PREFIX_RULES` menangani keluarga kode dinamis:
 
 | Prefix | Arti | Metadata |
@@ -139,7 +139,8 @@ Fungsi terkait:
   informasional (`vector` kosong) supaya laporan tidak menampilkan "skor 0.0".
 - `finding_confidence(code, declared=None)` -> `certain` / `firm` / `tentative`.
   Kode di `TENTATIVE_CODES` (`SSRF`, `SSRF_FORM`, `SSRF_TIMEOUT`,
-  `CORS_REFLECT`, `XSS_STORED`, `ROBOTS`, `SUBDOMAINS`, `NO_RATE_LIMIT`,
+  `SSRF_DIFFERENTIAL`, `CORS_REFLECT`, `XSS_STORED`, `SQLI_BOOLEAN`,
+  `SQLI_TIME`, `CMDI_TIME`, `ROBOTS`, `SUBDOMAINS`, `NO_RATE_LIMIT`,
   `HISTORIC_URLS`, `JS_SECRET_MAYBE`) selalu `tentative`, apa pun kata tabel
   meta.
 - `make_finding_id(code, url, desc)` -> `spade-` + sha256(`code|url|desc`)
@@ -176,14 +177,15 @@ Kode baru dari ekspansi cakupan: `IDOR_ANON`, `IDOR_READ`, `CSRF_NO_TOKEN`,
 `SSRF_BLIND`, `XXE_BLIND`, `CMDI_BLIND`, `JWT_WEAK_SECRET`,
 `JWT_KID_TRAVERSAL`, `JWT_ALG_CONFUSION`, `JWT_ALG_CONFUSION_SURFACE`,
 `JWT_EXPIRED_ACCEPTED`, `JWT_NO_EXPIRY`, `JWT_KID_SUSPECT`, `JS_SECRET`,
-`JS_SECRET_MAYBE`.
+`JS_SECRET_MAYBE`, `SQLI_BOOLEAN`, `SQLI_TIME`, `SSRF_METADATA`,
+`SSRF_DIFFERENTIAL`, `CMDI_TIME`.
 
-Kredensial hardcode di JS punya aturan masking sendiri: `JS_SECRET`/
-`JS_SECRET_MAYBE` **tidak** menaruh nilai asli di deskripsi — nilai diganti
-`mask_secret_value()` (4 karakter pertama + bintang) — dan snippet respons bukti
-dimask lewat `mask_secrets_in_text()`/`masked_evidence()`. Ini berjalan di
-dalam modul `js` (bukan di `Exchange.__init__` global), jadi jalur bukti modul
-lain tidak berubah. `--no-redact` mematikan masking ini juga.
+Kredensial dalam bukti disensor di satu titik. `Exchange.__init__` memanggil
+`mask_secrets_in_text()` untuk body respons, sedangkan header, body request,
+dan URL redaksinya memakai helper redaksi yang sudah ada. Nilai kredensial
+diganti `mask_secret_value()` (4 karakter pertama + bintang).
+`masked_evidence()` tetap tersedia untuk pemanggil lama. `--no-redact`
+mematikan masking ini juga.
 
 ---
 
