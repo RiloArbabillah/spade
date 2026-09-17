@@ -81,9 +81,11 @@ Banner scan menampilkan profil yang dipakai, mis. `Bot   : chrome` atau
 
 ## Verifikasi
 
-- 60 test (`tests/`) lulus, memakai fixture HTTP server lokal — tanpa koneksi
-  internet. Mencakup header impersonation, retry status + `Retry-After`,
-  timeout default, cookie, validasi `--impersonate`, serta regresi 23 modul.
+- 60 test (`tests/`) lulus saat PR itu dibuat, memakai fixture HTTP server lokal
+  — tanpa koneksi internet. Mencakup header impersonation, retry status +
+  `Retry-After`, timeout default, cookie, validasi `--impersonate`, serta regresi
+  23 modul. (Suite saat ini 176 test / 31 modul; lihat
+  [vuln-classes.md](vuln-classes.md).)
 - Perbandingan hasil modul lama (`requests`) vs baru (`curl_cffi`) terhadap
   fixture yang sama: identik kecuali tiga perubahan perilaku di atas.
 - Smoke scan ke target eksternal **belum** diverifikasi di PR ini.
