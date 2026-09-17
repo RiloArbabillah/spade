@@ -372,6 +372,7 @@ def test_new_codes_have_finding_meta():
                  "RECON_SOURCE_SKIPPED", "SUBDOMAINS",
                  "JWT_WEAK_SECRET", "JWT_KID_TRAVERSAL", "JWT_ALG_CONFUSION",
                  "JWT_ALG_CONFUSION_SURFACE", "JWT_EXPIRED_ACCEPTED", "JWT_NO_EXPIRY",
-                 "JWT_KID_SUSPECT", "JWT_COOKIE", "JWT_BEARER", "JWT_ALG_NONE"):
+                 "JWT_KID_SUSPECT", "JWT_COOKIE", "JWT_BEARER", "JWT_ALG_NONE",
+                 "JS_SECRET", "JS_SECRET_MAYBE"):
         assert code in spade.FINDING_META, f"{code} belum terdaftar di FINDING_META"
         assert spade.finding_confidence(code) in ("certain", "firm", "tentative")
