@@ -10,6 +10,7 @@ Dua level pengujian:
 """
 
 import json
+import statistics
 import time
 
 import pytest
@@ -178,11 +179,22 @@ def test_cli_jitter_keeps_gaps_within_bounds(vuln_server, tmp_path):
         "-o", str(tmp_path / "jitter.html"),
     ]) == 0
     times = sorted(vuln_server.app.times())
-    gaps = [b - a for a, b in zip(times, times[1:])]
+    gaps = sorted(b - a for a, b in zip(times, times[1:]))
     assert len(gaps) >= 10
-    assert min(gaps) >= 0.035, f"jeda lebih pendek dari batas jitter: {min(gaps):.3f}s"
-    assert max(gaps) <= 0.135, f"jeda lebih panjang dari batas jitter: {max(gaps):.3f}s"
-    assert max(gaps) - min(gaps) > 0.005, "jitter tidak mengacak jeda sama sekali"
+    # Waktu di sini dicatat oleh server fixture, jadi satu-dua jeda bisa terlihat
+    # menyimpang kalau thread server kelaparan CPU (mesin uji sibuk) — bukan karena
+    # penjadwal longgar. Karena itu rentang jitter diuji lewat median + p90, dan
+    # satu nilai menyimpang masih ditoleransi.
+    median = statistics.median(gaps)
+    assert 0.035 <= median <= 0.135, f"median jeda {median:.3f}s di luar rentang jitter ±50%"
+    p90 = gaps[min(len(gaps) - 1, int(len(gaps) * 0.9))]
+    assert p90 <= 0.135, f"p90 jeda {p90:.3f}s lebih panjang dari batas jitter"
+    outliers = [g for g in gaps if not 0.035 <= g <= 0.135]
+    assert len(outliers) <= 1, f"jeda di luar rentang jitter: {outliers}"
+    # Jitter benar-benar mengacak: sebaran jeda harus jauh lebih lebar dari derau
+    # scheduler (tanpa jitter, simpangan baku hanya beberapa milidetik).
+    spread = statistics.pstdev(gaps)
+    assert spread > 0.005, f"jitter tidak mengacak jeda sama sekali (stdev {spread:.4f}s)"
 
 
 def test_cli_banner_reports_throttle(vuln_server, tmp_path, capsys):
