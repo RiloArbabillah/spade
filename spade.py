@@ -18,12 +18,14 @@ import hashlib
 import hmac
 import html as htmlmod
 import json
+import os
 import random
 import re
 import secrets
 import socket
 import ssl
 import sys
+import tempfile
 import threading
 import time
 import typing
@@ -837,7 +839,7 @@ def _retry_after_seconds(value):
 
 
 def make_session(timeout=15, verify_ssl=True, impersonate=_DEFAULT, extra_headers=None,
-                 trust_env=None):
+                 trust_env=None, cert=None):
     """Buat satu curl_cffi Session dengan browser impersonation.
 
     User-Agent, sec-ch-ua, sec-fetch-*, dan Accept-Language tidak diset manual:
@@ -859,6 +861,11 @@ def make_session(timeout=15, verify_ssl=True, impersonate=_DEFAULT, extra_header
     (http_proxy/https_proxy); dipakai saat rotasi proxy aktif supaya request tidak
     tercampur proxy sistem. `None` (default) berarti perilaku lama dibiarkan apa
     adanya.
+
+    `cert` adalah client certificate untuk target mTLS (`--cert`/`--key`): satu
+    path PEM, atau tuple `(cert, key)`. Nilainya diteruskan apa adanya ke curl_cffi
+    (`CURLOPT_SSLCERT`/`CURLOPT_SSLKEY`), jadi isi berkas tidak pernah dibaca atau
+    dicatat oleh spade.
     """
     profile = DEFAULT_IMPERSONATE if impersonate is _DEFAULT else impersonate
     kwargs = {"timeout": timeout, "verify": verify_ssl, "retry": TRANSPORT_RETRIES}
@@ -866,6 +873,8 @@ def make_session(timeout=15, verify_ssl=True, impersonate=_DEFAULT, extra_header
         kwargs["impersonate"] = profile
     if trust_env is not None:
         kwargs["trust_env"] = trust_env
+    if cert:
+        kwargs["cert"] = cert
     session = CurlSession(**kwargs)
     if extra_headers:
         session.headers.update(extra_headers)
@@ -1535,14 +1544,18 @@ class ThreadLocalSession:
     Rotasi proxy (`--proxy`/`--proxy-file`) juga menempel di funnel ini: setiap
     request meminta proxy berikutnya dari `ProxyPool`, dan proxy yang membalas
     403/429/503 langsung diistirahatkan supaya request berikutnya pindah IP.
+
+    Client certificate (`--cert`/`--key`) diteruskan ke setiap Session thread,
+    jadi target mTLS bisa diuji tanpa mengubah call site modul.
     """
 
     def __init__(self, timeout=15, verify_ssl=True, impersonate=_DEFAULT, retries=None,
-                 extra_headers=None, auth_host=""):
+                 extra_headers=None, auth_host="", client_cert=None):
         self._local = threading.local()
         self.timeout = timeout
         self.verify_ssl = verify_ssl
         self.impersonate = impersonate
+        self.client_cert = client_cert
         self.retries = STATUS_RETRIES if retries is None else max(0, retries)
         # Host yang boleh menerima cookie auth (host target). Kosong = kunci ke
         # host pertama yang di-request, supaya cookie tetap tidak ikut ke host lain.
@@ -1570,7 +1583,8 @@ class ThreadLocalSession:
             sess = make_session(timeout=self.timeout, verify_ssl=self.verify_ssl,
                                 impersonate=self.impersonate,
                                 extra_headers=self.extra_headers,
-                                trust_env=False if proxy_rotation_enabled() else None)
+                                trust_env=False if proxy_rotation_enabled() else None,
+                                cert=self.client_cert)
             self._local.sess = sess
             self._local.cookie_hosts = set()
         host = urllib.parse.urlparse(url).hostname or ""
@@ -5177,6 +5191,159 @@ def scan_oob_cmdi(sess, base_url, ctx=None):
                   url), evidence_url=url, confidence="firm")
     return f
 
+# ══════════════════════════════════════════════════════════════════
+# STATE / RESUME — checkpoint scan (`--state` / `--resume`)
+# ══════════════════════════════════════════════════════════════════
+#
+# Scan panjang (mode DETAILED dengan recon + port scan) bisa berhenti di tengah
+# jalan: timeout jaringan, target tiba-tiba memblokir, atau tester menutup
+# terminal. Tanpa checkpoint, semuanya harus diulang dari nol — dan mengulang
+# berarti mengirim ulang ribuan request ke target yang sama.
+#
+# `--state FILE` menulis satu berkas JSON kecil setiap satu modul selesai
+# (tulis atomik: berkas sementara + `os.replace`, jadi berkas tidak pernah
+# setengah tertulis), lalu `--resume FILE` melanjutkan dari modul yang belum
+# selesai. Temuan beserta buktinya ikut disimpan supaya laporan hasil resume
+# tidak kehilangan temuan modul sebelumnya.
+
+STATE_SCHEMA_VERSION = 1
+# Kunci konfigurasi yang menentukan cakupan uji. Berbeda di sini berarti hasil
+# lama tidak bisa digabung dengan hasil baru (mis. mode atau flag destruktif
+# berubah), jadi `--resume` menolak dengan exit 2.
+STATE_FINGERPRINT_KEYS = ("target", "mode", "impersonate", "modules", "auth",
+                          "safe_mode", "active_writes", "timing_probes",
+                          "check_smuggling", "port_scan", "oob")
+
+def scan_config_fingerprint(config):
+    """Hash kanonik dari konfigurasi yang menentukan cakupan uji."""
+    canonical = json.dumps({key: (config or {}).get(key) for key in STATE_FINGERPRINT_KEYS},
+                           sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+def scan_state_config(target, mode, args, modules, auth_enabled, oob_host):
+    """Ringkasan konfigurasi scan yang disimpan di file state (tanpa rahasia)."""
+    return {
+        "target": target,
+        "mode": mode,
+        "impersonate": args.impersonate or "",
+        "modules": list(modules),
+        "auth": bool(auth_enabled),
+        "safe_mode": bool(args.safe_mode),
+        "active_writes": bool(args.active_writes),
+        "timing_probes": bool(args.timing_probes),
+        "check_smuggling": bool(args.check_smuggling),
+        "port_scan": bool(args.port_scan),
+        "oob": bool(oob_host),
+    }
+
+def state_fingerprint_mismatch(config, saved):
+    """Daftar kunci konfigurasi yang berbeda dari file state (kosong = cocok)."""
+    saved = saved or {}
+    return [key for key in STATE_FINGERPRINT_KEYS if (config or {}).get(key) != saved.get(key)]
+
+def scan_state_payload(config, target, modules, modules_done, finds, errors,
+                       started_at, finished_at=None):
+    """Susun isi file state: konfigurasi, progres modul, dan temuan + bukti."""
+    done = list(modules_done)
+    return {
+        "tool": {"name": "spade", "version": SPADE_VERSION},
+        "schema_version": STATE_SCHEMA_VERSION,
+        "target": target,
+        "started_at": started_at,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "finished_at": finished_at,
+        "config": config,
+        "fingerprint": scan_config_fingerprint(config),
+        "modules_planned": list(modules),
+        "modules_done": done,
+        "modules_pending": [key for key in modules if key not in set(done)],
+        # Temuan disimpan dengan bentuk yang sama seperti laporan JSON, termasuk
+        # bukti request/response yang sudah diredaksi.
+        "findings": [finding.to_dict() for finding in _normalize_findings(finds)],
+        "errors": list(errors or []),
+    }
+
+def write_scan_state(path, payload):
+    """Tulis checkpoint secara atomik; `ValueError` kalau berkas tidak bisa ditulis.
+
+    Tulis ke berkas sementara di direktori yang sama, `fsync`, lalu `os.replace`,
+    sehingga proses yang mati di tengah penulisan tidak meninggalkan state rusak.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    try:
+        handle_fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".spade-state-",
+                                               suffix=".tmp")
+    except OSError as exc:
+        raise ValueError(f"tidak bisa menulis state '{path}': {exc.strerror or exc}") from exc
+    try:
+        with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise ValueError(f"tidak bisa menulis state '{path}': {exc.strerror or exc}") from exc
+    return path
+
+def load_scan_state(path):
+    """Baca + validasi file state `--resume`; `ValueError` kalau tidak layak dipakai."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except OSError as exc:
+        raise ValueError(f"tidak bisa membaca --resume '{path}': {exc.strerror or exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--resume '{path}' bukan JSON yang valid: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"--resume '{path}' tidak berisi objek state")
+    version = data.get("schema_version")
+    if version != STATE_SCHEMA_VERSION:
+        raise ValueError(f"--resume '{path}' memakai schema_version {version!r}, "
+                         f"yang didukung hanya {STATE_SCHEMA_VERSION}")
+    if not isinstance(data.get("config"), dict):
+        raise ValueError(f"--resume '{path}' tidak memuat konfigurasi scan")
+    return data
+
+def finding_from_state(data):
+    """Bangun ulang `Finding` (+ bukti) dari entri file state; None kalau tidak layak."""
+    if not isinstance(data, dict) or not data.get("code"):
+        return None
+    evidence = None
+    raw = data.get("evidence")
+    if isinstance(raw, dict):
+        evidence = Exchange(
+            raw.get("method"), raw.get("url"), raw.get("status"),
+            request_headers=raw.get("request_headers"),
+            request_body=raw.get("request_body"),
+            response_headers=raw.get("response_headers"),
+            response_snippet=raw.get("response_snippet") or "",
+            response_length=raw.get("response_length") or 0,
+            content_type=raw.get("content_type") or "",
+            elapsed_ms=raw.get("elapsed_ms") or 0.0,
+            timestamp=raw.get("timestamp"),
+        )
+    return Finding(data.get("severity") or "INFO", data["code"],
+                   data.get("description") or "", data.get("url"),
+                   evidence=evidence, confidence=data.get("confidence"))
+
+def findings_from_state(data):
+    """Daftar temuan dari file state (entri rusak dilewati, bukan menggagalkan resume)."""
+    restored = []
+    for entry in (data or {}).get("findings") or []:
+        finding = finding_from_state(entry)
+        if finding is not None:
+            restored.append(finding)
+    return restored
+
+RESUME_CTX_NOTE = ("Data ctx dari modul yang dilewati tidak dipulihkan: URL recon, "
+                   "teks JS, dan daftar parameter dihitung ulang dari awal, jadi modul "
+                   "yang belum selesai bisa berjalan dengan seed lebih sedikit.")
+
 # ── report ──
 SEV_ORDER = {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"INFO":4}
 
@@ -5397,6 +5564,12 @@ def gen_json(finds, target, out, scan=None):
             "timing_probes": bool(scan.get("timing_probes")),
             "check_smuggling": bool(scan.get("check_smuggling")),
             "oob": bool(scan.get("oob")),
+            # Checkpoint/resume: hanya status + jumlah, path berkas tidak ikut
+            # supaya laporan tetap portabel.
+            "state": scan.get("state") or {"enabled": False, "written": False},
+            "resume": scan.get("resume") or {"enabled": False, "modules_skipped": [],
+                                             "findings_restored": 0},
+            "client_cert": scan.get("client_cert") or {"enabled": False, "key": False},
         },
         "summary": scan_summary(finds),
         "findings": [f.to_dict(EVIDENCE_SNIPPET_CHARS_JSON, None, impersonate) for f in finds],
@@ -5545,7 +5718,10 @@ def main(argv=None):
   python3 spade.py example.com --max-rps 5 --safe-mode   # batas laju + tanpa uji destruktif
   python3 spade.py example.com --session sesi.json       # impor cookie/header dari file JSON
   python3 spade.py example.com --proxy http://127.0.0.1:8080   # lewat satu proxy
-  python3 spade.py example.com --proxy-file proxy.txt    # rotasi IP round-robin dari file""")
+  python3 spade.py example.com --proxy-file proxy.txt    # rotasi IP round-robin dari file
+  python3 spade.py example.com --detailed --state state.json   # checkpoint tiap modul selesai
+  python3 spade.py example.com --detailed --resume state.json  # lanjutkan scan yang terputus
+  python3 spade.py example.com --cert klien.pem --key klien.key # target mTLS""")
     parser.add_argument("target", nargs="?", default="", help="Target URL (opsional — akan diminta interaktif jika kosong)")
     parser.add_argument("-o","--output", default="", help="Laporan HTML")
     parser.add_argument("--csv", default="", help="Export CSV")
@@ -5602,6 +5778,14 @@ def main(argv=None):
                         help="Konfirmasi non-interaktif bahwa kamu punya izin tertulis untuk uji destruktif (--active-writes/--timing-probes/--check-smuggling)")
     parser.add_argument("--session", default="", metavar="FILE",
                         help="Impor sesi dari file JSON (objek nama→nilai, daftar {name,value}, atau {cookies,headers}). Nilainya tidak pernah ditulis ke laporan")
+    parser.add_argument("--state", default="", metavar="FILE",
+                        help="Tulis checkpoint (JSON, tulis atomik) setiap satu modul selesai supaya scan panjang bisa dilanjutkan")
+    parser.add_argument("--resume", default="", metavar="FILE",
+                        help="Lanjutkan scan dari checkpoint --state: modul yang sudah selesai dilewati, temuan lama dimuat ulang. Konfigurasi berbeda → exit 2")
+    parser.add_argument("--cert", default="", metavar="FILE",
+                        help="Client certificate (PEM) untuk target mTLS, diteruskan ke curl_cffi sebagai cert=")
+    parser.add_argument("--key", default="", metavar="FILE",
+                        help="Private key (PEM) pasangan --cert. Diberikan tanpa --cert → exit 2")
     parser.add_argument("--crawl-depth", type=int, default=2, help="Kedalaman crawl mode detailed (default: 2)")
     parser.add_argument("--crawl-max", type=int, default=30, help="Maksimal halaman di-crawl mode detailed (default: 30)")
     parser.add_argument("--port-scan", action="store_true",
@@ -5645,6 +5829,26 @@ def main(argv=None):
             proxy_urls = load_proxy_file(args.proxy_file)
         except ValueError as exc:
             parser.error(str(exc))
+    # ── Validasi checkpoint/resume (--state/--resume) ──
+    state_path = args.state or ""
+    resume_data = None
+    if args.resume:
+        try:
+            resume_data = load_scan_state(args.resume)
+        except ValueError as exc:
+            parser.error(str(exc))
+        # Tanpa --state eksplisit, berkas yang di-resume ikut diperbarui supaya
+        # scan lanjutan tetap punya checkpoint (dan bisa di-resume lagi).
+        state_path = state_path or args.resume
+    # ── Validasi client certificate (--cert/--key) ──
+    if args.key and not args.cert:
+        parser.error("--key butuh --cert: private key tanpa client certificate tidak bisa dipakai")
+    for flag, path in (("--cert", args.cert), ("--key", args.key)):
+        if path and not os.path.isfile(path):
+            parser.error(f"{flag}: berkas '{path}' tidak ditemukan")
+    client_cert = None
+    if args.cert:
+        client_cert = (args.cert, args.key) if args.key else args.cert
     # ── Safe-mode & gerbang otorisasi uji destruktif ──
     destructive = [label for label, attr, _why in DESTRUCTIVE_FLAGS if getattr(args, attr)]
     if args.safe_mode:
@@ -5754,6 +5958,26 @@ def main(argv=None):
     mode = "quick" if args.quick else ("detailed" if args.detailed
                                       else ("recon" if args.recon_only else "standard"))
     verify_ssl = not args.skip_ssl
+    # ── Rencana modul ditentukan lebih awal supaya fingerprint `--resume` bisa
+    # divalidasi sebelum satu request pun dikirim ke target. ──
+    if mode == "quick":
+        planned_modules = list(QUICK_MODULES)
+    elif mode == "detailed":
+        planned_modules = list(ALL_MODULES.keys())
+    elif mode == "recon":
+        planned_modules = ["recon"]
+    else:
+        planned_modules = list(STANDARD_MODULES)
+    if args.no_recon:
+        planned_modules = [key for key in planned_modules if key != "recon"]
+    state_config = scan_state_config(target, mode, args, planned_modules, auth_enabled, oob_host)
+    if resume_data is not None:
+        # Checkpoint hanya boleh dilanjutkan kalau cakupan uji masih sama: mode,
+        # target, daftar modul, dan flag destruktif ikut menentukan arti temuan.
+        beda = state_fingerprint_mismatch(state_config, resume_data.get("config"))
+        if beda:
+            parser.error("--resume: konfigurasi berbeda dari checkpoint (" + ", ".join(beda)
+                         + ") — jalankan scan baru atau pakai checkpoint dengan konfigurasi yang sama")
     set_request_executor(args.workers)
     # Penjadwal request dipasang sebelum session dibuat supaya request pertama
     # (WAF detection / halaman utama) sudah ikut dibatasi.
@@ -5786,6 +6010,14 @@ def main(argv=None):
             warn("Request smuggling dilewati: payload desync lewat socket mentah tidak bisa dikirim via proxy.")
         if args.port_scan:
             warn("Port scan tetap koneksi langsung ke target (TCP connect tidak lewat proxy).")
+    if client_cert:
+        info(f"mTLS  : client certificate {args.cert}" + (f" + key {args.key}" if args.key else ""))
+        if args.skip_ssl:
+            warn("mTLS dipakai bersama --skip-ssl: server tidak diverifikasi, hanya client yang diautentikasi.")
+    if state_path:
+        info(f"State : checkpoint {state_path} (ditulis atomik setiap modul selesai)")
+    if resume_data is not None:
+        info(f"Resume: melanjutkan {args.resume} — modul yang sudah selesai tidak diulang")
     if args.safe_mode:
         warn("SAFE MODE — PUT/DELETE, uji tulis, probe timing, dan smuggling tidak dikirim.")
     if args.i_have_authorization:
@@ -5810,11 +6042,13 @@ def main(argv=None):
     print()
 
     sess = ThreadLocalSession(timeout=15, verify_ssl=verify_ssl, impersonate=args.impersonate,
-                              extra_headers=extra_headers, auth_host=auth_host)
+                              extra_headers=extra_headers, auth_host=auth_host,
+                              client_cert=client_cert)
     # Sesi anonim (tanpa kredensial) untuk pembanding: IDOR, auth bypass, cache deception,
     # dan orakel token JWT butuh tahu respons apa yang diterima pengunjung tanpa login.
     anon_sess = ThreadLocalSession(timeout=15, verify_ssl=verify_ssl,
-                                   impersonate=args.impersonate) if auth_enabled else None
+                                   impersonate=args.impersonate,
+                                   client_cert=client_cert) if auth_enabled else None
     # Bukti (request/response) hanya boleh berasal dari scan yang sedang berjalan.
     reset_evidence()
     set_evidence_base_url(target)
@@ -5837,6 +6071,11 @@ def main(argv=None):
         "timing_probes": bool(args.timing_probes),
         "check_smuggling": bool(args.check_smuggling),
         "oob": bool(oob_host),
+        # Checkpoint/resume + client certificate: status saja, tanpa path berkas.
+        "state": {"enabled": bool(state_path), "written": False},
+        "resume": {"enabled": False, "modules_skipped": [], "findings_restored": 0,
+                   "ctx_note": ""},
+        "client_cert": {"enabled": bool(args.cert), "key": bool(args.key)},
         "recon": {"enabled": False, "sources": {}, "counts": {}, "errors": []},
         "port_scan": bool(args.port_scan),
         "recon_only": bool(args.recon_only),
@@ -5881,13 +6120,10 @@ def main(argv=None):
         scan["recon"] = {"enabled": True, "sources": recon_data.get("sources") or {},
                          "counts": dict(counts), "errors": recon_data.get("errors") or []}
 
+    modules = planned_modules
     if mode == "quick":
-        modules = list(QUICK_MODULES)
         crawler = None
     elif mode in ("detailed", "recon"):
-        modules = list(ALL_MODULES.keys()) if mode == "detailed" else ["recon"]
-        if args.no_recon:
-            modules = [k for k in modules if k != "recon"]
         info("Merayapi halaman (depth 2)...")
         crawler = Crawler(sess, target, depth=args.crawl_depth, max_p=args.crawl_max,
                           extra_seeds=recon_seed_urls(ctx))
@@ -5895,7 +6131,6 @@ def main(argv=None):
         info(f"Merayapi {len(crawler.pages)} halaman")
         print()
     else:
-        modules = list(STANDARD_MODULES)
         crawler = None
     ctx["crawler"] = crawler
     if recon_on:
@@ -5905,11 +6140,48 @@ def main(argv=None):
         ctx["recon_js_endpoints"] = list(recon_js_data.get("endpoints") or [])
         scan["recon"]["counts"]["js_endpoints"] = len(ctx["recon_js_endpoints"])
 
-    info(f"Menjalankan {len(modules)} modul...")
-    for key in modules:
+    scan["modules"] = list(modules)
+    # ── Resume: temuan lama dimuat ulang, modul yang sudah selesai dilewati ──
+    state_done = set()
+    state_error = ""
+    state_written = False
+    if resume_data is not None:
+        state_done = {key for key in (resume_data.get("modules_done") or []) if key in modules}
+        restored = findings_from_state(resume_data)
+        if restored:
+            finds.extend(restored)
+        skipped = [key for key in modules if key in state_done]
+        scan["errors"].extend(resume_data.get("errors") or [])
+        scan["resume"] = {"enabled": True, "modules_skipped": skipped,
+                          "findings_restored": len(restored), "ctx_note": RESUME_CTX_NOTE}
+        info(f"Resume: {len(skipped)} modul dilewati, {len(restored)} temuan lama dimuat ulang")
+        warn(RESUME_CTX_NOTE)
+    pending = [key for key in modules if key not in state_done]
+
+    def _checkpoint(finished_at=None):
+        """Simpan progres ke `--state`; kegagalan tulis tidak menghentikan scan."""
+        nonlocal state_error, state_written
+        if not state_path or state_error:
+            return
+        payload = scan_state_payload(state_config, target, modules,
+                                     [key for key in modules if key in state_done],
+                                     finds, scan["errors"], scan["started_at"],
+                                     finished_at=finished_at)
+        try:
+            write_scan_state(state_path, payload)
+            state_written = True
+        except ValueError as exc:
+            state_error = str(exc)
+            warn(f"{exc} — checkpoint dimatikan, scan tetap dilanjutkan")
+
+    # Checkpoint awal ditulis sebelum modul pertama supaya scan yang mati di
+    # tengah modul pertama tetap punya rencana modul + konfigurasi yang bisa
+    # dibandingkan saat `--resume`.
+    _checkpoint()
+    info(f"Menjalankan {len(pending)} modul...")
+    for key in pending:
         name, func = ALL_MODULES[key]
         print(f"\n  {c('bold',c('magenta','---'))} {c('bold',name)}")
-        scan["modules"].append(key)
         try:
             res = func(sess, target, ctx)
             if res: finds.extend(res)
@@ -5922,11 +6194,17 @@ def main(argv=None):
             # Bukti HTTP tidak relevan untuk kegagalan modul, jadi tempel bukti
             # dimatikan supaya laporan tidak menyesatkan.
             finds.append(("INFO", "SCAN_ERROR", detail, target), evidence_url=None)
+        # Modul selesai (berhasil maupun gagal) -> checkpoint: resume berikutnya
+        # tidak mengulang request modul ini.
+        state_done.add(key)
+        _checkpoint()
 
     end = datetime.now()
     dur = (end-start).total_seconds()
     scan["finished_at"] = end.isoformat(timespec="seconds")
     scan["duration_s"] = round(dur, 2)
+    _checkpoint(finished_at=scan["finished_at"])
+    scan["state"]["written"] = state_written
     print(f"\n  {c('bold',c('magenta','+==============================+'))}")
     print()
     info(f"Selesai dalam {dur:.1f}s")

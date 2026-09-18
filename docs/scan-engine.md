@@ -1,9 +1,11 @@
-# Mesin Scan / Operasional — Throttle, Safe-Mode, Impor Sesi, Rotasi Proxy
+# Mesin Scan / Operasional — Throttle, Safe-Mode, Impor Sesi, Rotasi Proxy, Resume, mTLS
 
-Dokumen ini menjelaskan empat kontrol operasional yang menempel di **satu funnel
-request** (`ThreadLocalSession.request()` + `raw_http_probe()`): penjadwal laju
-request, safe-mode beserta gerbang otorisasi, impor sesi dari file JSON, dan
-rotasi proxy keluar.
+Dokumen ini menjelaskan enam kontrol operasional: penjadwal laju request,
+safe-mode beserta gerbang otorisasi, impor sesi dari file JSON, rotasi proxy
+keluar, checkpoint/resume scan, dan client certificate untuk target mTLS.
+Empat yang pertama menempel di **satu funnel request**
+(`ThreadLocalSession.request()` + `raw_http_probe()`); resume dan mTLS bekerja
+di lapisan orkestrasi `main()` dan pembuatan `Session`.
 
 Semua kontrol dijalankan **sebelum request pertama dikirim**. Pelanggaran
 kombinasi flag berhenti dengan exit code `2` tanpa menyentuh target.
@@ -223,13 +225,146 @@ password proxy tidak muncul di stdout, HTML, maupun JSON.
 - `proxy_rotation_enabled()` / `next_request_proxy()` / `mark_proxy_blocked(url)`
   — no-op saat rotasi tidak aktif.
 
+## 5. Checkpoint & resume (`--state`, `--resume`)
+
+| Flag | Default | Efek |
+|---|---|---|
+| `--state FILE` | – | Tulis checkpoint JSON secara atomik setiap satu modul selesai. |
+| `--resume FILE` | – | Lanjutkan scan dari checkpoint: modul yang sudah selesai dilewati, temuan lama dimuat ulang. Konfigurasi berbeda → exit 2. |
+
+Scan mode `detailed` bisa berjalan puluhan menit. Kalau jaringan putus, target
+mendadak memblokir, atau terminal ditutup, scan tanpa checkpoint harus diulang
+dari nol — dan mengulang berarti mengirim ulang ribuan request ke target yang
+sama. `--state` menyimpan progres, `--resume` melanjutkannya.
+
+### Isi berkas state
+
+Satu berkas JSON kecil (bukan dump memori) yang memuat:
+
+```json
+{
+  "tool": {"name": "spade", "version": "3.1"},
+  "schema_version": 1,
+  "target": "https://contoh.test",
+  "started_at": "2026-01-01T10:00:00",
+  "updated_at": "2026-01-01T10:04:11",
+  "finished_at": null,
+  "config": {"target": "...", "mode": "detailed", "modules": ["tech", "..."], "safe_mode": false, "...": "..."},
+  "fingerprint": "9f2c…",
+  "modules_planned": ["tech", "headers", "..."],
+  "modules_done": ["tech", "headers"],
+  "modules_pending": ["robots", "..."],
+  "findings": [{"id": "...", "code": "XSS", "evidence": {"...": "..."}}],
+  "errors": []
+}
+```
+
+Temuan disimpan dengan bentuk yang sama seperti laporan JSON, **termasuk bukti
+request/response yang sudah diredaksi** — jadi laporan hasil resume tidak
+kehilangan temuan modul sebelumnya. Berkas state tidak memuat kredensial,
+cookie sesi, atau path berkas lokal.
+
+### Tulis atomik
+
+`write_scan_state()` menulis ke berkas sementara di direktori yang sama,
+`fsync`, lalu `os.replace()`. Proses yang mati di tengah penulisan tidak
+meninggalkan state setengah jadi. Kalau checkpoint gagal ditulis (mis. direktori
+tidak bisa ditulis), scan **tetap lanjut** dengan peringatan dan checkpoint
+dimatikan untuk sisa run — kehilangan progres lebih ringan daripada kehilangan
+hasil scan.
+
+### Fingerprint: kenapa resume bisa ditolak
+
+`--resume` hanya menerima checkpoint dengan cakupan uji yang sama. Sebelas kunci
+konfigurasi (`STATE_FINGERPRINT_KEYS`) di-hash jadi `fingerprint`; kalau ada yang
+berbeda, scan berhenti dengan exit code `2` **sebelum satu request pun dikirim**:
+
+```
+spade.py: error: --resume: konfigurasi berbeda dari checkpoint (mode, modules) — jalankan scan baru atau pakai checkpoint dengan konfigurasi yang sama
+```
+
+Yang ikut di-fingerprint: `target`, `mode`, `impersonate`, `modules`, `auth`,
+`safe_mode`, `active_writes`, `timing_probes`, `check_smuggling`, `port_scan`,
+dan `oob`. Alasannya: mengubah salah satunya mengubah arti temuan, jadi
+menggabungkan hasil lama dengan hasil baru akan menyesatkan triager.
+
+### Batas resume: ctx tidak dipulihkan
+
+Modul yang dilewati tidak mengembalikan *ctx* yang dihitung di memori (URL hasil
+recon, endpoint dari berkas JS, daftar parameter). Modul yang belum selesai
+berjalan dengan seed yang dihitung ulang dari awal, sehingga bisa lebih sedikit
+daripada scan penuh. Keterbatasan ini dicatat di log (`RESUME_CTX_NOTE`) dan di
+laporan (`scan.resume.ctx_note`) supaya cakupan hasil resume tidak
+ditafsirkan berlebihan.
+
+### Metadata laporan
+
+```json
+"state":  {"enabled": true, "written": true},
+"resume": {"enabled": true, "modules_skipped": ["tech", "headers"],
+           "findings_restored": 3, "ctx_note": "Data ctx dari modul yang dilewati …"}
+```
+
+Path berkas state tidak ditulis ke laporan supaya laporan tetap portabel.
+
+### API publik
+
+- `scan_config_fingerprint(config)` / `state_fingerprint_mismatch(config, saved)`
+  — hash cakupan uji dan daftar kunci yang berbeda.
+- `scan_state_config(target, mode, args, modules, auth_enabled, oob_host)` —
+  ringkasan konfigurasi tanpa rahasia.
+- `scan_state_payload(...)` / `write_scan_state(path, payload)` /
+  `load_scan_state(path)` — menyusun, menulis atomik, dan membaca+memvalidasi
+  state (semuanya melempar `ValueError` yang siap diteruskan ke `parser.error`).
+- `finding_from_state(data)` / `findings_from_state(data)` — membangun ulang
+  `Finding` beserta bukti; entri rusak dilewati, bukan menggagalkan resume.
+
+## 6. Client certificate (`--cert`, `--key`)
+
+| Flag | Efek |
+|---|---|
+| `--cert FILE` | Client certificate PEM untuk target mTLS. Satu berkas boleh memuat cert + key sekaligus. |
+| `--key FILE` | Private key PEM pasangan `--cert`. Diberikan tanpa `--cert` → exit 2. |
+
+Target di balik mTLS menolak koneksi sebelum HTTP apa pun dikirim, sehingga
+seluruh modul akan tampak "mati" tanpa cara memasang client certificate.
+
+### Cara kerja
+
+`--cert`/`--key` diteruskan apa adanya ke `curl_cffi` sebagai `cert=` — satu
+path kalau tanpa `--key`, atau tuple `(cert, key)`. Nilainya dipasang sekali di
+`make_session()` dan otomatis dipakai **semua** Session thread
+(`ThreadLocalSession(client_cert=…)`), termasuk sesi anonim pembanding, jadi
+tidak ada call site modul yang perlu diubah.
+
+Isi berkas tidak pernah dibaca, disalin, atau dicatat spade: yang dikirim ke
+libcurl hanya path-nya.
+
+### Validasi sebelum request pertama
+
+- `--key` tanpa `--cert` → `parser.error` (exit 2): private key sendirian tidak
+  bisa dipakai libcurl dan hampir pasti salah ketik.
+- `--cert`/`--key` menunjuk berkas yang tidak ada → `parser.error` (exit 2).
+- `--cert` digabung `--skip-ssl` → peringatan di banner: koneksi tidak
+  diverifikasi, hanya sisi klien yang diautentikasi.
+
+### Metadata laporan
+
+```json
+"client_cert": {"enabled": true, "key": true}
+```
+
+Hanya status yang dicatat; path berkas lokal tidak ikut ke HTML/JSON supaya
+laporan tetap portabel dan tidak membocorkan struktur direktori tester.
+
 ## Verifikasi
 
 ```bash
-.venv/bin/pytest -q tests/test_scan_engine.py    # unit + CLI end-to-end throttle/safe-mode/sesi
-.venv/bin/pytest -q tests/test_proxy_rotation.py # unit + CLI end-to-end rotasi proxy (proxy lokal asli)
-.venv/bin/pytest -q                             # seluruh suite (fixture lokal, tanpa internet)
-.venv/bin/ruff check .                          # lint
+.venv/bin/pytest -q tests/test_scan_engine.py        # unit + CLI end-to-end throttle/safe-mode/sesi
+.venv/bin/pytest -q tests/test_proxy_rotation.py     # unit + CLI end-to-end rotasi proxy (proxy lokal asli)
+.venv/bin/pytest -q tests/test_resume_client_cert.py # unit + CLI end-to-end checkpoint/resume & mTLS
+.venv/bin/pytest -q                                 # seluruh suite (fixture lokal, tanpa internet)
+.venv/bin/ruff check .                              # lint
 ```
 
 Test rotasi proxy memakai forward proxy HTTP lokal di `tests/conftest.py`
@@ -239,8 +374,11 @@ pada jalur HTTP nyata.
 
 ## Batasan / yang ditunda
 
-- Resume/checkpoint (`--state`/`--resume`) dan client certificate
-  (`--cert`/`--key`) belum ada.
+- Resume tidak memulihkan *ctx* modul yang dilewati (lihat §5) dan tidak
+  melanjutkan modul yang terpotong di tengah: checkpoint ditulis per modul,
+  jadi modul yang belum selesai diulang dari awal.
+- `--cert`/`--key` hanya menerima berkas PEM (format yang dimengerti libcurl);
+  PKCS#12/PFX dan passphrase belum didukung.
 - Rotasi proxy mengubah IP keluar, bukan fingerprint TLS/header: setiap proxy
   tetap memakai profil impersonation yang sama. Untuk target `https://`, proxy
   `http`/`socks5` hanya membuat tunnel (CONNECT) sehingga header origin utuh;

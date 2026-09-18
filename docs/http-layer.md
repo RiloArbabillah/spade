@@ -8,7 +8,7 @@ langsung dikenali sebagai bot.
 
 ## API publik
 
-### `make_session(timeout=15, verify_ssl=True, impersonate=_DEFAULT)`
+### `make_session(timeout=15, verify_ssl=True, impersonate=_DEFAULT, extra_headers=None, trust_env=None, cert=None)`
 
 Membuat satu `curl_cffi.requests.Session`.
 
@@ -19,8 +19,14 @@ Membuat satu `curl_cffi.requests.Session`.
   diset manual: nilainya diambil dari profil impersonate. Menyetel `User-Agent`
   manual akan menimpa header profil dan merusak paritas fingerprint.
 - `retry=TRANSPORT_RETRIES` hanya menangani error transport (koneksi/DNS/TLS).
+- `cert` meneruskan client certificate mTLS apa adanya ke `curl_cffi`
+  (`CURLOPT_SSLCERT`/`CURLOPT_SSLKEY`): satu path PEM, atau tuple `(cert, key)`.
+  Isi berkas tidak pernah dibaca spade. Dipakai `--cert`/`--key`; detail di
+  [scan-engine.md](scan-engine.md).
+- `trust_env=False` dipakai saat rotasi proxy aktif supaya proxy eksplisit tidak
+  tercampur `http_proxy`/`https_proxy` milik sistem tester.
 
-### `ThreadLocalSession(timeout=15, verify_ssl=True, impersonate=_DEFAULT, retries=None)`
+### `ThreadLocalSession(timeout=15, verify_ssl=True, impersonate=_DEFAULT, retries=None, extra_headers=None, auth_host="", client_cert=None)`
 
 Proxy session yang membuat satu `curl_cffi` Session **per thread**, supaya
 request paralel (`--workers`) tidak berbagi session/cookie state.
@@ -38,6 +44,8 @@ request paralel (`--workers`) tidak berbagi session/cookie state.
   (sudah tersensor) lewat `record_exchange()`, sehingga temuan bisa membawa
   bukti + langkah repro. Detailnya di
   [findings-model.md](findings-model.md).
+- `client_cert` diteruskan ke setiap Session thread, jadi target mTLS bisa diuji
+  tanpa mengubah call site modul.
 
 ### `supported_impersonate_profiles()`
 
@@ -53,6 +61,7 @@ pertama dikirim, dan keluar dengan kode 2 bila profil tidak dikenal.
 |---|---|
 | `--impersonate PROFIL` | Ganti profil impersonate (default `chrome`). Contoh: `chrome136`, `safari184`, `firefox147`. |
 | `--no-impersonate` | Matikan impersonation (fingerprint default curl). Berguna untuk membandingkan perilaku atau men-debug target yang menolak TLS browser. |
+| `--cert FILE` / `--key FILE` | Client certificate mTLS (PEM) untuk target yang menolak koneksi tanpa sertifikat klien. |
 
 Banner scan menampilkan profil yang dipakai, mis. `Bot   : chrome` atau
 `Bot   : tanpa impersonation`.
@@ -84,7 +93,7 @@ Banner scan menampilkan profil yang dipakai, mis. `Bot   : chrome` atau
 - 60 test (`tests/`) lulus saat PR itu dibuat, memakai fixture HTTP server lokal
   — tanpa koneksi internet. Mencakup header impersonation, retry status +
   `Retry-After`, timeout default, cookie, validasi `--impersonate`, serta regresi
-  23 modul. (Suite saat ini 354 test / 32 modul; lihat
+  23 modul. (Suite saat ini 399 test / 32 modul; lihat
   [vuln-classes.md](vuln-classes.md).)
 - Perbandingan hasil modul lama (`requests`) vs baru (`curl_cffi`) terhadap
   fixture yang sama: identik kecuali tiga perubahan perilaku di atas.

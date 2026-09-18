@@ -184,6 +184,11 @@ nama target tidak lagi keluar dari IP tester. Catatan: **port scan**
 (`--port-scan`) tetap TCP connect langsung, bukan lewat proxy. Detail rotasi ada di
 [docs/scan-engine.md](scan-engine.md).
 
+Catatan resume: checkpoint `--state`/`--resume` menyimpan progres **modul**, bukan
+hasil recon. Saat `--resume` dipakai, recon dijalankan ulang dan seed modul
+dihitung ulang dari awal, jadi modul yang belum selesai bisa menerima seed lebih
+sedikit daripada scan penuh. Detailnya di [docs/scan-engine.md](scan-engine.md) §5.
+
 ## 10. API publik
 
 ```python
