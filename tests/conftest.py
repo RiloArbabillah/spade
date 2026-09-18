@@ -259,7 +259,9 @@ class FixtureApp:
 
     def record(self, method, path, headers):
         with self._lock:
-            self.requests.append({"method": method, "path": path, "headers": headers})
+            # `t` (monotonic) dipakai test penjadwal request untuk mengukur jarak antar request.
+            self.requests.append({"method": method, "path": path, "headers": headers,
+                                  "t": time.monotonic()})
 
     def paths(self):
         return [r["path"] for r in self.requests]
@@ -281,6 +283,11 @@ class FixtureApp:
             if urlparse(req["path"]).path == path:
                 return {k.lower(): v for k, v in req["headers"].items()}
         return {}
+
+    def times(self, path=None):
+        """Waktu (monotonic) tiap request, opsional difilter per path."""
+        return [r["t"] for r in self.requests
+                if path is None or urlparse(r["path"]).path == path]
 
 
 class FixtureServer:
@@ -331,6 +338,23 @@ class _XXEHandler(_Handler):
             return self._send(200, passwd)
         return super()._handle()
 
+class _RetryAfterHandler(_Handler):
+    """429 + `Retry-After: 1` pada request pertama ke `/`, 200 setelahnya.
+
+    Dipakai test cooldown global: target yang membalas 429 harus menahan SEMUA
+    worker, bukan hanya thread yang menerima respons itu.
+    """
+
+    def _handle(self):
+        if urlparse(self.path).path == "/":
+            self.server.app.hits["/retry-after"] += 1
+            if self.server.app.hits["/retry-after"] == 1:
+                self._record()
+                self._body()
+                return self._send(429, "too many requests", "text/plain",
+                                  extra=[("Retry-After", "1")])
+        return super()._handle()
+
 
 @pytest.fixture
 def vuln_server():
@@ -363,6 +387,12 @@ def cmd_timing_server():
 @pytest.fixture
 def xxe_server():
     server = FixtureServer(handler=_XXEHandler).start()
+    yield server
+    server.stop()
+
+@pytest.fixture
+def retry_after_server():
+    server = FixtureServer(handler=_RetryAfterHandler).start()
     yield server
     server.stop()
 

@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import html as htmlmod
 import json
+import random
 import re
 import secrets
 import socket
@@ -264,25 +265,54 @@ def parse_header_arg(value):
         raise ValueError(f"format header tidak valid: {value!r} (butuh 'Nama: nilai')")
     return name, val.strip()
 
-def build_auth_headers(cookies=(), headers=(), bearer=""):
+def build_auth_headers(cookies=(), headers=(), bearer="", session_cookies=(), session_headers=()):
     """Rakit header autentikasi dari --cookie/-H/--bearer.
 
     Cookie digabung jadi satu header `Cookie`; `--bearer` menolak digabung
     dengan header `Authorization` dari `-H` supaya tidak ada ambiguitas.
+
+    `session_cookies`/`session_headers` berasal dari `--session` (file JSON) dan
+    diproses lebih dulu, sehingga nilai eksplisit dari `--cookie`/`-H` menang
+    kalau nama cookie/header-nya sama.
+
+    Cookie yang dihasilkan TIDAK dikirim sebagai header mentah oleh
+    `ThreadLocalSession`: nilainya dipindahkan ke cookie jar per host (lihat
+    `split_auth_cookies`) supaya tidak hilang setelah respons pertama yang
+    menulis cookie dan tidak bocor ke host pihak ketiga.
     """
-    jar = []
+    jar = []                      # daftar (nama, nilai) sebelum digabung
     extra = OrderedDict()
-    for raw in cookies or ():
-        jar.extend(parse_cookie_arg(raw))
     has_auth_header = False
-    for raw in headers or ():
-        name, value = parse_header_arg(raw)
+
+    def _add_cookie(name, value):
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("cookie tanpa nama tidak valid")
+        jar.append((name, "" if value is None else str(value)))
+
+    def _add_header(name, value):
+        nonlocal has_auth_header
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("header tanpa nama tidak valid")
+        value = "" if value is None else str(value)
         if name.lower() == "cookie":
-            jar.extend(parse_cookie_arg(value))
-            continue
+            for pair in parse_cookie_arg(value):
+                _add_cookie(*pair.split("=", 1))
+            return
         if name.lower() == "authorization":
             has_auth_header = True
         extra[name] = value
+
+    for name, value in session_cookies or ():
+        _add_cookie(name, value)
+    for name, value in session_headers or ():
+        _add_header(name, value)
+    for raw in cookies or ():
+        for pair in parse_cookie_arg(raw):
+            _add_cookie(*pair.split("=", 1))
+    for raw in headers or ():
+        _add_header(*parse_header_arg(raw))
     if bearer:
         if has_auth_header:
             raise ValueError("--bearer tidak bisa digabung dengan header Authorization dari -H")
@@ -290,10 +320,94 @@ def build_auth_headers(cookies=(), headers=(), bearer=""):
     if jar:
         # Buang duplikat nama cookie (pemanggil terakhir menang, seperti browser).
         dedup = OrderedDict()
-        for pair in jar:
-            dedup[pair.split("=", 1)[0]] = pair
+        for name, value in jar:
+            dedup[name] = f"{name}={value}"
         extra["Cookie"] = "; ".join(dedup.values())
     return extra
+
+
+def parse_session_payload(payload, source="--session"):
+    """Ubah isi file sesi JSON menjadi (daftar cookie, daftar header).
+
+    Tiga bentuk diterima supaya file ekspor dari alat lain bisa langsung dipakai:
+    objek `{"nama": "nilai"}`, daftar cookie `[{"name":..,"value":..}, ..]`
+    (bentuk `document.cookie`/Playwright), atau objek dengan kunci `cookies`
+    dan/atau `headers`.
+    """
+    cookies = []
+    headers = []
+    if isinstance(payload, dict) and ("cookies" in payload or "headers" in payload):
+        raw_cookies = payload.get("cookies")
+        raw_headers = payload.get("headers")
+    elif isinstance(payload, (dict, list)):
+        raw_cookies = payload
+        raw_headers = None
+    else:
+        raise ValueError(f"{source}: isi file harus objek JSON atau daftar cookie")
+
+    if isinstance(raw_cookies, dict):
+        cookies.extend((str(name), "" if value is None else str(value))
+                       for name, value in raw_cookies.items())
+    elif isinstance(raw_cookies, list):
+        for item in raw_cookies:
+            if isinstance(item, dict):
+                if "name" not in item or "value" not in item:
+                    raise ValueError(f"{source}: setiap entri cookie butuh kunci 'name' dan 'value'")
+                cookies.append((str(item["name"]), "" if item["value"] is None else str(item["value"])))
+            elif isinstance(item, str):
+                name, sep, value = item.partition("=")
+                if not sep or not name.strip():
+                    raise ValueError(f"{source}: cookie {item!r} tidak berformat 'nama=nilai'")
+                cookies.append((name.strip(), value))
+            else:
+                raise ValueError(f"{source}: entri cookie harus objek atau string")
+    elif raw_cookies is not None:
+        raise ValueError(f"{source}: kunci 'cookies' harus objek atau daftar")
+
+    if raw_headers is not None:
+        if not isinstance(raw_headers, dict):
+            raise ValueError(f"{source}: kunci 'headers' harus objek nama→nilai")
+        headers.extend((str(name), "" if value is None else str(value))
+                       for name, value in raw_headers.items())
+
+    if not cookies and not headers:
+        raise ValueError(f"{source}: tidak ada cookie atau header yang bisa dipakai")
+    return cookies, headers
+
+
+def load_session_file(path):
+    """Baca file sesi JSON (`--session`) dan kembalikan (cookies, headers)."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except OSError as exc:
+        raise ValueError(f"tidak bisa membaca --session '{path}': {exc.strerror or exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--session '{path}' bukan JSON valid: {exc.msg} (baris {exc.lineno})") from exc
+    return parse_session_payload(payload, f"--session '{path}'")
+
+
+def split_auth_cookies(headers):
+    """Pisahkan header `Cookie` dari header auth lainnya.
+
+    curl_cffi/libcurl memakai cookie engine sendiri: begitu cookie jar sesi berisi
+    entri (mis. dari `Set-Cookie`), header `Cookie` mentah tidak lagi dikirim.
+    Karena itu cookie dari `--cookie`/`--session`/`-H "Cookie: ..."` harus masuk ke
+    cookie jar (lihat `ThreadLocalSession`), bukan dikirim sebagai header.
+
+    Kembalikan `(header tanpa Cookie, daftar pasangan (nama, nilai))`.
+    """
+    rest = OrderedDict()
+    cookies = []
+    for name, value in (headers or {}).items():
+        if str(name).lower() == "cookie":
+            for pair in parse_cookie_arg(str(value)):
+                cname, _sep, cvalue = pair.partition("=")
+                cookies.append((cname.strip(), cvalue))
+            continue
+        rest[name] = value
+    return rest, cookies
+
 
 def _redact_auth_headers(headers):
     """Versi aman-untuk-log dari header auth (dipakai di pesan terminal)."""
@@ -302,14 +416,48 @@ def _redact_auth_headers(headers):
         for name, value in (headers or {}).items()
     ) or "-"
 
+
+# Flag yang mengirim data/efek ke target. Semuanya butuh otorisasi eksplisit dan
+# dimatikan total oleh --safe-mode.
+DESTRUCTIVE_FLAGS = (
+    ("--active-writes", "active_writes", "mengirim POST ke target"),
+    ("--timing-probes", "timing_probes", "menunda respons target sampai beberapa detik"),
+    ("--check-smuggling", "check_smuggling", "mengirim payload desync lewat socket mentah"),
+)
+
+
+def _stdin_is_tty():
+    """True kalau stdin adalah terminal interaktif (pytest/CI bukan TTY)."""
+    try:
+        return bool(sys.stdin) and sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+def _confirm_authorization(labels):
+    """Minta konfirmasi eksplisit di terminal sebelum mengirim uji destruktif."""
+    print()
+    warn("Uji berikut mengirim data ke target: " + ", ".join(labels))
+    print("  Konfirmasi hanya kalau kamu punya izin tertulis dari pemilik target "
+          "(scope program bounty/engagement).")
+    try:
+        answer = input("  [>] Ketik 'yes' untuk konfirmasi otorisasi: ").strip().lower()
+    except EOFError:
+        return False
+    return answer == "yes"
+
 def raw_http_probe(host, port, payload, use_tls=False, timeout=8.0, max_bytes=65536):
     """Kirim request HTTP mentah lewat socket, kembalikan respons mentah (bytes).
 
     Dipakai modul request smuggling: curl_cffi (dan curl) selalu menormalkan
     header sehingga CL.TE/TE.CL tidak bisa dikirim lewat jalur normal.
+
+    Probe ini juga menghormati penjadwal global (`--delay`/`--max-rps`) supaya
+    target tidak dibanjiri socket mentah di luar batas laju scan.
     """
     sock = None
     try:
+        throttle_acquire()
         sock = socket.create_connection((host, port), timeout=timeout)
         if use_tls:
             context = ssl._create_unverified_context()
@@ -365,11 +513,126 @@ def parse_raw_response(raw):
 # ── HTTP layer (curl_cffi) ──
 DEFAULT_IMPERSONATE = "chrome"     # profil default: Chrome terbaru yang didukung curl_cffi
 TRANSPORT_RETRIES = 1              # retry error koneksi/DNS/TLS (ditangani curl_cffi)
-STATUS_RETRIES = 1                 # retry status 429/5xx (ditangani ThreadLocalSession)
+STATUS_RETRIES = 2                 # retry status 429/5xx (ditangani ThreadLocalSession)
 RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 RETRY_METHODS = frozenset({"GET", "POST", "HEAD", "OPTIONS"})
 RETRY_AFTER_MAX = 5.0              # batas tunggu Retry-After agar scan tidak macet
+DEFAULT_BACKOFF_MAX = 30.0         # batas atas cooldown global saat target membalas 429/503
 _DEFAULT = object()                # sentinel: bedakan "pakai default" dari "tanpa impersonate"
+
+
+# ══════════════════════════════════════════════════════════════════
+# THROTTLE — penjadwal request global (delay, max-rps, jitter, backoff)
+# ══════════════════════════════════════════════════════════════════
+
+class Throttle:
+    """Penjadwal request global untuk seluruh scan.
+
+    Satu instance dipakai bersama semua worker, jadi `--max-rps` benar-benar
+    membatasi laju total (bukan laju per thread). `acquire()` dipanggil di satu
+    funnel request (`ThreadLocalSession.request()` dan `raw_http_probe()`),
+    sehingga tidak ada modul yang bisa lolos dari penjadwalan.
+
+    Tanpa `--delay`/`--max-rps`, `enabled` bernilai False dan `acquire()`
+    langsung kembali tanpa menyentuh jadwal apa pun.
+    """
+
+    def __init__(self, delay=0.0, max_rps=0.0, jitter_pct=0.0, backoff_max=DEFAULT_BACKOFF_MAX):
+        self.delay = max(0.0, float(delay or 0.0))
+        self.max_rps = max(0.0, float(max_rps or 0.0))
+        self.jitter_pct = min(100.0, max(0.0, float(jitter_pct or 0.0)))
+        self.backoff_max = max(0.0, float(backoff_max or 0.0))
+        self.interval = (1.0 / self.max_rps) if self.max_rps > 0 else 0.0
+        self._lock = threading.Lock()
+        self._next_slot = 0.0        # waktu paling awal request berikutnya boleh dikirim
+        self._cooldown_until = 0.0   # backoff global akibat 429/503
+
+    @property
+    def enabled(self):
+        """True kalau ada pembatas laju yang harus ditegakkan."""
+        return self.delay > 0 or self.interval > 0
+
+    def describe(self):
+        """Ringkasan untuk metadata laporan (tanpa nilai rahasia apa pun)."""
+        return {
+            "enabled": self.enabled,
+            "delay": self.delay,
+            "max_rps": self.max_rps,
+            "jitter": self.jitter_pct,
+            "backoff_max": self.backoff_max,
+        }
+
+    def _jitter(self, gap):
+        """Acak jeda ±jitter_pct% supaya pola request tidak seragam."""
+        if gap <= 0 or self.jitter_pct <= 0:
+            return gap
+        spread = gap * (self.jitter_pct / 100.0)
+        return max(0.0, gap + random.uniform(-spread, spread))
+
+    def acquire(self):
+        """Tunggu sampai request berikutnya boleh dikirim (delay + max-rps + cooldown)."""
+        if not self.enabled:
+            return
+        with self._lock:
+            now = time.monotonic()
+            start = max(now, self._next_slot, self._cooldown_until)
+            gap = self._jitter(max(self.delay, self.interval))
+            self._next_slot = start + gap
+            if self._cooldown_until <= start:
+                self._cooldown_until = 0.0
+        self._sleep_until(start)
+
+    def _sleep_until(self, target):
+        """Tidur bertahap supaya cooldown yang lebih panjang tetap dihormati."""
+        while True:
+            wait = target - time.monotonic()
+            if wait <= 0:
+                return
+            time.sleep(min(wait, 0.5))
+
+    def backoff_for(self, attempt):
+        """Backoff eksponensial untuk kegagalan ke-`attempt` (1 = kegagalan pertama)."""
+        return min(self.backoff_max, 1.0 * (2 ** max(0, int(attempt) - 1)))
+
+    def cooldown(self, seconds):
+        """Tahan semua worker selama `seconds`; kembalikan durasi tunggu efektif."""
+        wait = max(0.0, float(seconds or 0.0))
+        if self.backoff_max > 0:
+            wait = min(wait, self.backoff_max)
+        if wait <= 0:
+            return 0.0
+        with self._lock:
+            until = time.monotonic() + wait
+            if until > self._cooldown_until:
+                self._cooldown_until = until
+                self._next_slot = max(self._next_slot, until)
+            return max(0.0, self._cooldown_until - time.monotonic())
+
+
+REQUEST_THROTTLE = None
+
+def set_request_throttle(throttle):
+    """Pasang penjadwal request global (None = tanpa throttle)."""
+    global REQUEST_THROTTLE
+    REQUEST_THROTTLE = throttle
+    return throttle
+
+def throttle_acquire():
+    """Tunggu giliran request berikutnya; no-op kalau throttle tidak aktif."""
+    throttle = REQUEST_THROTTLE
+    if throttle is not None:
+        throttle.acquire()
+
+def throttle_cooldown(seconds, attempt=1):
+    """Backoff global setelah 429/503; 0.0 kalau throttle tidak aktif.
+
+    Saat throttle mati, pemanggil tetap memakai jeda `Retry-After` per thread
+    seperti sebelumnya — perilaku default scan tidak berubah.
+    """
+    throttle = REQUEST_THROTTLE
+    if throttle is None or not throttle.enabled:
+        return 0.0
+    return throttle.cooldown(max(float(seconds or 0.0), throttle.backoff_for(attempt)))
 
 
 def supported_impersonate_profiles():
@@ -414,8 +677,10 @@ def make_session(timeout=15, verify_ssl=True, impersonate=_DEFAULT, extra_header
     berdasarkan status HTTP (429/5xx) ditangani wrapper ThreadLocalSession.
 
     `extra_headers` (Cookie/Authorization/header dari -H) disuntikkan ke
-    `session.headers` supaya ikut di setiap request. Header khas browser tetap
-    datang dari profil impersonate saat request dikirim, jadi paritas
+    `session.headers` supaya ikut di setiap request. Header `Cookie` sebaiknya
+    tidak lewat sini: `ThreadLocalSession` memindahkannya ke cookie jar per host
+    supaya tidak diabaikan curl_cffi setelah jar berisi entri. Header khas browser
+    tetap datang dari profil impersonate saat request dikirim, jadi paritas
     fingerprint TLS + header tidak berubah.
 
     impersonate=None berarti impersonation dimatikan (mode paritas/debugging).
@@ -1080,26 +1345,59 @@ class ThreadLocalSession:
     default dan retry status HTTP berlaku seragam untuk semua modul tanpa perlu
     mengubah call site. Atribut lain (cookies, headers, close) didelegasikan ke
     Session milik thread terkait lewat __getattr__.
+
+    Cookie auth (`--cookie`/`--session`) TIDAK dikirim sebagai header `Cookie`
+    mentah, melainkan dimasukkan ke cookie jar thread dengan domain = host target
+    (saat request pertama ke host itu). Alasannya dua:
+
+    * curl_cffi mengabaikan header `Cookie` mentah begitu cookie jar berisi entri,
+      sehingga kredensial tester hilang setelah respons pertama yang menulis cookie;
+    * cookie jadi ter-scope ke host target saja, tidak ikut terkirim ke API pihak
+      ketiga yang dipakai recon (crt.sh, Cert Spotter, Wayback, Common Crawl).
     """
 
     def __init__(self, timeout=15, verify_ssl=True, impersonate=_DEFAULT, retries=None,
-                 extra_headers=None):
+                 extra_headers=None, auth_host=""):
         self._local = threading.local()
         self.timeout = timeout
         self.verify_ssl = verify_ssl
         self.impersonate = impersonate
         self.retries = STATUS_RETRIES if retries is None else max(0, retries)
-        # Header auth (Cookie/Authorization/-H) dipakai tiap request. Salinan
-        # dibuat di sini supaya pemanggil tidak bisa mengubahnya di tengah scan.
-        self.extra_headers = dict(extra_headers or {})
+        # Host yang boleh menerima cookie auth (host target). Kosong = kunci ke
+        # host pertama yang di-request, supaya cookie tetap tidak ikut ke host lain.
+        self.auth_host = auth_host or ""
+        # Header auth (Authorization/-H) dipakai tiap request; cookie dipisah ke
+        # `auth_cookies` karena harus lewat cookie jar. Salinan dibuat di sini
+        # supaya pemanggil tidak bisa mengubahnya di tengah scan.
+        self.extra_headers, self.auth_cookies = split_auth_cookies(extra_headers)
 
-    def _session(self):
+    def _cookie_scope(self, host):
+        """True kalau cookie auth boleh di-seed untuk `host` ini."""
+        if not self.auth_cookies or not host:
+            return False
+        if self.auth_host:
+            return host == self.auth_host
+        # Tanpa host eksplisit, cookie di-seed hanya untuk host pertama.
+        return not getattr(self._local, "cookie_hosts", ())
+
+    def _session(self, url=""):
         sess = getattr(self._local, "sess", None)
         if sess is None:
             sess = make_session(timeout=self.timeout, verify_ssl=self.verify_ssl,
                                 impersonate=self.impersonate,
                                 extra_headers=self.extra_headers)
             self._local.sess = sess
+            self._local.cookie_hosts = set()
+        host = urllib.parse.urlparse(url).hostname or ""
+        # Cookie auth di-seed sekali per host: cukup untuk target, dan tidak ikut
+        # dikirim ke host lain (recon pihak ketiga).
+        if host not in self._local.cookie_hosts and self._cookie_scope(host):
+            self._local.cookie_hosts.add(host)
+            for name, value in self.auth_cookies:
+                try:
+                    sess.cookies.set(name, value, domain=host)
+                except Exception:
+                    pass
         return sess
 
     def request(self, method, url, **kwargs):
@@ -1115,10 +1413,17 @@ class ThreadLocalSession:
         started = time.monotonic()
         resp = None
         for attempt in range(max_attempts + 1):
-            resp = self._session().request(method, url, **kwargs)
+            # Penjadwalan global (--delay/--max-rps/jitter) dijalankan di funnel
+            # yang sama supaya seluruh modul ikut terbatas tanpa mengubah call site.
+            throttle_acquire()
+            resp = self._session(url).request(method, url, **kwargs)
             if resp.status_code not in RETRY_STATUS or attempt >= max_attempts:
                 break
-            time.sleep(_retry_after_seconds(resp.headers.get("Retry-After")))
+            wait = _retry_after_seconds(resp.headers.get("Retry-After"))
+            # Saat throttle aktif, backoff ditahan global supaya seluruh worker
+            # ikut melambat; tanpa throttle, retry tetap per thread seperti dulu.
+            if throttle_cooldown(wait, attempt + 1) <= 0:
+                time.sleep(wait)
         # Bukti direkam di satu-satunya funnel request, termasuk respons 4xx/5xx,
         # supaya setiap temuan punya request/response pendukungnya.
         record_exchange(exchange_from_response(resp, method, (time.monotonic() - started) * 1000,
@@ -1812,6 +2117,13 @@ def dir_listing(sess, base_url, ctx=None):
 
 def http_methods(sess, base_url, ctx=None):
     f = FindingList(); info("Memeriksa metode HTTP...")
+    # Safe-mode tidak mengirim metode yang bisa mengubah state (PUT/DELETE).
+    # TRACE dan OPTIONS tetap diuji karena keduanya hanya membaca.
+    if _ctx_flag(ctx, "safe_mode"):
+        info("  (safe-mode: PUT/DELETE tidak dikirim — hanya TRACE/OPTIONS)")
+        methods = ["TRACE", "OPTIONS"]
+    else:
+        methods = ["PUT", "DELETE", "TRACE", "OPTIONS"]
     def _check(m):
         out = FindingList()
         try:
@@ -1830,7 +2142,7 @@ def http_methods(sess, base_url, ctx=None):
         except: pass
         return out
 
-    results = pmap(_check, ["PUT","DELETE","TRACE","OPTIONS"])
+    results = pmap(_check, methods)
     for out in results:
         for item in out:
             if item[1] == "HTTP_METHOD":
@@ -1941,7 +2253,7 @@ def scan_sqli(sess, base_url, ctx=None):
                abs(len(true_resp.content) - len(false_resp.content)) > 300:
                 return [("HIGH","SQLI_BOOLEAN",f"Parameter URL '{p}' menunjukkan boolean-based SQL injection: respons true dan false berbeda secara konsisten.", f"{url}?{p}=1+AND+1%3D1", f"Boolean oracle via parameter '{p}'")]
         except: pass
-        if ctx and ctx.get("timing_probes"):
+        if _timing_probes_on(ctx):
             for payload in SQLI_TIMING_PAYLOADS:
                 started = time.monotonic()
                 try:
@@ -1973,7 +2285,7 @@ def scan_sqli(sess, base_url, ctx=None):
                     out.append(("HIGH","SQLI",f"Form field '{inp['name']}' di {action} rentan SQL injection (error-based, payload: {label}). Attacker bisa membaca/mengubah database.", action, f"SQL injection via field '{inp['name']}' di form {action}"))
                     break
             except: pass
-        if ctx and ctx.get("timing_probes"):
+        if _timing_probes_on(ctx):
             for payload in SQLI_TIMING_PAYLOADS:
                 p = {inp["name"]: payload}
                 url = join(base_url, action)
@@ -2176,7 +2488,7 @@ def cmd_injection(sess, base_url, ctx=None):
         f.extend(scan_oob_cmdi(sess, base_url, ctx))
         return f
 
-    if ctx and ctx.get("timing_probes"):
+    if _timing_probes_on(ctx):
         def _timing(job):
             path, param, payload = job
             started = time.monotonic()
@@ -2308,6 +2620,11 @@ def ssrf_check(sess, base_url, ctx=None):
 
 def rate_limit(sess, base_url, ctx=None):
     f = FindingList(base_url); info("Menguji rate limiting...")
+    # Uji ini bergantung pada burst request paralel; saat penjadwal global aktif
+    # burst itu memang diredam, jadi hasilnya tidak bisa ditafsirkan.
+    if REQUEST_THROTTLE is not None and REQUEST_THROTTLE.enabled:
+        info("  (dilewati: throttle aktif — burst 15 request tidak bisa diamati)")
+        return f
     def _probe(_):
         try:
             r = sess.get(base_url, timeout=8)
@@ -2851,10 +3168,10 @@ def auth_header_candidates(sess, resp=None):
 def cookie_candidates(sess, resp=None):
     """Pasangan (nama, nilai) cookie yang benar-benar dipakai scan.
 
-    Dua sumber digabung: header `Cookie` sesi dan cookie jar. Header dibaca
-    lebih dulu karena `--cookie`/`-H "Cookie: ..."` disuntikkan sebagai header
-    mentah ke session, bukan ke cookie jar curl_cffi; cookie jar (hasil
-    `Set-Cookie`) hanya mengisi nama yang belum ada.
+    Dua sumber digabung: header `Cookie` pada request nyata (kalau ada) dan cookie
+    jar sesi. Sejak cookie auth (`--cookie`/`--session`) dimasukkan ke cookie jar
+    per host, sumber utama adalah jar; header mentah tetap dibaca untuk kasus
+    request yang membawa header Cookie-nya sendiri.
     """
     jar = OrderedDict()
     for source in _auth_sources(sess, resp):
@@ -3789,6 +4106,10 @@ def _ctx_flag(ctx, key):
     """Baca flag boolean dari ctx tanpa pecah kalau ctx kosong/None."""
     return bool((ctx or {}).get(key))
 
+def _timing_probes_on(ctx):
+    """True kalau probe time-based boleh jalan (butuh --timing-probes, bukan safe-mode)."""
+    return _ctx_flag(ctx, "timing_probes") and not _ctx_flag(ctx, "safe_mode")
+
 def _resp_fingerprint(resp):
     """Sidik ringkas respons (status, ukuran, hash body) untuk perbandingan."""
     if resp is None:
@@ -3975,7 +4296,8 @@ def scan_csrf(sess, base_url, ctx=None):
     if not forms:
         info("  Tidak ada form POST dari crawl")
         return f
-    active = _ctx_flag(ctx, "active_writes")
+    # Safe-mode memaksa uji tulis mati, walaupun kombinasinya sudah ditolak di CLI.
+    active = _ctx_flag(ctx, "active_writes") and not _ctx_flag(ctx, "safe_mode")
     info(f"  {len(forms)} form POST diperiksa" + ("" if active else " (uji aktif dengan token palsu: tambah --active-writes)"))
 
     def _inspect(job):
@@ -4471,7 +4793,7 @@ def scan_smuggling(sess, base_url, ctx=None):
     kalau canary path benar-benar diproses sebagai request terpisah oleh server.
     """
     f = FindingList(base_url, capture=False)
-    if not _ctx_flag(ctx, "check_smuggling"):
+    if not _ctx_flag(ctx, "check_smuggling") or _ctx_flag(ctx, "safe_mode"):
         return f
     info("Menguji request smuggling (raw socket, CL.TE/TE.CL)...")
     parsed = urllib.parse.urlparse(base_url)
@@ -4862,6 +5184,10 @@ def gen_json(finds, target, out, scan=None):
             # Status flag aktif: penting untuk audit karena mengubah cakupan uji
             # (uji autentikasi, uji tulis, dan callback OOB tidak pernah default).
             "auth": bool(scan.get("auth")),
+            "auth_source": list(scan.get("auth_source") or []),
+            "safe_mode": bool(scan.get("safe_mode")),
+            "authorized": bool(scan.get("authorized")),
+            "throttle": scan.get("throttle") or Throttle().describe(),
             "active_writes": bool(scan.get("active_writes")),
             "timing_probes": bool(scan.get("timing_probes")),
             "check_smuggling": bool(scan.get("check_smuggling")),
@@ -5009,7 +5335,10 @@ def main(argv=None):
   python3 spade.py example.com --json hasil.json     # export JSON
   python3 spade.py example.com --sarif hasil.sarif   # export SARIF
   python3 spade.py example.com --recon-only          # recon saja (subdomain + URL historis)
-  python3 spade.py example.com --detailed --port-scan # full + TCP connect scan""")
+  python3 spade.py example.com --detailed --port-scan # full + TCP connect scan
+  python3 spade.py example.com --delay 0.5 --jitter 30   # sopan ke target (maks ~2 req/s)
+  python3 spade.py example.com --max-rps 5 --safe-mode   # batas laju + tanpa uji destruktif
+  python3 spade.py example.com --session sesi.json       # impor cookie/header dari file JSON""")
     parser.add_argument("target", nargs="?", default="", help="Target URL (opsional — akan diminta interaktif jika kosong)")
     parser.add_argument("-o","--output", default="", help="Laporan HTML")
     parser.add_argument("--csv", default="", help="Export CSV")
@@ -5033,17 +5362,31 @@ def main(argv=None):
     parser.add_argument("--jwt-secrets", default="", metavar="FILE",
                         help="File daftar secret JWT (satu per baris) untuk diuji offline terhadap token yang ditemukan.")
     parser.add_argument("--active-writes", action="store_true",
-                        help="Izinkan uji yang mengirim data (submit form CSRF dengan token palsu). Default: mati.")
+                        help="Izinkan uji yang mengirim data (submit form CSRF dengan token palsu). Default: mati. Butuh konfirmasi otorisasi/--i-have-authorization")
     parser.add_argument("--timing-probes", action="store_true",
-                        help="Izinkan probe time-based SQLi/CMDi (delay 3 detik). Default: mati.")
+                        help="Izinkan probe time-based SQLi/CMDi (delay 3 detik). Default: mati. Butuh konfirmasi otorisasi/--i-have-authorization")
     parser.add_argument("--check-smuggling", action="store_true",
-                        help="Aktifkan uji request smuggling CL.TE/TE.CL lewat socket mentah. Hanya untuk target yang mengizinkan.")
+                        help="Aktifkan uji request smuggling CL.TE/TE.CL lewat socket mentah. Butuh konfirmasi otorisasi/--i-have-authorization.")
     parser.add_argument("--oob-host", default="", metavar="HOST",
                         help="Host collector OOB milik tester (mis. 10.0.0.5:9000) untuk bukti blind SSRF/XXE/CMDi. Jalankan tools/oob_collector.py di sana.")
     parser.add_argument("--impersonate", default=DEFAULT_IMPERSONATE, metavar="PROFIL",
                         help=f"Profil browser curl_cffi untuk menyamarkan request (default: {DEFAULT_IMPERSONATE}). Contoh: chrome136, safari184, firefox147")
     parser.add_argument("--no-impersonate", action="store_true", help="Matikan browser impersonation (fingerprint default curl; untuk debugging/paritas)")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help=f"Jumlah request paralel per scan (default: {DEFAULT_WORKERS}, 1 = sekuensial)")
+    parser.add_argument("--delay", type=float, default=0.0, metavar="SEC",
+                        help="Jeda minimum antar request untuk SEMUA worker (default: 0 = tanpa jeda). Mis. 0.5 = maksimal ~2 request/detik")
+    parser.add_argument("--max-rps", type=float, default=0.0, metavar="N",
+                        help="Batas laju global request per detik (default: 0 = tanpa batas). Bisa digabung dengan --delay (yang paling ketat menang)")
+    parser.add_argument("--jitter", type=float, default=0.0, metavar="PCT",
+                        help="Acak jeda ±PCT%% (0-100) supaya pola request tidak seragam (default: 0)")
+    parser.add_argument("--backoff-max", type=float, default=DEFAULT_BACKOFF_MAX, metavar="SEC",
+                        help=f"Batas atas cooldown global saat target membalas 429/503 (default: {DEFAULT_BACKOFF_MAX:.0f}s)")
+    parser.add_argument("--safe-mode", action="store_true",
+                        help="Mode aman: tidak mengirim metode/payload yang mengubah state (PUT/DELETE, uji tulis, probe timing, smuggling). Bentrok dengan flag destruktif → exit 2")
+    parser.add_argument("--i-have-authorization", action="store_true",
+                        help="Konfirmasi non-interaktif bahwa kamu punya izin tertulis untuk uji destruktif (--active-writes/--timing-probes/--check-smuggling)")
+    parser.add_argument("--session", default="", metavar="FILE",
+                        help="Impor sesi dari file JSON (objek nama→nilai, daftar {name,value}, atau {cookies,headers}). Nilainya tidak pernah ditulis ke laporan")
     parser.add_argument("--crawl-depth", type=int, default=2, help="Kedalaman crawl mode detailed (default: 2)")
     parser.add_argument("--crawl-max", type=int, default=30, help="Maksimal halaman di-crawl mode detailed (default: 30)")
     parser.add_argument("--port-scan", action="store_true",
@@ -5059,6 +5402,29 @@ def main(argv=None):
         parser.error("--recon-only butuh recon aktif — jangan digabung dengan --no-recon")
     if args.port_scan and not (args.detailed or args.recon_only):
         parser.error("--port-scan hanya berlaku bersama --detailed atau --recon-only")
+    # ── Validasi penjadwal request (--delay/--max-rps/--jitter/--backoff-max) ──
+    if args.delay < 0:
+        parser.error("--delay tidak boleh negatif")
+    if args.max_rps < 0:
+        parser.error("--max-rps tidak boleh negatif")
+    if not 0 <= args.jitter <= 100:
+        parser.error("--jitter harus di antara 0 dan 100 (persen)")
+    if args.backoff_max < 0:
+        parser.error("--backoff-max tidak boleh negatif")
+    # ── Safe-mode & gerbang otorisasi uji destruktif ──
+    destructive = [label for label, attr, _why in DESTRUCTIVE_FLAGS if getattr(args, attr)]
+    if args.safe_mode:
+        for label, attr, why in DESTRUCTIVE_FLAGS:
+            if getattr(args, attr):
+                parser.error(f"--safe-mode tidak bisa digabung dengan {label} ({why})")
+    if destructive and not args.i_have_authorization:
+        if not _stdin_is_tty():
+            parser.error("uji destruktif " + ", ".join(destructive) + " butuh konfirmasi otorisasi. "
+                         "Jalankan di terminal interaktif atau tambahkan --i-have-authorization.")
+        if not _confirm_authorization(destructive):
+            print()
+            err("Konfirmasi otorisasi tidak diberikan — scan dibatalkan sebelum request apa pun.")
+            return 2
     if args.no_color: DISABLE_COLOR = True
     if args.no_redact:
         REDACT_ENABLED = False
@@ -5074,11 +5440,29 @@ def main(argv=None):
                      f"Contoh yang valid: chrome146, safari184, firefox147, edge101 (total {len(profiles)} profil)")
 
     # ── Validasi argumen autentikasi & OOB (semua sebelum request pertama) ──
+    session_cookies, session_headers = [], []
+    if args.session:
+        try:
+            session_cookies, session_headers = load_session_file(args.session)
+        except ValueError as exc:
+            parser.error(str(exc))
     try:
-        extra_headers = build_auth_headers(args.cookie, args.header, args.bearer)
+        extra_headers = build_auth_headers(args.cookie, args.header, args.bearer,
+                                           session_cookies=session_cookies,
+                                           session_headers=session_headers)
     except ValueError as exc:
         parser.error(str(exc))
     auth_enabled = bool(extra_headers)
+    # Sumber autentikasi dicatat untuk audit (nama saja, tidak pernah nilainya).
+    auth_source = []
+    if session_cookies or session_headers:
+        auth_source.append("session")
+    if args.cookie:
+        auth_source.append("cookie")
+    if args.header:
+        auth_source.append("header")
+    if args.bearer:
+        auth_source.append("bearer")
     jwt_secrets = []
     if args.jwt_secrets:
         try:
@@ -5131,8 +5515,16 @@ def main(argv=None):
 
     target = normalize_url(args.target)
     host = host_from_url(target)
+    # Cookie auth hanya dikirim ke host target (bukan ke API recon pihak ketiga).
+    auth_host = urllib.parse.urlparse(target).hostname or ""
     mode = "quick" if args.quick else ("detailed" if args.detailed
                                       else ("recon" if args.recon_only else "standard"))
+    verify_ssl = not args.skip_ssl
+    set_request_executor(args.workers)
+    # Penjadwal request dipasang sebelum session dibuat supaya request pertama
+    # (WAF detection / halaman utama) sudah ikut dibatasi.
+    throttle = set_request_throttle(Throttle(delay=args.delay, max_rps=args.max_rps,
+                                             jitter_pct=args.jitter, backoff_max=args.backoff_max))
 
     print()
     print(f"    {c('bold',c('cyan','+===========[ SPADE ]===========+'))}")
@@ -5146,6 +5538,13 @@ def main(argv=None):
     if auth_enabled:
         info(f"Auth  : {_redact_auth_headers(extra_headers)}")
         warn("Scan memakai sesi autentikasi — pastikan akun dan scope sudah diizinkan program.")
+    if throttle.enabled:
+        rate = f"{1.0 / throttle.interval:.1f} req/s" if throttle.interval > 0 else "tanpa batas laju"
+        info(f"Throttle: delay {throttle.delay:g}s, {rate}, jitter ±{throttle.jitter_pct:g}%")
+    if args.safe_mode:
+        warn("SAFE MODE — PUT/DELETE, uji tulis, probe timing, dan smuggling tidak dikirim.")
+    if args.i_have_authorization:
+        info("Otorisasi: dikonfirmasi lewat --i-have-authorization")
     if oob_host:
         info(f"OOB   : collector {oob_host}")
         if urllib.parse.urlparse(oob_host).hostname == host_from_url(target).split(":")[0]:
@@ -5165,10 +5564,8 @@ def main(argv=None):
     info(f"Start : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
 
-    verify_ssl = not args.skip_ssl
-    set_request_executor(args.workers)
     sess = ThreadLocalSession(timeout=15, verify_ssl=verify_ssl, impersonate=args.impersonate,
-                              extra_headers=extra_headers)
+                              extra_headers=extra_headers, auth_host=auth_host)
     # Sesi anonim (tanpa kredensial) untuk pembanding: IDOR, auth bypass, cache deception,
     # dan orakel token JWT butuh tahu respons apa yang diterima pengunjung tanpa login.
     anon_sess = ThreadLocalSession(timeout=15, verify_ssl=verify_ssl,
@@ -5186,6 +5583,10 @@ def main(argv=None):
         "impersonate": args.impersonate,
         "workers": args.workers,
         "auth": auth_enabled,
+        "auth_source": auth_source,
+        "safe_mode": bool(args.safe_mode),
+        "authorized": bool(args.i_have_authorization),
+        "throttle": throttle.describe(),
         "active_writes": bool(args.active_writes),
         "timing_probes": bool(args.timing_probes),
         "check_smuggling": bool(args.check_smuggling),
@@ -5201,6 +5602,7 @@ def main(argv=None):
         "crawler": None,
         "auth_enabled": auth_enabled,
         "anon_sess": anon_sess,
+        "safe_mode": bool(args.safe_mode),
         "active_writes": bool(args.active_writes),
         "timing_probes": bool(args.timing_probes),
         "check_smuggling": bool(args.check_smuggling),
@@ -5303,6 +5705,7 @@ def main(argv=None):
     if scan["errors"]:
         warn(f"{len(scan['errors'])} modul gagal — lihat temuan SCAN_ERROR di laporan.")
     print()
+    set_request_throttle(None)
     return 0
 
 if __name__ == "__main__":

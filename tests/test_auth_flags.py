@@ -203,22 +203,26 @@ def test_cli_cookie_jwt_is_audited(jwt_server, tmp_path):
     assert token not in raw
 
 # ══════════════════════════════════════════════════════════════════
-# Flag aktivasi: --active-writes / --check-smuggling
+# Flag aktivasi: --active-writes / --check-smuggling (+ gerbang otorisasi)
 # ══════════════════════════════════════════════════════════════════
 
 def test_active_writes_flag_warns_and_is_recorded(auth_server, tmp_path, capsys):
     json_out = tmp_path / "aw.json"
     assert spade.main([auth_server.base_url, "--detailed", "--no-color", "--workers", "1",
                        "--crawl-max", "5", "--active-writes",
+                       "--i-have-authorization",
                        "--cookie", "sid=x", "-o", str(tmp_path / "aw.html"),
                        "--json", str(json_out)]) == 0
     assert "ACTIVE WRITES ON" in capsys.readouterr().out
-    assert json.loads(json_out.read_text(encoding="utf-8"))["scan"]["active_writes"] is True
+    payload = json.loads(json_out.read_text(encoding="utf-8"))
+    assert payload["scan"]["active_writes"] is True
+    assert payload["scan"]["authorized"] is True
 
 
 def test_check_smuggling_flag_warns_and_is_recorded(vuln_server, tmp_path, capsys):
     json_out = tmp_path / "sm.json"
     assert spade.main([vuln_server.base_url, "--quick", "--no-color", "--check-smuggling",
+                       "--i-have-authorization",
                        "-o", str(tmp_path / "sm.html"), "--json", str(json_out)]) == 0
     assert "REQUEST SMUGGLING ON" in capsys.readouterr().out
     assert json.loads(json_out.read_text(encoding="utf-8"))["scan"]["check_smuggling"] is True
@@ -228,6 +232,7 @@ def test_quick_mode_does_not_run_smuggling_or_oob(vuln_server, tmp_path):
     json_out = tmp_path / "quick.json"
     assert spade.main([vuln_server.base_url, "--quick", "--no-color",
                        "--check-smuggling", "-o", str(tmp_path / "quick.html"),
+                       "--i-have-authorization",
                        "--json", str(json_out)]) == 0
     payload = json.loads(json_out.read_text(encoding="utf-8"))
     assert "smuggling" not in payload["scan"]["modules"]
