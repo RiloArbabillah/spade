@@ -13,9 +13,9 @@ Status: **bagian 1, 2, 3, dan 4 sudah dikerjakan** — bagian 1 di PR
 hardcode di JS sudah diperbaiki di PR `fix/js-secret-detection`; sisa bagian 4
 sekarang ditangani di `feat/module-detection-quality`. Integrasi binary
 eksternal (`sqlmap`, `ffuf`, `nuclei`, Playwright) sengaja tidak ditambahkan.
-Bagian 5 sudah dikerjakan sebagian di PR `feat/scan-throttle-safe-mode`
-(throttle, safe-mode, impor sesi — detail di
-[docs/scan-engine.md](scan-engine.md)); proxy/rotasi IP, resume/state, dan
+Bagian 5 sudah dikerjakan sebagian: throttle, safe-mode, dan impor sesi di PR
+`feat/scan-throttle-safe-mode`; proxy/rotasi IP di PR `feat/proxy-rotation`
+(detail keduanya di [docs/scan-engine.md](scan-engine.md)). Resume/state dan
 client certificate masih terbuka. Bagian 6 masih terbuka. PR
 `feat/curl-cffi-http-layer` sebelumnya hanya mengganti HTTP layer ke `curl_cffi`
 + menambah test + membuat dokumen ini.
@@ -129,7 +129,7 @@ dengan pendekatan tanpa dependency runtime baru. Rincian orakel ada di
 | Area | Bukti di kode | Dampak | Tool / pendekatan konkret | Prioritas |
 |---|---|---|---|---|
 | Tanpa rate limit / delay / jitter | Hanya `--workers`; request paralel penuh (default 10) | Target down / diblokir WAF → scan sia-sia | Tambah `--delay`, `--max-rps`, jitter acak, dan backoff saat 429/503 | ✅ Selesai (`--delay`/`--max-rps`/`--jitter`/`--backoff-max`, penjadwal global + cooldown 429/503) |
-| Tanpa proxy / rotasi IP | Tidak ada opsi proxy | IP tester cepat diblokir | Tambah `--proxy`, `--proxy-file` (rotasi), dukung SOCKS5 | P1 (belum) |
+| Tanpa proxy / rotasi IP | Tidak ada opsi proxy | IP tester cepat diblokir | Tambah `--proxy`, `--proxy-file` (rotasi), dukung SOCKS5 | ✅ Selesai (`--proxy`/`--proxy-file`/`--proxy-cooldown`, round-robin + skip saat 403/429/503, `socks5`/`socks5h`) |
 | Tanpa auth/cookie/header injection | Tidak ada `--cookie`, `--header`, `--auth` | Tidak bisa scan area terautentikasi (mayoritas bounty) | Tambah `--cookie`, `-H`, `--bearer`, impor sesi (JSON cookie) | ✅ Selesai (`--cookie`/`-H`/`--bearer` di bagian 2; impor sesi `--session` di PR mesin scan) |
 | Tanpa resume / state | Hasil hanya akhir scan; tidak ada checkpoint | Scan panjang harus diulang | Tulis `state.json` per modul selesai + `--resume` | P2 (belum) |
 | Tanpa client certificate | Tidak ada | Target mTLS tidak bisa diuji | `--cert/--key` (didukung `curl_cffi` lewat `cert=`) | P3 (belum) |
@@ -155,8 +155,11 @@ menyerupai browser asli.
 
 Yang **belum** ada dan tetap jadi celah deteksi:
 
-1. Rotasi IP/proxy (`--proxy-file`) — IP tetap sama selama scan.
-2. Pola request: tanpa delay/jitter, urutan modul tetap sama tiap scan.
+1. ~~Rotasi IP/proxy (`--proxy-file`) — IP tetap sama selama scan.~~
+   **Sudah selesai** di PR `feat/proxy-rotation` (`--proxy`/`--proxy-file`,
+   rotasi round-robin + skip-on-block).
+2. ~~Pola request: tanpa delay/jitter~~ — **sudah selesai** lewat
+   `--delay`/`--max-rps`/`--jitter`; sisa: urutan modul tetap sama tiap scan.
 3. Fingerprint perilaku: tidak ada jeda berpikir, tidak memuat aset statis,
    tidak ada `Referer` realistis antar halaman.
 4. Cookie/sesi palsu dan `Accept-Language` tetap seragam untuk semua target.
@@ -164,9 +167,10 @@ Yang **belum** ada dan tetap jadi celah deteksi:
    Spotter, Wayback, Common Crawl) dari IP tester — request ini tidak bisa
    di-impersonate. Opt-out: `--no-recon` (mode DETAILED).
 
-Item 2 (delay/jitter) sudah ditangani `--delay`/`--max-rps`/`--jitter` di PR
-`feat/scan-throttle-safe-mode`; item 1 (rotasi IP/proxy) masih terbuka di tabel
-bagian 5.
+Item 1 (rotasi IP/proxy) sudah ditangani `--proxy`/`--proxy-file` di PR
+`feat/proxy-rotation`; item 2 (delay/jitter) di PR `feat/scan-throttle-safe-mode`.
+Yang benar-benar masih terbuka: urutan modul yang tetap, fingerprint perilaku
+(item 3), dan recon pasif dari IP tester (item 5).
 
 ## Urutan pengerjaan yang disarankan
 
@@ -181,9 +185,10 @@ bagian 5.
    autentikasi.
 3. **P0 operasional sisanya** (bagian 5 & 6): `--delay/--max-rps`,
    `--safe-mode`, dan `--i-have-authorization` **sudah selesai** di PR
-   `feat/scan-throttle-safe-mode` (detail di
-   [docs/scan-engine.md](scan-engine.md)); `--proxy/--proxy-file`,
-   `--scope-file`, dan `-l targets.txt` masih terbuka.
+   `feat/scan-throttle-safe-mode`, lalu `--proxy/--proxy-file` **sudah selesai**
+   di PR `feat/proxy-rotation` (detail di
+   [docs/scan-engine.md](scan-engine.md)); `--scope-file`, `-l targets.txt`,
+   resume/state, dan client certificate masih terbuka.
 4. ~~**P0 akurasi**: perbaiki heuristik SSRF in-band dan perluas cakupan
    XSS/LFI (bagian 4).~~ **Sudah selesai** di `feat/module-detection-quality`;
    integrasi binary eksternal tetap tidak ditambahkan.

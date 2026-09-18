@@ -14,6 +14,7 @@ import socket
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict
@@ -808,3 +809,116 @@ def oob_collector():
     httpd.shutdown()
     httpd.server_close()
     thread.join(timeout=5)
+
+# ══════════════════════════════════════════════════════════════════
+# Proxy uji: forward proxy HTTP lokal untuk test rotasi proxy
+# ══════════════════════════════════════════════════════════════════
+
+class _ProxyApp:
+    """State proxy uji: catat request yang lewat, atau simulasikan blokir."""
+
+    def __init__(self, block_status=None):
+        self.requests = []
+        self.block_status = block_status
+        self._lock = threading.Lock()
+
+    def record(self, method, path, headers):
+        with self._lock:
+            self.requests.append({"method": method, "path": path, "headers": headers,
+                                  "t": time.monotonic()})
+
+    def targets(self):
+        """Path asli (bukan bentuk absolut) dari tiap request yang lewat proxy ini."""
+        return [urlparse(r["path"]).path for r in self.requests]
+
+    def headers_for(self, path):
+        for req in self.requests:
+            if urlparse(req["path"]).path == path:
+                return {k.lower(): v for k, v in req["headers"].items()}
+        return {}
+
+class _ProxyHandler(BaseHTTPRequestHandler):
+    """Forward proxy HTTP minimal (absolute-form) — hanya untuk test.
+
+    Request diteruskan ke origin memakai urllib, jadi test bisa membuktikan
+    scanner benar-benar keluar lewat proxy (bukan langsung ke fixture) sekaligus
+    melihat request apa saja yang dikirim. Hanya melayani `http` (tanpa CONNECT),
+    cukup untuk fixture lokal. `block_status` mensimulasikan IP yang diblokir WAF.
+    """
+
+    protocol_version = "HTTP/1.1"
+    server_version = "spade-test-proxy"
+    sys_version = ""
+
+    _HOP_HEADERS = frozenset({"proxy-connection", "proxy-authorization", "connection",
+                              "host", "content-length", "accept-encoding", "transfer-encoding"})
+
+    def _forward(self):
+        app = self.server.app
+        app.record(self.command, self.path, dict(self.headers))
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else None
+        if app.block_status:
+            return self._reply(app.block_status, b"blocked by test proxy", "text/plain")
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in self._HOP_HEADERS}
+        request = urllib.request.Request(self.path, data=body, headers=headers, method=self.command)
+        try:
+            with urllib.request.urlopen(request, timeout=10) as resp:
+                return self._reply(resp.status, resp.read(),
+                                   resp.headers.get("Content-Type", "text/html"))
+        except urllib.error.HTTPError as exc:
+            return self._reply(exc.code, exc.read(),
+                               exc.headers.get("Content-Type", "text/html"))
+        except Exception as exc:
+            return self._reply(502, f"proxy error: {exc}".encode(), "text/plain")
+
+    def _reply(self, status, body, ctype):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    do_GET = do_POST = do_HEAD = do_OPTIONS = do_PUT = do_DELETE = _forward
+
+    def log_message(self, *args):
+        pass
+
+class ProxyServer:
+    """Satu proxy uji = satu 'IP' yang bisa dirotasi."""
+
+    def __init__(self, block_status=None):
+        self.app = _ProxyApp(block_status=block_status)
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _ProxyHandler)
+        self.httpd.app = self.app
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+
+    @property
+    def url(self):
+        host, port = self.httpd.server_address[0], self.httpd.server_address[1]
+        return f"http://{host}:{port}"
+
+    def start(self):
+        self.thread.start()
+        return self
+
+    def stop(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=5)
+
+@pytest.fixture
+def proxy_pair():
+    """Dua proxy lokal sehat (proxy A + proxy B) untuk test rotasi round-robin."""
+    first, second = ProxyServer().start(), ProxyServer().start()
+    yield first, second
+    first.stop()
+    second.stop()
+
+@pytest.fixture
+def blocked_proxy():
+    """Proxy yang selalu membalas 403 supaya perilaku skip-on-block bisa diuji."""
+    server = ProxyServer(block_status=403).start()
+    yield server
+    server.stop()

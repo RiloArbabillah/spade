@@ -1,8 +1,9 @@
-# Mesin Scan / Operasional — Throttle, Safe-Mode, Impor Sesi
+# Mesin Scan / Operasional — Throttle, Safe-Mode, Impor Sesi, Rotasi Proxy
 
-Dokumen ini menjelaskan tiga kontrol operasional yang menempel di **satu funnel
+Dokumen ini menjelaskan empat kontrol operasional yang menempel di **satu funnel
 request** (`ThreadLocalSession.request()` + `raw_http_probe()`): penjadwal laju
-request, safe-mode beserta gerbang otorisasi, dan impor sesi dari file JSON.
+request, safe-mode beserta gerbang otorisasi, impor sesi dari file JSON, dan
+rotasi proxy keluar.
 
 Semua kontrol dijalankan **sebelum request pertama dikirim**. Pelanggaran
 kombinasi flag berhenti dengan exit code `2` tanpa menyentuh target.
@@ -151,20 +152,100 @@ terminal hanya menampilkan nama header yang dipakai lewat
 `_redact_auth_headers()`. Test regresi memastikan nilai cookie sesi tidak
 muncul di keluaran.
 
+## 4. Rotasi proxy (`--proxy`, `--proxy-file`, `--proxy-cooldown`)
+
+| Flag | Default | Efek |
+|---|---|---|
+| `--proxy URL` | – | Proxy keluar. Boleh diulang: setiap pengulangan menambah satu IP ke rotasi. |
+| `--proxy-file FILE` | – | Daftar proxy dari file teks (satu URL per baris, `#` = komentar). Tidak bisa digabung dengan `--proxy` → exit 2. |
+| `--proxy-cooldown SEC` | `60` | Lama proxy diistirahatkan setelah target membalas 403/429/503. `0` = langsung dipakai lagi. |
+
+Skema yang didukung: `http`, `https`, `socks5`, `socks5h`. Skema wajib ditulis
+eksplisit (tanpa skema, libcurl menebak dan hasilnya ambigu) dan semuanya
+divalidasi **sebelum request pertama**; URL yang tidak layak berhenti dengan
+exit code `2`. `socks5h` menyelesaikan DNS di sisi proxy, sehingga nama target
+tidak terlihat dari jaringan tester.
+
+```
+http://127.0.0.1:8080
+socks5h://user:pass@proxy.example.com:1080
+# baris komentar diabaikan
+```
+
+### Cara kerja
+
+`ProxyPool` adalah satu instance bersama seluruh worker:
+
+1. Setiap request di `ThreadLocalSession.request()` meminta proxy berikutnya
+   lewat `next_request_proxy()`, lalu mengirimnya sebagai parameter `proxy=`
+   milik `curl_cffi`. Recon, crawl, dan semua modul vuln lewat funnel yang sama,
+   jadi tidak ada jalur request yang tetap memakai IP tester.
+2. Pemilihan proxy **round-robin**. Kalau responsnya 403/429/503, proxy itu
+   diistirahatkan `--proxy-cooldown` detik (`mark_proxy_blocked()`) dan request
+   berikutnya otomatis pindah ke proxy lain — inilah *skip-on-block*.
+3. Kalau **semua** proxy sedang istirahat, proxy dengan waktu pulih tercepat
+   dipakai lagi supaya scan tidak berhenti total (lebih baik lambat daripada
+   mati di tengah jalan).
+4. Saat rotasi aktif, pembacaan proxy dari variabel lingkungan
+   (`http_proxy`/`https_proxy`) dimatikan (`trust_env=False`) supaya proxy
+   eksplisit tidak tercampur proxy sistem tester.
+
+### Yang tidak lewat proxy
+
+- **Request smuggling** dikirim lewat socket mentah (bukan `curl_cffi`), jadi
+  tidak bisa mengikuti rotasi. Modulnya **dilewati** dengan catatan di log
+  supaya IP tester tidak bocor justru saat sedang disembunyikan.
+- **Port scan** (`--port-scan`) memakai TCP connect langsung ke target. Ini
+  memang perilaku aslinya dan tetap dicatat di banner saat proxy aktif.
+
+### Redaksi
+
+URL proxy bisa memuat kredensial (`user:pass@host`). Yang pernah muncul di
+keluaran hanya `_redact_proxy_url()` (password → `***`) untuk pesan error, dan
+`describe()` untuk metadata — yang isinya hanya jumlah, sumber, dan cooldown.
+Banner menampilkan jumlah proxy, bukan URL-nya. Test regresi memastikan
+password proxy tidak muncul di stdout, HTML, maupun JSON.
+
+### Metadata laporan
+
+```json
+"proxy": {"enabled": true, "count": 2, "source": "--proxy-file", "cooldown": 60.0}
+```
+
+### API publik
+
+- `parse_proxy_url(raw)` / `load_proxy_file(path)` — normalisasi + validasi
+  (keduanya melempar `ValueError` yang siap diteruskan ke `parser.error`).
+- `ProxyPool(proxies=(), cooldown=DEFAULT_PROXY_COOLDOWN, source="")` dengan
+  `enabled`, `count`, `describe()`, `next_proxy()`, `mark_blocked(url)`.
+- `set_request_proxies(pool)` — pasang/lepas pool global
+  (`set_request_proxies(None)` di akhir `main()`).
+- `proxy_rotation_enabled()` / `next_request_proxy()` / `mark_proxy_blocked(url)`
+  — no-op saat rotasi tidak aktif.
+
 ## Verifikasi
 
 ```bash
-.venv/bin/pytest -q tests/test_scan_engine.py   # unit + CLI end-to-end throttle/safe-mode/sesi
+.venv/bin/pytest -q tests/test_scan_engine.py    # unit + CLI end-to-end throttle/safe-mode/sesi
+.venv/bin/pytest -q tests/test_proxy_rotation.py # unit + CLI end-to-end rotasi proxy (proxy lokal asli)
 .venv/bin/pytest -q                             # seluruh suite (fixture lokal, tanpa internet)
 .venv/bin/ruff check .                          # lint
 ```
 
+Test rotasi proxy memakai forward proxy HTTP lokal di `tests/conftest.py`
+(`ProxyServer`), bukan mock: request scanner benar-benar dikirim ke proxy lalu
+diteruskan ke fixture target, sehingga round-robin dan *skip-on-block* terbukti
+pada jalur HTTP nyata.
+
 ## Batasan / yang ditunda
 
-- Rotasi IP/proxy (`--proxy`/`--proxy-file`) belum ada — lihat
-  [bug-bounty-gaps.md](bug-bounty-gaps.md) bagian 5.
 - Resume/checkpoint (`--state`/`--resume`) dan client certificate
   (`--cert`/`--key`) belum ada.
+- Rotasi proxy mengubah IP keluar, bukan fingerprint TLS/header: setiap proxy
+  tetap memakai profil impersonation yang sama. Untuk target `https://`, proxy
+  `http`/`socks5` hanya membuat tunnel (CONNECT) sehingga header origin utuh;
+  untuk target `http://`, proxy HTTP mengakhiri koneksi dan sebagian header
+  (mis. `Server`/`Via`) bisa berasal dari proxy, bukan target.
 - `--delay`/`--max-rps` membatasi **laju**, bukan pola request manusiawi
   (tidak ada `Referer` realistis antar halaman atau pemuatan aset statis).
 - Gunakan hanya pada aset yang Anda miliki atau yang secara eksplisit masuk
