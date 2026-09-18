@@ -9,7 +9,7 @@ Automated web vulnerability scanner dengan 4 mode + mode interaktif. Detect SQLi
 ## Cara Pakai
 
 ```bash
-python3 spade.py                          # INTERAKTIF — minta domain & mode
+python3 spade.py                          # INTERAKTIF — minta domain & mode, lalu semua opsi flag dengan nilai default
 python3 spade.py https://target.com       # STANDARD (19 modul)
 python3 spade.py https://target.com --quick   # QUICK (7 modul, basic)
 python3 spade.py https://target.com --detailed # DETAILED (32 modul, full)
@@ -27,7 +27,7 @@ python3 spade.py example.com
 
 | Opsi | Fungsi |
 |---|---|
-| Tanpa argumen | Mode interaktif — minta target & pilih mode |
+| Tanpa argumen | Mode interaktif — minta target, pilih mode, lalu tampilkan **semua opsi flag beserta nilai default** (`--workers`, `--delay`, `--proxy`, `--cookie`, `--safe-mode`, dst.). Enter = pakai default dan langsung scan; ketik nomor opsi untuk mengubahnya |
 | `--quick` | Mode cepat (7 modul, no crawl) |
 | `--detailed` | Mode lengkap (32 modul, crawl depth 2, recon, parameter discovery, JWT, OOB) |
 | `-o file.html` | Output HTML report |
@@ -233,7 +233,8 @@ Detail HTTP layer ada di [docs/http-layer.md](docs/http-layer.md), model
 temuan/bukti/laporan ada di [docs/findings-model.md](docs/findings-model.md),
 tahap recon ada di [docs/recon.md](docs/recon.md), dan rincian kelas kerentanan
 ada di [docs/vuln-classes.md](docs/vuln-classes.md). Kontrol operasional
-(throttle, safe-mode, impor sesi, rotasi proxy, resume, mTLS) ada di
+(throttle, safe-mode, impor sesi, rotasi proxy, resume, mTLS, dan mode
+interaktif dengan pengaturan lanjutan) ada di
 [docs/scan-engine.md](docs/scan-engine.md).
 
 **Catatan recon:** tahap recon di mode DETAILED mengirim **nama target** ke API
@@ -252,8 +253,9 @@ python3 tools/oob_collector.py --help  # collector OOB (stdlib, tanpa dependency
 ```
 
 Test memakai fixture server lokal di `tests/conftest.py` (tanpa jaringan
-eksternal): 399 test mencakup 32 modul, flag CLI, recon, mesin scan
-(throttle/safe-mode/sesi/rotasi proxy/resume/mTLS), dan generator laporan.
+eksternal): 424 test mencakup 32 modul, flag CLI, recon, mesin scan
+(throttle/safe-mode/sesi/rotasi proxy/resume/mTLS), mode interaktif (menu
+pengaturan lanjutan), dan generator laporan.
 
 ## Catatan
 

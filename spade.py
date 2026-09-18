@@ -5698,9 +5698,324 @@ DETAILED_ONLY = {"xxe","ssti","nosqli","graphql","js","jwt","recon","subdomains"
 STANDARD_MODULES = [k for k in ALL_MODULES if k not in DETAILED_ONLY]
 
 
-def main(argv=None):
-    """Entry point CLI. argv=None berarti pakai sys.argv (dipakai test dengan list eksplisit)."""
-    global DISABLE_COLOR, REDACT_ENABLED
+# ══════════════════════════════════════════════════════════════════
+#  MODE INTERAKTIF — PENGATURAN LANJUTAN
+# ══════════════════════════════════════════════════════════════════
+# Opsi di bawah ini hanya bisa diaktifkan lewat flag CLI. Tanpa argumen, pengguna
+# tidak pernah tahu fitur itu ada, jadi semuanya ditampilkan di mode interaktif
+# bersama nilai default yang akan dipakai scan.
+#
+# Registry ini satu sumber kebenaran untuk daftar tersebut. Setiap entri:
+#   attr    : nama atribut argparse (dest) yang diubah
+#   flag    : nama flag CLI-nya (ditampilkan supaya bisa dipakai non-interaktif)
+#   label   : teks yang ditampilkan ke pengguna
+#   group   : judul kelompok di daftar
+#   kind    : cara membaca input — "int" | "float" | "bool" | "text" | "list" | "profile"
+#   hint    : catatan singkat di belakang nilai
+#   invert  : True kalau nilai True pada attr berarti fiturnya MATI (mis. --no-recon)
+#   minimum : batas bawah nilai angka
+#   maximum : batas atas nilai angka
+#   show    : callable(args, host) -> str untuk nilai yang butuh format khusus
+#   secret  : True kalau nilainya tidak boleh ditampilkan (cookie/token/header)
+#
+# Yang sengaja TIDAK dimasukkan: `--quick`/`--detailed`/`--recon-only` (sudah
+# menjadi prompt mode), `--no-color` (harus di-set sejak awal karena memengaruhi
+# tampilan menu ini sendiri), `--no-impersonate` (sudah tercakup opsi
+# `--impersonate` dengan nilai '-'), dan `--i-have-authorization` (digantikan
+# prompt konfirmasi otorisasi yang memang hanya muncul di terminal interaktif).
+INTERACTIVE_OPTIONS = (
+    {"attr": "workers", "flag": "--workers", "label": "Workers", "group": "Kecepatan & stealth",
+     "kind": "int", "hint": "request paralel, 1 = sekuensial", "minimum": 1},
+    {"attr": "impersonate", "flag": "--impersonate", "label": "Impersonation", "group": "Kecepatan & stealth",
+     "kind": "profile", "hint": "'-' = tanpa impersonation"},
+    {"attr": "delay", "flag": "--delay", "label": "Delay", "group": "Kecepatan & stealth",
+     "kind": "float", "hint": "detik antar request, 0 = tanpa jeda", "minimum": 0},
+    {"attr": "max_rps", "flag": "--max-rps", "label": "Max req/detik", "group": "Kecepatan & stealth",
+     "kind": "float", "hint": "0 = tanpa batas laju", "minimum": 0},
+    {"attr": "jitter", "flag": "--jitter", "label": "Jitter", "group": "Kecepatan & stealth",
+     "kind": "float", "hint": "persen pengacakan jeda", "minimum": 0, "maximum": 100},
+    {"attr": "backoff_max", "flag": "--backoff-max", "label": "Backoff max", "group": "Kecepatan & stealth",
+     "kind": "float", "hint": "detik cooldown saat target membalas 429/503", "minimum": 0},
+    {"attr": "proxy", "flag": "--proxy", "label": "Proxy", "group": "Kecepatan & stealth",
+     "kind": "list", "hint": "boleh diulang, '-' = kosongkan"},
+    {"attr": "proxy_file", "flag": "--proxy-file", "label": "Proxy file", "group": "Kecepatan & stealth",
+     "kind": "text", "hint": "satu URL proxy per baris"},
+    {"attr": "proxy_cooldown", "flag": "--proxy-cooldown", "label": "Proxy cooldown", "group": "Kecepatan & stealth",
+     "kind": "float", "hint": "detik istirahat proxy yang diblokir", "minimum": 0},
+
+    {"attr": "cookie", "secret": True, "flag": "--cookie", "label": "Cookie", "group": "Sesi & autentikasi",
+     "kind": "list", "hint": "format N=V;M=X, boleh diulang"},
+    {"attr": "header", "secret": True, "flag": "-H/--header", "label": "Header tambahan", "group": "Sesi & autentikasi",
+     "kind": "list", "hint": "format 'Nama: nilai', boleh diulang"},
+    {"attr": "bearer", "secret": True, "flag": "--bearer", "label": "Bearer token", "group": "Sesi & autentikasi",
+     "kind": "text", "hint": "isi header Authorization"},
+    {"attr": "session", "flag": "--session", "label": "Session file", "group": "Sesi & autentikasi",
+     "kind": "text", "hint": "file JSON berisi cookie/header"},
+    {"attr": "jwt_secrets", "flag": "--jwt-secrets", "label": "JWT secrets", "group": "Sesi & autentikasi",
+     "kind": "text", "hint": "file daftar secret HMAC (satu per baris)"},
+
+    {"attr": "no_recon", "flag": "--no-recon", "label": "Recon", "group": "Cakupan uji", "invert": True,
+     "kind": "bool", "hint": "subdomain, URL historis, endpoint JS; 'mati' = --no-recon"},
+    {"attr": "crawl_depth", "flag": "--crawl-depth", "label": "Crawl depth", "group": "Cakupan uji",
+     "kind": "int", "hint": "kedalaman crawl (mode detailed)", "minimum": 1},
+    {"attr": "crawl_max", "flag": "--crawl-max", "label": "Crawl max", "group": "Cakupan uji",
+     "kind": "int", "hint": "maksimal halaman di-crawl", "minimum": 1},
+    {"attr": "port_scan", "flag": "--port-scan", "label": "Port scan", "group": "Cakupan uji",
+     "kind": "bool", "hint": "TCP connect ke port umum (butuh detailed)"},
+    {"attr": "safe_mode", "flag": "--safe-mode", "label": "Safe-mode", "group": "Cakupan uji",
+     "kind": "bool", "hint": "blokir semua uji yang mengubah state"},
+    {"attr": "skip_ssl", "flag": "--skip-ssl", "label": "Skip SSL verify", "group": "Cakupan uji",
+     "kind": "bool", "hint": "lewati verifikasi sertifikat server"},
+
+    {"attr": "active_writes", "flag": "--active-writes", "label": "Active writes", "group": "Uji destruktif (butuh otorisasi)",
+     "kind": "bool", "hint": "modul CSRF mengirim POST ke target"},
+    {"attr": "timing_probes", "flag": "--timing-probes", "label": "Timing probes", "group": "Uji destruktif (butuh otorisasi)",
+     "kind": "bool", "hint": "probe SQLi/CMDi menunda respons 3 detik"},
+    {"attr": "check_smuggling", "flag": "--check-smuggling", "label": "Check smuggling", "group": "Uji destruktif (butuh otorisasi)",
+     "kind": "bool", "hint": "socket mentah CL.TE/TE.CL"},
+
+    {"attr": "oob_host", "flag": "--oob-host", "label": "OOB host", "group": "Target khusus",
+     "kind": "text", "hint": "collector blind SSRF/XXE/CMDi"},
+    {"attr": "cert", "flag": "--cert", "label": "Client cert", "group": "Target khusus",
+     "kind": "text", "hint": "PEM untuk target mTLS"},
+    {"attr": "key", "flag": "--key", "label": "Client key", "group": "Target khusus",
+     "kind": "text", "hint": "PEM pasangan client cert"},
+
+    {"attr": "state", "flag": "--state", "label": "State file", "group": "Checkpoint",
+     "kind": "text", "hint": "checkpoint tiap modul selesai"},
+    {"attr": "resume", "flag": "--resume", "label": "Resume file", "group": "Checkpoint",
+     "kind": "text", "hint": "lanjutkan scan yang terputus"},
+
+    {"attr": "output", "flag": "-o/--output", "label": "Laporan HTML", "group": "Laporan", "kind": "text",
+     "hint": "kosong = nama otomatis",
+     "show": lambda args, host: args.output or (f"spade_{host}.html" if host else "spade_<host>.html")},
+    {"attr": "json", "flag": "--json", "label": "Export JSON", "group": "Laporan", "kind": "text"},
+    {"attr": "csv", "flag": "--csv", "label": "Export CSV", "group": "Laporan", "kind": "text"},
+    {"attr": "sarif", "flag": "--sarif", "label": "Export SARIF", "group": "Laporan", "kind": "text"},
+    {"attr": "no_redact", "flag": "--no-redact", "label": "Redaksi rahasia", "group": "Laporan", "invert": True,
+     "kind": "bool", "hint": "sensor cookie/token di laporan; 'mati' = --no-redact"},
+)
+
+# Kata yang diterima untuk opsi boolean.
+_OPTION_TRUTHY = frozenset(("y", "ya", "yes", "true", "1", "on", "aktif"))
+_OPTION_FALSY = frozenset(("n", "tidak", "no", "false", "0", "off", "mati"))
+# Nilai yang dipakai untuk mengosongkan opsi teks/daftar.
+_OPTION_CLEAR = "-"
+
+
+def _interactive_option_text(option, args, host=""):
+    """Teks nilai satu opsi untuk daftar pengaturan lanjutan."""
+    show = option.get("show")
+    if show is not None:
+        return show(args, host)
+    value = getattr(args, option["attr"], None)
+    kind = option["kind"]
+    if option.get("secret"):
+        # Cookie/token/header tidak pernah ditampilkan — terminal bisa ikut
+        # tersimpan di log atau scrollback.
+        if kind == "list":
+            return f"*** ({len(value)} item)" if value else "(kosong)"
+        return "***" if value else "(kosong)"
+    if kind == "bool":
+        # `invert` dipakai untuk flag negatif (--no-recon/--no-redact) supaya
+        # yang tampil adalah keadaan fiturnya, bukan nama flag-nya.
+        aktif = (not value) if option.get("invert") else bool(value)
+        return "aktif" if aktif else "mati"
+    if kind == "list":
+        return ", ".join(value) if value else "(kosong)"
+    if kind == "profile":
+        return value or "tanpa impersonation"
+    if kind == "int":
+        return str(value)
+    if kind == "float":
+        return f"{value:g}"
+    return value or "(kosong)"
+
+
+def _print_interactive_options(args, host=""):
+    """Cetak semua opsi flag-only beserta nilai yang akan dipakai scan."""
+    group = None
+    for index, option in enumerate(INTERACTIVE_OPTIONS, start=1):
+        if option["group"] != group:
+            group = option["group"]
+            print(f"\n    {c('bold', group)}")
+        label = f"[{index:>2}] {option['label']}"
+        line = f"      {label:<26}{_interactive_option_text(option, args, host)}"
+        note = option["flag"] + (f" · {option['hint']}" if option.get("hint") else "")
+        line += f"  {c('dim', '(' + note + ')')}"
+        print(line)
+
+
+def _parse_option_numbers(raw):
+    """Ubah input '1, 3 5' menjadi daftar nomor opsi yang valid."""
+    total = len(INTERACTIVE_OPTIONS)
+    numbers = []
+    for token in re.split(r"[,\s]+", raw.strip()):
+        if not token:
+            continue
+        if not token.isdigit() or not 1 <= int(token) <= total:
+            raise ValueError(f"'{token}' bukan nomor opsi yang valid — pakai angka 1-{total}")
+        number = int(token)
+        if number not in numbers:
+            numbers.append(number)
+    return numbers
+
+
+def _parse_option_number(raw, option):
+    """Baca satu nilai angka dan tegakkan batas minimum/maximum opsi."""
+    caster = int if option["kind"] == "int" else float
+    try:
+        value = caster(raw.strip())
+    except ValueError:
+        raise ValueError(f"'{raw}' bukan angka") from None
+    minimum = option.get("minimum")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"nilai minimum {minimum:g}")
+    maximum = option.get("maximum")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"nilai maksimum {maximum:g}")
+    return value
+
+
+def _apply_option_value(option, args, raw):
+    """Terapkan satu nilai mentah dari pengguna ke `args`.
+
+    Nilai yang tidak masuk akal ditolak dengan ValueError supaya pemanggil bisa
+    menanyakan ulang. Validasi akhir tetap dikerjakan jalur flag CLI yang sama,
+    jadi tidak ada aturan yang cuma hidup di mode interaktif.
+    """
+    attr = option["attr"]
+    kind = option["kind"]
+    if kind == "bool":
+        token = raw.strip().lower()
+        if token in _OPTION_TRUTHY:
+            value = True
+        elif token in _OPTION_FALSY:
+            value = False
+        else:
+            raise ValueError(f"jawab 'aktif' atau 'mati' (kamu menulis '{raw}')")
+        if option.get("invert"):
+            value = not value
+        changed = getattr(args, attr) != value
+        setattr(args, attr, value)
+        return changed
+    if kind == "list":
+        items = getattr(args, attr)
+        if raw.strip() == _OPTION_CLEAR:
+            if not items:
+                return False
+            del items[:]
+            return True
+        if raw in items:
+            return False
+        items.append(raw)
+        return True
+    if kind == "profile":
+        text = raw.strip()
+        if text.lower() in ("none", "tanpa", "off", "mati", _OPTION_CLEAR):
+            args.impersonate = ""
+            args.no_impersonate = True
+            return True
+        profiles = supported_impersonate_profiles()
+        if text not in profiles:
+            raise ValueError(f"profil '{text}' tidak dikenal. Contoh yang valid: "
+                             f"chrome146, safari184, firefox147 (total {len(profiles)} profil)")
+        changed = args.impersonate != text or args.no_impersonate
+        args.impersonate = text
+        args.no_impersonate = False
+        return changed
+    if kind in ("int", "float"):
+        value = _parse_option_number(raw, option)
+    else:  # text
+        value = "" if raw.strip() == _OPTION_CLEAR else raw
+    changed = getattr(args, attr) != value
+    setattr(args, attr, value)
+    return changed
+
+
+def _interactive_conflicts(args):
+    """Konflik flag yang akan berakhir exit 2 di validasi.
+
+    Dicek di dalam prompt supaya pengguna tidak kehilangan semua isian hanya
+    karena satu kombinasi salah.
+    """
+    problems = []
+    if args.safe_mode:
+        for label, attr, why in DESTRUCTIVE_FLAGS:
+            if getattr(args, attr):
+                problems.append(f"--safe-mode tidak bisa digabung dengan {label} ({why})")
+    if args.proxy and args.proxy_file:
+        problems.append("--proxy dan --proxy-file tidak bisa dipakai bersamaan")
+    if args.port_scan and not (args.detailed or args.recon_only):
+        problems.append("Port scan butuh mode detailed — pilih mode [3] atau [4]")
+    return problems
+
+
+def _edit_interactive_option(option, args, host=""):
+    """Tanya satu nilai baru untuk opsi. True kalau nilainya berubah."""
+    index = INTERACTIVE_OPTIONS.index(option) + 1
+    while True:
+        current = _interactive_option_text(option, args, host)
+        raw = input(f"    [{index:>2}] {option['label']} [{current}] "
+                    f"(Enter = batal, '{_OPTION_CLEAR}' = kosongkan): ").strip()
+        if not raw:
+            return False
+        try:
+            changed = _apply_option_value(option, args, raw)
+        except ValueError as exc:
+            warn(f"{option['label']}: {exc}")
+            continue
+        print(f"    [{index:>2}] {option['label']} -> {_interactive_option_text(option, args, host)}")
+        return changed
+
+
+def _prompt_advanced_options(args, host=""):
+    """Tampilkan opsi flag-only dengan nilai default dan biarkan diubah.
+
+    Enter langsung berarti "pakai semua default lalu mulai scan", jadi jalur
+    cepat (target -> mode -> Enter) tetap sama seperti sebelumnya.
+    Return False kalau input berakhir (EOF) supaya pemanggil bisa keluar bersih.
+    """
+    changed = OrderedDict()
+    print()
+    print(f"  {c('bold','Pengaturan lanjutan')} — fitur yang hanya bisa diaktifkan lewat flag CLI.")
+    print("  Nilai default sudah terisi; tekan Enter untuk langsung mulai scan.")
+    _print_interactive_options(args, host)
+    while True:
+        try:
+            raw = input(f"\n  [>] Nomor yang mau diubah (1-{len(INTERACTIVE_OPTIONS)}), "
+                        "'l' = lihat daftar, Enter = mulai scan: ").strip()
+            if raw.lower() in ("l", "list", "?"):
+                _print_interactive_options(args, host)
+                continue
+            if not raw:
+                problems = _interactive_conflicts(args)
+                if problems:
+                    print()
+                    for problem in problems:
+                        warn(problem)
+                    print("  Perbaiki dulu pengaturannya.")
+                    continue
+                if changed:
+                    print()
+                    info("Pengaturan diubah: " + ", ".join(changed.values()))
+                return True
+            for number in _parse_option_numbers(raw):
+                option = INTERACTIVE_OPTIONS[number - 1]
+                if _edit_interactive_option(option, args, host):
+                    changed[option["attr"]] = f"{option['label']}={_interactive_option_text(option, args, host)}"
+        except EOFError:
+            return False
+        except ValueError as exc:
+            warn(str(exc))
+
+
+def build_parser():
+    """Bangun parser CLI.
+
+    Dipisah dari `main()` supaya daftar flag bisa diperiksa (dan diuji) tanpa
+    menjalankan scan — registry mode interaktif harus selalu sinkron dengannya.
+    """
     parser = argparse.ArgumentParser(
         description="spade — Automated Web Vulnerability Scanner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -5794,7 +6109,61 @@ def main(argv=None):
                         help="Hanya jalankan recon (subdomain, URL historis, endpoint JS) tanpa modul vuln")
     parser.add_argument("--no-recon", action="store_true",
                         help="Lewati tahap recon di mode detailed (nama target tidak dikirim ke crt.sh/Wayback)")
+    return parser
+
+
+def main(argv=None):
+    """Entry point CLI. argv=None berarti pakai sys.argv (dipakai test dengan list eksplisit)."""
+    global DISABLE_COLOR, REDACT_ENABLED
+    parser = build_parser()
     args = parser.parse_args(argv)
+    # `--no-color` diproses sebelum apa pun dicetak supaya banner mode interaktif
+    # di bawah juga ikut tanpa warna.
+    if args.no_color: DISABLE_COLOR = True
+    # ── Mode interaktif: target, mode, lalu pengaturan lanjutan ──
+    # Blok ini sengaja jalan SEBELUM validasi supaya nilai yang diisi di sini
+    # melewati jalur validasi yang sama dengan flag CLI, bukan cek terpisah.
+    if not args.target:
+        print()
+        print(f"    {c('bold',c('cyan','+===========[ SPADE ]===========+'))}")
+        print(f"    {c('bold',c('cyan','|'))}  {c('bold','Web Vuln Scanner')}     {c('bold',c('cyan','|'))}")
+        print(f"    {c('bold',c('cyan','+==============================+'))}")
+        try:
+            inp = input("\n  [>] Masukkan domain/URL target: ").strip()
+            while not inp:
+                inp = input("  [>] Target tidak boleh kosong: ").strip()
+        except EOFError:
+            print("\n  [!] Tidak ada input target (EOF). Keluar.", file=sys.stderr)
+            return 2
+        args.target = inp
+        print()
+        print("  Pilih mode scan:")
+        print("    [1] Quick     — 7 modul, basic checks (cepat)")
+        print("    [2] Standard  — 19 modul, recommended (default)")
+        print("    [3] Detailed  — 32 modul, full scan dengan crawl + recon + subdomain")
+        print("    [4] Recon     — enumerasi subdomain/URL historis/JS/port saja")
+        mode_ch = input("  [>] Pilih [1/2/3/4] (default: 2): ").strip()
+        while mode_ch and mode_ch not in ("1","2","3","4"):
+            mode_ch = input("  [>] Pilih 1, 2, 3, atau 4: ").strip()
+        if mode_ch == "1":
+            args.quick = True
+        elif mode_ch == "3":
+            args.detailed = True
+        elif mode_ch == "4":
+            args.recon_only = True
+        # else default (standard)
+        # Nama berkas laporan default butuh host, jadi diturunkan dari target mentah.
+        host_input = host_from_url(normalize_url(args.target)) if args.target else ""
+        if not _prompt_advanced_options(args, host_input):
+            print("\n  [!] Tidak ada input pengaturan (EOF). Keluar.", file=sys.stderr)
+            return 2
+        print()
+
+    if args.no_redact:
+        REDACT_ENABLED = False
+        print()
+        warn("REDACT OFF — cookie/token/password ikut tersimpan di laporan. Jangan bagikan hasil scan ini.")
+
     if args.recon_only and (args.quick or args.detailed):
         parser.error("--recon-only tidak bisa digabung dengan --quick/--detailed")
     if args.recon_only and args.no_recon:
@@ -5863,11 +6232,6 @@ def main(argv=None):
             print()
             err("Konfirmasi otorisasi tidak diberikan — scan dibatalkan sebelum request apa pun.")
             return 2
-    if args.no_color: DISABLE_COLOR = True
-    if args.no_redact:
-        REDACT_ENABLED = False
-        print()
-        warn("REDACT OFF — cookie/token/password ikut tersimpan di laporan. Jangan bagikan hasil scan ini.")
 
     # Validasi profil impersonasi sebelum request apa pun dikirim.
     profiles = supported_impersonate_profiles()
@@ -5921,36 +6285,6 @@ def main(argv=None):
             parser.error(f"--oob-host '{args.oob_host}' bukan alamat yang bisa dihubungi target "
                          f"(butuh host/IP/port, mis. 10.0.0.5:9000 atau collector.example.com)")
 
-    # ── Interactive prompt jika target tidak diberikan ──
-    if not args.target:
-        print()
-        print(f"    {c('bold',c('cyan','+===========[ SPADE ]===========+'))}")
-        print(f"    {c('bold',c('cyan','|'))}  {c('bold','Web Vuln Scanner')}     {c('bold',c('cyan','|'))}")
-        print(f"    {c('bold',c('cyan','+==============================+'))}")
-        try:
-            inp = input("\n  [>] Masukkan domain/URL target: ").strip()
-            while not inp:
-                inp = input("  [>] Target tidak boleh kosong: ").strip()
-        except EOFError:
-            print("\n  [!] Tidak ada input target (EOF). Keluar.", file=sys.stderr)
-            return 2
-        args.target = inp
-        print()
-        print("  Pilih mode scan:")
-        print("    [1] Quick     — 7 modul, basic checks (cepat)")
-        print("    [2] Standard  — 19 modul, recommended (default)")
-        print("    [3] Detailed  — 32 modul, full scan dengan crawl + recon + subdomain")
-        mode_ch = input("  [>] Pilih [1/2/3] (default: 2): ").strip()
-        while mode_ch and mode_ch not in ("1","2","3"):
-            mode_ch = input("  [>] Pilih 1, 2, atau 3: ").strip()
-        if mode_ch == "1":
-            args.quick = True
-        elif mode_ch == "3":
-            args.detailed = True
-        # else default (standard)
-        print()
-
-
     target = normalize_url(args.target)
     host = host_from_url(target)
     # Cookie auth hanya dikirim ke host target (bukan ke API recon pihak ketiga).
@@ -5997,6 +6331,11 @@ def main(argv=None):
     info(f"Target: {c('bold',target)}")
     info(f"Mode  : {mode.upper()}")
     info(f"Bot   : {args.impersonate or 'tanpa impersonation'}")
+    info(f"Workers: {args.workers} request paralel" + ("" if args.workers > 1 else " (sekuensial)"))
+    if mode == "detailed":
+        info(f"Crawl : depth {args.crawl_depth}, maks {args.crawl_max} halaman")
+    if args.no_recon:
+        info("Recon : dilewati (--no-recon) — nama target tidak dikirim ke API pihak ketiga")
     if auth_enabled:
         info(f"Auth  : {_redact_auth_headers(extra_headers)}")
         warn("Scan memakai sesi autentikasi — pastikan akun dan scope sudah diizinkan program.")
