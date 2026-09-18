@@ -55,6 +55,10 @@ python3 spade.py example.com
 | `--proxy URL` | Proxy keluar; boleh diulang untuk rotasi round-robin. Skema: `http`/`https`/`socks5`/`socks5h`. Kredensial di URL tidak pernah ditulis ke laporan |
 | `--proxy-file FILE` | Daftar proxy untuk rotasi (satu URL per baris, `#` = komentar). Bentrok dengan `--proxy` → exit 2 |
 | `--proxy-cooldown SEC` | Istirahatkan proxy selama SEC detik setelah respons 403/429/503 lalu pindah ke proxy lain (default 60s) |
+| `--state FILE` | Tulis checkpoint JSON (atomik, per modul selesai) supaya scan panjang bisa dilanjutkan kalau terputus |
+| `--resume FILE` | Lanjutkan scan dari checkpoint `--state`: modul yang sudah selesai dilewati, temuan lama dimuat ulang. Cakupan berbeda → exit 2 |
+| `--cert FILE` | Client certificate PEM untuk target mTLS (satu berkas boleh memuat cert + key) |
+| `--key FILE` | Private key PEM pasangan `--cert`. Diberikan tanpa `--cert` → exit 2 |
 | `--safe-mode` | Mode aman: tidak mengirim PUT/DELETE, uji tulis, probe timing, atau smuggling. Bentrok dengan flag destruktif → exit 2 |
 | `--i-have-authorization` | Konfirmasi non-interaktif bahwa kamu punya izin tertulis untuk uji destruktif (`--active-writes`/`--timing-probes`/`--check-smuggling`) |
 | `--crawl-depth N` | Kedalaman crawl mode detailed (default 2) |
@@ -84,6 +88,13 @@ python3 spade.py https://example.com --max-rps 5 --safe-mode    # batas laju + t
 python3 spade.py https://example.com --proxy socks5h://user:pass@proxy.example:1080
 python3 spade.py https://example.com --proxy-file proxy.txt --proxy-cooldown 120
 
+# Scan panjang yang bisa dilanjutkan kalau terputus
+python3 spade.py https://example.com --detailed --state state.json
+python3 spade.py https://example.com --detailed --resume state.json   # lanjut dari modul terakhir
+
+# Target di balik mTLS
+python3 spade.py https://example.com --cert klien.pem --key klien.key
+
 # Uji tulis + OOB (hanya di target yang mengizinkan, butuh konfirmasi otorisasi)
 python3 tools/oob_collector.py --host 0.0.0.0 --port 9000 &
 python3 spade.py https://example.com --detailed --active-writes --oob-host 10.0.0.5:9000 --i-have-authorization
@@ -101,7 +112,7 @@ repro selalu jadi `COOKIE_ANDA`.
 |---|---|---|
 | HTML | `-o file.html` (default `spade_<host>.html`) | Tabel temuan + blok `<details>` berisi bukti, metadata (confidence/CVSS/CWE/OWASP), dan dua langkah repro |
 | CSV | `--csv file.csv` | 5 kolom lama + `Confidence`, `CVSS_Score`, `CVSS_Vector`, `CWE`, `OWASP`, `Repro_Curl`, `Evidence_Status`, `Evidence_URL` |
-| JSON | `--json file.json` | `tool`, `target`, `scan` (mode, durasi, worker, `errors`, `redacted`, plus flag audit `auth`/`auth_source`/`safe_mode`/`authorized`/`throttle`/`proxy`/`active_writes`/`check_smuggling`/`oob`), `summary`, dan `findings` lengkap dengan `evidence` + `repro` |
+| JSON | `--json file.json` | `tool`, `target`, `scan` (mode, durasi, worker, `errors`, `redacted`, plus flag audit `auth`/`auth_source`/`safe_mode`/`authorized`/`throttle`/`proxy`/`state`/`resume`/`client_cert`/`active_writes`/`check_smuggling`/`oob`), `summary`, dan `findings` lengkap dengan `evidence` + `repro` |
 | SARIF | `--sarif file.sarif` | SARIF 2.1.0: satu rule per kode temuan + `partialFingerprints` supaya temuan tidak dobel di dashboard |
 
 Metadata per temuan: skor + vector CVSS 3.1, CWE, kategori OWASP Top 10, dan
@@ -206,6 +217,14 @@ recon) melewati pool proxy round-robin, dan proxy yang membalas 403/429/503
 otomatis diistirahatkan lalu ditinggalkan. Modul request smuggling dilewati saat
 rotasi aktif karena payload desync dikirim lewat socket mentah.
 
+Untuk scan panjang (mode DETAILED bisa puluhan menit), tambahkan
+`--state state.json`: checkpoint ditulis atomik setiap modul selesai, lalu
+`--resume state.json` melanjutkan dari modul yang belum jalan. Temuan beserta
+buktinya ikut disimpan, jadi laporan hasil resume tidak kehilangan temuan modul
+sebelumnya. Resume menolak checkpoint dengan cakupan berbeda (mode, target,
+daftar modul, atau flag destruktif berubah) dengan exit 2 sebelum mengirim
+request. Target di balik mTLS diuji dengan `--cert`/`--key`.
+
 Yang belum tersedia: pola request manusiawi (mis. `Referer` antar halaman atau
 pemuatan aset statis). Daftar lengkapnya ada di
 [docs/bug-bounty-gaps.md](docs/bug-bounty-gaps.md).
@@ -214,7 +233,7 @@ Detail HTTP layer ada di [docs/http-layer.md](docs/http-layer.md), model
 temuan/bukti/laporan ada di [docs/findings-model.md](docs/findings-model.md),
 tahap recon ada di [docs/recon.md](docs/recon.md), dan rincian kelas kerentanan
 ada di [docs/vuln-classes.md](docs/vuln-classes.md). Kontrol operasional
-(throttle, safe-mode, impor sesi, rotasi proxy) ada di
+(throttle, safe-mode, impor sesi, rotasi proxy, resume, mTLS) ada di
 [docs/scan-engine.md](docs/scan-engine.md).
 
 **Catatan recon:** tahap recon di mode DETAILED mengirim **nama target** ke API
@@ -233,8 +252,8 @@ python3 tools/oob_collector.py --help  # collector OOB (stdlib, tanpa dependency
 ```
 
 Test memakai fixture server lokal di `tests/conftest.py` (tanpa jaringan
-eksternal): 354 test mencakup 32 modul, flag CLI, recon, mesin scan
-(throttle/safe-mode/sesi/rotasi proxy), dan generator laporan.
+eksternal): 399 test mencakup 32 modul, flag CLI, recon, mesin scan
+(throttle/safe-mode/sesi/rotasi proxy/resume/mTLS), dan generator laporan.
 
 ## Catatan
 
@@ -254,7 +273,8 @@ eksternal): 354 test mencakup 32 modul, flag CLI, recon, mesin scan
   JSON/SARIF), bagian 2 (cakupan kelas kerentanan: IDOR, CSRF, JWT, auth
   bypass, API spec, host header/cache, CRLF, smuggling, blind OOB), dan bagian 3
   (recon: subdomain, URL historis, endpoint JS, host hidup, port scan) sudah
-  selesai.
+  selesai, begitu juga bagian 5 (mesin scan/operasional: throttle, safe-mode,
+  impor sesi, rotasi proxy, resume/checkpoint, client certificate).
 - Detail tahap recon (sumber, batas request, alur data ke crawler dan modul
   injection, privasi) ada di [docs/recon.md](docs/recon.md).
 - Model data temuan ada di [docs/findings-model.md](docs/findings-model.md);
