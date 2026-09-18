@@ -130,6 +130,20 @@ def test_ssrf_flagged_for_url_form_field(sess, ctx):
     assert any(c.startswith("SSRF") for c in codes(findings))
 
 
+def test_ssrf_large_response_alone_is_not_finding(sess, ctx):
+    findings = spade.ssrf_check(sess, ctx["target"], ctx)
+    assert "SSRF" not in codes(findings)
+    assert "SSRF_FORM" not in codes(findings)
+
+
+def test_ssrf_metadata_signature_is_high_confidence(sess, ctx):
+    findings = spade.ssrf_check(sess, ctx["target"], ctx)
+    metadata = [f for f in findings if f[1] == "SSRF_METADATA"]
+    assert metadata
+    assert metadata[0][0] == "HIGH"
+    assert metadata[0].confidence == "firm"
+
+
 def test_rate_limit_detects_429(rate_limited_server):
     spade.set_request_executor(1)
     sess = spade.ThreadLocalSession(timeout=10)
@@ -187,6 +201,113 @@ def test_all_modules_return_lists(ctx):
     for key, (_label, func) in spade.ALL_MODULES.items():
         findings = func(sess, ctx["target"], ctx)
         assert findings is None or isinstance(findings, list), f"modul {key} tidak mengembalikan list"
+
+
+class _BaselineSession:
+    def __init__(self, bodies):
+        self.bodies = list(bodies)
+        self.calls = []
+
+    def get(self, url, **_kwargs):
+        self.calls.append(url)
+
+        class _Response:
+            status_code = 200
+            content = self.bodies.pop(0).encode()
+            headers = {"Content-Type": "text/html"}
+
+        return _Response()
+
+
+def test_baseline_uses_four_similar_probes_for_dynamic_spa():
+    body = "<!DOCTYPE html><html><body><main>app { }</main></body></html>"
+    bodies = [body.replace("{ }", f"nonce-{i}") for i in range(4)]
+    sess = _BaselineSession(bodies)
+    baseline = spade.get_baseline_fingerprint(sess, "http://target.test")
+    assert len(sess.calls) == 4
+    assert baseline and baseline["detected"] == "spa_catchall"
+    assert baseline["similarity"] >= 0.95
+
+
+def test_baseline_rejects_distinct_responses():
+    bodies = [f"completely different page number {i} {i * i}" for i in range(4)]
+    baseline = spade.get_baseline_fingerprint(_BaselineSession(bodies), "http://target.test")
+    assert baseline is None
+
+
+def test_xss_context_parser_rejects_non_executable_reflection():
+    payload = "<script>alert(1)</script>"
+    assert spade.xss_reflection_context("<comment><!-- <script>alert(1)</script> --></comment>", payload) is None
+    assert spade.xss_reflection_context("<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>", payload) is None
+    assert spade.xss_reflection_context("<input value='<script>alert(1)</script>'>", payload) is None
+
+
+def test_xss_context_parser_detects_executable_contexts():
+    payload = '"><svg onload=alert(1)>'
+    assert spade.xss_reflection_context(f'<input value="{payload}">', payload) == "html"
+    assert spade.xss_reflection_context(f"<div>{payload}</div>", payload) == "html"
+    assert spade.xss_reflection_context("<a href='javascript:alert(1)'>x</a>", "javascript:alert(1)") == "url"
+
+
+def test_xss_module_uses_context_oracle(sess, ctx):
+    for path, expected in (("/xss/safe", False), ("/xss/attribute", False), ("/xss/html", True)):
+        target = ctx["target"].rstrip("/") + path
+        findings = spade.scan_xss(sess, target, ctx)
+        found = any("/xss/" in str(f[3]) for f in findings if f[1] == "XSS_REFLECTED")
+        assert found is expected, (path, found)
+
+
+def test_lfi_expanded_oracles(sess, ctx):
+    cases = {
+        "/lfi/windows": "../../Windows/win.ini",
+        "/lfi/environ": "../../proc/self/environ",
+        "/lfi/php": "php://filter/convert.base64-encode/resource=/etc/passwd",
+    }
+    for path, payload in cases.items():
+        findings = spade.lfi_check(sess, ctx["target"].rstrip("/") + path)
+        assert "LFI" in codes(findings), (path, payload, findings)
+
+
+def test_lfi_large_safe_page_is_not_finding(sess):
+    assert spade.lfi_check(sess, "/lfi/safe") == []
+
+
+def test_sqli_boolean_oracle(sess, vuln_server):
+    findings = spade.scan_sqli(sess, vuln_server.base_url.rstrip("/") + "/sqli/boolean")
+    assert "SQLI_BOOLEAN" in codes(findings)
+
+
+def test_sqli_timing_requires_opt_in(sess, vuln_server, monkeypatch):
+    monkeypatch.setattr(spade, "TIMING_MIN_ELAPSED", 0.01)
+    target = vuln_server.base_url.rstrip("/") + "/sqli/time"
+    assert "SQLI_TIME" not in codes(spade.scan_sqli(sess, target))
+    assert "SQLI_TIME" in codes(spade.scan_sqli(sess, target, {"timing_probes": True}))
+
+
+def test_cmdi_echo_oracle(sess, cmd_echo_server):
+    findings = spade.cmd_injection(sess, cmd_echo_server.base_url.rstrip("/") + "/ping")
+    assert "CMD_INJECTION" in codes(findings)
+
+
+def test_cmdi_timing_requires_opt_in(sess, cmd_timing_server, monkeypatch):
+    monkeypatch.setattr(spade, "TIMING_MIN_ELAPSED", 0.01)
+    target = cmd_timing_server.base_url.rstrip("/") + "/ping"
+    assert "CMDI_TIME" not in codes(spade.cmd_injection(sess, target))
+    assert "CMDI_TIME" in codes(spade.cmd_injection(sess, target, {"timing_probes": True}))
+
+
+def test_xxe_detects_passwd_without_bash(sess, xxe_server):
+    findings = spade.scan_xxe(sess, xxe_server.base_url)
+    assert "XXE_DIRECT" in codes(findings)
+
+
+def test_internal_detection_templates_declare_context_and_safety():
+    expected = {"xss", "lfi", "cmdi", "xxe"}
+    assert set(spade.DETECTION_TEMPLATES) == expected
+    for class_name, template in spade.DETECTION_TEMPLATES.items():
+        assert template["payloads"] and template["context"]
+        assert isinstance(template["safe"], bool)
+        assert class_name != "cmdi" or not template["timing_default"]
 
 
 def test_full_standard_scan_against_fixture(vuln_server, tmp_path):

@@ -8,6 +8,7 @@ dibandingkan secara deterministik sebelum/sesudah perubahan.
 import base64
 import hashlib
 import hmac
+import html as htmlmod
 import json
 import socket
 import sys
@@ -40,6 +41,7 @@ ROOT_HTML = """<!DOCTYPE html>
 <a href="/uploads/">Uploads</a>
 <a href="/search">Search</a>
 <script src="/static/app.js"></script>
+<script>const stripeSecret = "sk_test_RESPONSE_SECRET_0123456789";</script>
 <form method="GET" action="/item">
   <input type="text" name="id">
   <button type="submit">Cari</button>
@@ -117,10 +119,34 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send(200, f"<html><body>Hasil: {query.get('q', [''])[0]}</body></html>")
         if path == "/item":
             return self._item(query)
+        if path == "/sqli/postgres" and "'" in query.get("id", [""])[0]:
+            return self._send(500, 'ERROR:  syntax error at or near "spade"')
+        if path == "/sqli/mssql" and "'" in query.get("id", [""])[0]:
+            return self._send(500, "Microsoft OLE DB Provider: Unclosed quotation mark after the character string")
+        if path == "/sqli/sqlite" and "'" in query.get("id", [""])[0]:
+            return self._send(500, 'SQLite3::query(): unrecognized token: 1: near "spade": syntax error')
+        if path == "/sqli/oracle" and "'" in query.get("id", [""])[0]:
+            return self._send(500, "ORA-01756: quoted string not properly terminated")
+        if path == "/sqli/boolean":
+            value = query.get("id", [""])[0]
+            if value == "1":
+                return self._send(200, "RESULT")
+            if "AND 1=1" in value:
+                return self._send(200, "RESULT " + ("DATA" * 80))
+            if "AND 1=2" in value:
+                return self._send(200, "RESULT")
+        if path == "/sqli/time":
+            value = query.get("id", [""])[0]
+            if "SLEEP" in value.upper():
+                time.sleep(0.05)
         if path == "/submit":
+            submitted = parse_qs(self._body(), keep_blank_values=True)
+            fetched = submitted.get("url", [""])[0]
+            if fetched.startswith("http://spade-ssrf.invalid/"):
+                return self._send(200, "SSRF fetched control " + ("B" * 600), "text/plain")
             return self._send(200, f"<html><body>Komentar: {self._body()}</body></html>")
         if path == "/.env":
-            return self._send(200, "APP_NAME=spade\nDB_PASSWORD=fixture-secret\n", "text/plain")
+            return self._send(200, "APP_NAME=spade\nDB_PASSWORD=fixture-secret\nDB_TOKEN=DB_RESPONSE_SECRET_9876543210\n", "text/plain")
         if path == "/admin/":
             return self._send(200, "<html><body><h1>Admin Login</h1><form><input name='username'><input type='password' name='password'></form></body></html>")
         if path == "/robots.txt":
@@ -130,6 +156,26 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/static/app.js":
             return self._send(200, 'const apiKey = "AKIA1234567890ABCDEF";\nfetch("/api/v1/users");\n',
                               "application/javascript")
+        if path == "/xss/safe":
+            return self._send(200, f"<p>{htmlmod.escape(query.get('comment', [''])[0])}</p>")
+        if path == "/xss/attribute":
+            return self._send(200, f"<input value='{query.get('input', [''])[0]}'>")
+        if path == "/xss/html":
+            return self._send(200, f"<div>{query.get('input', [''])[0]}</div>")
+        if path == "/lfi/safe":
+            return self._send(200, "normal page " + ("LFI " * 100), "text/plain")
+        if path == "/lfi/windows":
+            return self._send(200, "; for 16-bit app support\n[fonts]\n[extensions]\n", "text/plain")
+        if path == "/lfi/environ":
+            return self._send(200, "PATH=/usr/local/bin\x00LANG=C.UTF-8\x00PWD=/\x00", "text/plain")
+        if path == "/lfi/php":
+            passwd = b"root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"
+            return self._send(200, base64.b64encode(passwd).decode(), "text/plain")
+        if path == "/proxy":
+            fetched = query.get("url", [""])[0]
+            if "169.254.169.254/latest/meta-data" in fetched:
+                return self._send(200, "ami-id\ninstance-id\nreservation-id\n", "text/plain")
+            return self._send(200, "generic proxy response " + ("A" * 1200), "text/plain")
         if path == "/graphql":
             return self._graphql(query)
         if path == "/flaky":
@@ -259,6 +305,33 @@ class FixtureServer:
         self.thread.join(timeout=5)
 
 
+class _CmdEchoHandler(_Handler):
+    def _handle(self):
+        if urlparse(self.path).path == "/ping":
+            payload = parse_qs(urlparse(self.path).query).get("cmd", [""])[0]
+            if "echo spade-cmd-" in payload:
+                token = payload.split("spade-cmd-", 1)[1].split(" ", 1)[0]
+                return self._send(200, "output SPADE-CMD-" + token)
+        return super()._handle()
+
+
+class _CmdTimingHandler(_Handler):
+    def _handle(self):
+        if urlparse(self.path).path == "/ping":
+            payload = parse_qs(urlparse(self.path).query).get("cmd", [""])[0]
+            if "SLEEP" in payload.upper():
+                time.sleep(0.05)
+        return super()._handle()
+
+
+class _XXEHandler(_Handler):
+    def _handle(self):
+        if urlparse(self.path).path == "/api/xml" and "file:///etc/passwd" in self._body():
+            passwd = "root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"
+            return self._send(200, passwd)
+        return super()._handle()
+
+
 @pytest.fixture
 def vuln_server():
     server = FixtureServer().start()
@@ -269,6 +342,27 @@ def vuln_server():
 @pytest.fixture
 def rate_limited_server():
     server = FixtureServer(rate_limit_after=5).start()
+    yield server
+    server.stop()
+
+
+@pytest.fixture
+def cmd_echo_server():
+    server = FixtureServer(handler=_CmdEchoHandler).start()
+    yield server
+    server.stop()
+
+
+@pytest.fixture
+def cmd_timing_server():
+    server = FixtureServer(handler=_CmdTimingHandler).start()
+    yield server
+    server.stop()
+
+
+@pytest.fixture
+def xxe_server():
+    server = FixtureServer(handler=_XXEHandler).start()
     yield server
     server.stop()
 

