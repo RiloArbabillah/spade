@@ -2,7 +2,18 @@
 
 Automated web vulnerability scanner dengan 4 mode + mode interaktif. Detect SQLi, XSS, LFI, CMDi, SSRF (termasuk blind/OOB), XXE, GraphQL introspection, IDOR/BOLA, CSRF, JWT, auth bypass, host header/cache poisoning, CRLF, request smuggling, open redirect, sensitive files, TLS, CORS, WAF, recon (subdomain/URL historis/JS/port), dan masih banyak lagi.
 
-**File:** `spade.py` (Python 3, dependensi minimal)
+**File:** `spade.py` (Python 3.9+, dependensi runtime hanya `curl_cffi`) · **32 modul** · **39 opsi CLI** · **424 test** · versi `3.1`
+
+> ⚠️ **Hanya untuk pengujian yang sah.** Pakai Spade hanya pada aset milikmu
+> sendiri atau aset yang kamu punya **izin tertulis** untuk diuji (program bug
+> bounty, kontrak pentest, lab pribadi). **Pemilik repo dan kontributor tidak
+> bertanggung jawab atas penyalahgunaan alat ini**, termasuk pemindaian tanpa
+> izin, kerusakan layanan/data, maupun konsekuensi hukum apa pun — tanggung
+> jawab sepenuhnya ada di pengguna. Selengkapnya: [Penafian](#penafian--batas-penggunaan).
+>
+> **Disclaimer (EN):** Use Spade only on assets you own or are explicitly
+> authorized in writing to test. The repository owner and contributors accept
+> **no responsibility or liability** for misuse of this repository or tool.
 
 ---
 
@@ -23,19 +34,47 @@ URL boleh pakai `https://` atau langsung domain:
 python3 spade.py example.com
 ```
 
+### Mode interaktif
+
+Jalankan `python3 spade.py` tanpa argumen. Alurnya: **target → mode → menu
+pengaturan lanjutan → ringkasan → scan**.
+
+| Langkah | Yang terjadi |
+|---|---|
+| 1. Target | Minta domain/URL; input kosong ditanyakan ulang, EOF (bukan terminal) → keluar dengan exit 2 |
+| 2. Mode | `[1] Quick` (7 modul), `[2] Standard` (19 modul, default), `[3] Detailed` (32 modul + crawl + recon), `[4] Recon` (`--recon-only`). Input selain 1–4 ditanyakan ulang (Enter = Standard) |
+| 3. Menu pengaturan lanjutan | 33 opsi dalam 7 kelompok dicetak bersama **nilai default** yang akan dipakai scan, plus nama flag aslinya supaya bisa dipindah ke jalur CLI |
+| 4. Ringkasan | Banner kedua menampilkan Workers, Crawl (mode detailed), dan status recon sebelum request pertama dikirim |
+
+Menjawab menu: **Enter** = pakai semua default dan langsung scan; `1` atau
+`1,3 5` = ubah satu/beberapa opsi; `l` (juga `list`/`?`) = cetak ulang daftar;
+`-` di prompt nilai = kosongkan opsi teks/daftar (cookie, header, proxy, dst.).
+Nilai rahasia (`--cookie`, `-H/--header`, `--bearer`) ditampilkan sebagai `***`
+dan nilainya tetap lewat jalur validasi CLI yang sama. Konflik antar-flag
+(mis. `--proxy` + `--proxy-file`, `--safe-mode` + `--active-writes`) dilaporkan
+di menu, bukan menunggu `exit 2` di akhir. Detail ada di
+[docs/scan-engine.md](docs/scan-engine.md).
+
+Enam opsi CLI tidak muncul di menu karena sudah punya jalur sendiri:
+`--quick`/`--detailed`/`--recon-only` (menjadi prompt mode), `--no-color`
+(diproses sebelum menu dicetak), `--no-impersonate` (setara
+`--impersonate -`), dan `--i-have-authorization` (digantikan prompt konfirmasi
+otorisasi yang hanya muncul di terminal interaktif).
+
 ## Opsi
 
 | Opsi | Fungsi |
 |---|---|
-| Tanpa argumen | Mode interaktif — minta target, pilih mode, lalu tampilkan **semua opsi flag beserta nilai default** (`--workers`, `--delay`, `--proxy`, `--cookie`, `--safe-mode`, dst.). Enter = pakai default dan langsung scan; ketik nomor opsi untuk mengubahnya |
+| Tanpa argumen | Mode interaktif — minta target, pilih mode (`[4] Recon` termasuk), lalu tampilkan **33 opsi flag dalam 7 kelompok beserta nilai default** (`--workers`, `--delay`, `--proxy`, `--cookie`, `--safe-mode`, dst.). Enter = pakai default dan langsung scan; ketik nomor opsi untuk mengubahnya |
 | `--quick` | Mode cepat (7 modul, no crawl) |
 | `--detailed` | Mode lengkap (32 modul, crawl depth 2, recon, parameter discovery, JWT, OOB) |
-| `-o file.html` | Output HTML report |
+| `-o` / `--output file.html` | Output HTML report (default `spade_<host>.html`) |
 | `--csv file.csv` | Export hasil ke CSV |
 | `--json file.json` | Export JSON (metadata scan + temuan + bukti request/response, cocok untuk pipeline) |
 | `--sarif file.sarif` | Export SARIF 2.1.0 (untuk GitHub code scanning / CI) |
 | `--no-redact` | Matikan sensor cookie/token/password. **Hati-hati: jangan dibagikan.** |
 | `--no-color` | Output terminal tanpa warna |
+| `--skip-ssl` | Lewati verifikasi sertifikat TLS server (self-signed/expired). Digabung `--cert` → peringatan di banner: hanya sisi klien yang diautentikasi |
 | `--impersonate PROFIL` | Profil browser untuk impersonation (default `chrome`). Contoh: `chrome136`, `safari184`, `firefox147` |
 | `--no-impersonate` | Matikan browser impersonation (fingerprint default curl, untuk debugging) |
 | `--cookie "N=V;M=X"` | Cookie sesi untuk area terautentikasi (boleh diulang). Mengaktifkan modul IDOR, CSRF, JWT forgery, dan cache deception |
@@ -112,7 +151,7 @@ repro selalu jadi `COOKIE_ANDA`.
 |---|---|---|
 | HTML | `-o file.html` (default `spade_<host>.html`) | Tabel temuan + blok `<details>` berisi bukti, metadata (confidence/CVSS/CWE/OWASP), dan dua langkah repro |
 | CSV | `--csv file.csv` | 5 kolom lama + `Confidence`, `CVSS_Score`, `CVSS_Vector`, `CWE`, `OWASP`, `Repro_Curl`, `Evidence_Status`, `Evidence_URL` |
-| JSON | `--json file.json` | `tool`, `target`, `scan` (mode, durasi, worker, `errors`, `redacted`, plus flag audit `auth`/`auth_source`/`safe_mode`/`authorized`/`throttle`/`proxy`/`state`/`resume`/`client_cert`/`active_writes`/`check_smuggling`/`oob`), `summary`, dan `findings` lengkap dengan `evidence` + `repro` |
+| JSON | `--json file.json` | `tool`, `target`, `scan` (mode, waktu mulai/selesai, durasi, worker, `impersonate`, `modules`, `errors`, `redacted`, plus flag audit `auth`/`auth_source`/`safe_mode`/`authorized`/`throttle`/`proxy`/`state`/`resume`/`client_cert`/`active_writes`/`timing_probes`/`check_smuggling`/`oob`), `summary`, dan `findings` lengkap dengan `evidence` + `repro` |
 | SARIF | `--sarif file.sarif` | SARIF 2.1.0: satu rule per kode temuan + `partialFingerprints` supaya temuan tidak dobel di dashboard |
 
 Metadata per temuan: skor + vector CVSS 3.1, CWE, kategori OWASP Top 10, dan
@@ -158,6 +197,10 @@ redaksi, dan skema output ada di
 | Subdomain enum (`crt.sh` + Cert Spotter + DNS wordlist) | ❌ | ❌ | ✅ |
 | Port scan (butuh `--port-scan`, opt-in) | ❌ | ❌ | ✅ |
 
+Mode keempat, **RECON** (`--recon-only`), hanya menjalankan modul `recon`
+(subdomain, URL historis, endpoint JS, host hidup) — tanpa modul kerentanan.
+Port scan tetap bisa digabung (`--recon-only --port-scan`).
+
 ## Semua Modul
 
 - Technology fingerprinting (server, framework, JS libs)
@@ -167,8 +210,8 @@ redaksi, dan skema output ada di
 - TLS/SSL cert + weak protocol check
 - Form analysis, rate limiting, cookie security
 - SQL injection (error-based + time-based)
-- XSS reflected (GET params) + XSS via form POST + stored XSS
-- Open redirect, LFI, command injection (GET + POST)
+- XSS reflected (GET params) + XSS via form POST + stored XSS (hanya konteks yang benar-benar executable dilaporkan)
+- Open redirect, LFI (katalog Linux/Windows/traversal ter-encode/`php://filter`), command injection (GET + POST)
 - SSRF (GET endpoint + via form field)
 - XXE (direct XML endpoint + via form upload)
 - SSTI (Jinja2/Twig/Freemarker/Velocity), NoSQLi
@@ -243,6 +286,37 @@ Request itu tidak bisa disamarkan dengan browser impersonation dan terlihat
 sebagai passive reconnaissance. Pakai `--no-recon` kalau nama target tidak boleh
 keluar ke pihak ketiga.
 
+## Status Pengembangan
+
+Roadmap celah fitur bug bounty ada di
+[docs/bug-bounty-gaps.md](docs/bug-bounty-gaps.md). Kondisi saat ini:
+**bagian 1–5 selesai, bagian 6 (kepatuhan & etika) masih terbuka.**
+
+| Bagian | Cakupan | Status & PR | Dokumen |
+|---|---|---|---|
+| 1 | Kualitas temuan: bukti request/response, repro `curl`, CVSS/CWE/OWASP, confidence, output JSON/SARIF | ✅ `feat/finding-evidence-metadata` | [docs/findings-model.md](docs/findings-model.md) |
+| 2 | Cakupan kelas kerentanan: IDOR/BOLA, CSRF, JWT, auth bypass, API spec, host header/cache, CRLF, smuggling, blind OOB | ✅ `feat/vuln-class-coverage` | [docs/vuln-classes.md](docs/vuln-classes.md) |
+| 3 | Recon: subdomain (crt.sh + Cert Spotter + wordlist DNS), URL historis (Wayback + Common Crawl), endpoint JS, host hidup, port scan | ✅ `feat/recon-enum` | [docs/recon.md](docs/recon.md) |
+| 4 | Kualitas deteksi modul lama: kredensial hardcode JS, orakel SSRF/XSS/LFI/SQLi/CMDi/XXE, baseline SPA, redaksi di objek `Exchange` | ✅ `fix/js-secret-detection` + `feat/module-detection-quality` | [docs/detection-quality.md](docs/detection-quality.md) |
+| 5 | Mesin scan: throttle (`--delay`/`--max-rps`/`--jitter`/`--backoff-max`), safe-mode + gerbang otorisasi, impor sesi, rotasi proxy, checkpoint/resume, client certificate, mode interaktif | ✅ `feat/scan-throttle-safe-mode`, `feat/proxy-rotation`, `feat/resume-client-cert`, `feat/interactive-advanced-defaults` | [docs/scan-engine.md](docs/scan-engine.md) |
+| 6 | Kepatuhan & etika: allowlist scope (`--scope-file`), `--respect-robots`, identitas tester di `User-Agent` | ⏳ belum dikerjakan (gerbang otorisasi sudah ada lewat `--i-have-authorization`/prompt interaktif) | [docs/bug-bounty-gaps.md](docs/bug-bounty-gaps.md) |
+
+Sengaja **tidak** ditambahkan sebagai dependensi: `sqlmap`, `ffuf`, `nuclei`,
+dan Playwright. Semua orakel memakai katalog internal supaya runtime tetap
+`curl_cffi` + stdlib saja.
+
+## Dokumentasi
+
+| Dokumen | Isi |
+|---|---|
+| [docs/scan-engine.md](docs/scan-engine.md) | Penjadwal request, safe-mode & gerbang otorisasi, impor sesi, rotasi proxy, checkpoint/resume, mTLS, dan mode interaktif dengan pengaturan lanjutan |
+| [docs/findings-model.md](docs/findings-model.md) | Model temuan: bukti request/response, CVSS/CWE/OWASP, confidence, aturan redaksi, skema HTML/CSV/JSON/SARIF |
+| [docs/vuln-classes.md](docs/vuln-classes.md) | Rincian tiap kelas kerentanan: apa yang diuji, flag yang dibutuhkan, batas request, penjaga false positive |
+| [docs/detection-quality.md](docs/detection-quality.md) | Orakel dan penjaga false positive modul lama (baseline SPA, SSRF, XSS, LFI, SQLi, CMDi/XXE) |
+| [docs/recon.md](docs/recon.md) | Tahap recon: sumber data, batas request, alur ke crawler/modul injection, catatan privasi |
+| [docs/http-layer.md](docs/http-layer.md) | HTTP layer `curl_cffi`, browser impersonation, dan alasan socket mentah untuk smuggling/CRLF |
+| [docs/bug-bounty-gaps.md](docs/bug-bounty-gaps.md) | Roadmap dan status kesenjangan fitur bug bounty per bagian |
+
 ## Development
 
 ```bash
@@ -257,6 +331,12 @@ eksternal): 424 test mencakup 32 modul, flag CLI, recon, mesin scan
 (throttle/safe-mode/sesi/rotasi proxy/resume/mTLS), mode interaktif (menu
 pengaturan lanjutan), dan generator laporan.
 
+Kode keluar: `0` scan selesai (termasuk kalau ada modul yang gagal — kegagalan
+modul dicatat sebagai `INFO SCAN_ERROR` dan masuk `scan.errors` di JSON), `1`
+dependensi runtime `curl_cffi` belum terpasang, `2` argumen/konfigurasi tidak
+valid (kombinasi flag bentrok, checkpoint `--resume` dengan cakupan berbeda,
+prompt target atau menu pengaturan interaktif yang kehabisan input/EOF).
+
 ## Catatan
 
 - Scan ini non-intrusive **kecuali** uji opt-in: `--active-writes` (kirim POST),
@@ -269,14 +349,11 @@ pengaturan lanjutan), dan generator laporan.
 - Batasi laju scan dengan `--delay`/`--max-rps`/`--jitter` kalau target sensitif
   atau WAF agresif; penjadwal ini global untuk semua worker dan ikut menghormati
   `Retry-After` (dibatasi `--backoff-max`).
-- Roadmap celah fitur bug bounty (proxy/rate limit, scope file, multi-target)
-  ada di [docs/bug-bounty-gaps.md](docs/bug-bounty-gaps.md).
-  Bagian 1 (kualitas temuan: bukti, repro, CVSS/CWE/OWASP, confidence,
-  JSON/SARIF), bagian 2 (cakupan kelas kerentanan: IDOR, CSRF, JWT, auth
-  bypass, API spec, host header/cache, CRLF, smuggling, blind OOB), dan bagian 3
-  (recon: subdomain, URL historis, endpoint JS, host hidup, port scan) sudah
-  selesai, begitu juga bagian 5 (mesin scan/operasional: throttle, safe-mode,
-  impor sesi, rotasi proxy, resume/checkpoint, client certificate).
+- Roadmap celah fitur bug bounty ada di
+  [docs/bug-bounty-gaps.md](docs/bug-bounty-gaps.md); yang masih terbuka:
+  `--scope-file`/`-l targets.txt`, `--respect-robots`, identitas tester di
+  `User-Agent`, dan screenshot recon. Ringkasan status per bagian (PR +
+  dokumen pendamping) ada di [Status Pengembangan](#status-pengembangan).
 - Detail tahap recon (sumber, batas request, alur data ke crawler dan modul
   injection, privasi) ada di [docs/recon.md](docs/recon.md).
 - Model data temuan ada di [docs/findings-model.md](docs/findings-model.md);
@@ -298,3 +375,57 @@ pengaturan lanjutan), dan generator laporan.
 - False positive mungkin terjadi. Verifikasi manual temuan CRITICAL/HIGH.
 - Mulai dengan `--quick`, lanjut `--detailed` kalau perlu.
 - Untuk hasil maksimal: `--detailed` karena mengaktifkan crawler untuk menemukan form POST.
+
+## Penafian & Batas Penggunaan
+
+Spade adalah alat uji keamanan untuk **aset milikmu sendiri atau aset yang kamu
+punya izin tertulis untuk diuji** (program bug bounty, kontrak pentest, lab
+pribadi). Baca bagian ini sebelum menjalankan scan.
+
+**Pemilik repo tidak bertanggung jawab atas penyalahgunaan repo/alat ini.**
+Secara eksplisit, pemilik repo dan para kontributor:
+
+- **tidak bertanggung jawab** atas pemakaian Spade terhadap sistem yang tidak
+  kamu miliki atau tidak kamu punya izin untuk menguji — termasuk pemindaian,
+  pengujian berintrusi, atau eksploitasi tanpa izin;
+- **tidak bertanggung jawab** atas kerusakan langsung maupun tidak langsung,
+  kehilangan data, gangguan layanan, kerugian finansial, atau dampak lain yang
+  timbul dari pemakaian alat ini;
+- **tidak bertanggung jawab** atas tuntutan, sanksi, atau konsekuensi hukum apa
+  pun yang timbul dari pemakaian alat ini, termasuk pelanggaran hukum yang
+  berlaku di yurisdiksi pengguna dan pelanggaran aturan program bug bounty;
+- **tidak memberikan jaminan** apa pun, tersurat maupun tersirat, termasuk
+  kelayakan untuk tujuan tertentu dan akurasi temuan.
+
+Tanggung jawab sepenuhnya ada di pengguna: pastikan izin tertulis sudah ada
+sebelum request pertama dikirim, patuhi aturan program dan hukum yang berlaku,
+hormati batas laju target, dan lindungi data hasil scan (termasuk sebelum
+memakai `--no-redact`).
+
+Catatan tambahan:
+
+- Perangkat lunak ini disediakan **"sebagaimana adanya" (as is)**. Temuan bisa
+  false positive maupun false negative; verifikasi manual temuan CRITICAL/HIGH
+  sebelum dilaporkan ke program.
+- Repo ini belum memuat berkas `LICENSE`. Tanpa lisensi eksplisit, hak pakai
+  terbatas pada apa yang diizinkan pemilik repo — hubungi pemilik repo kalau
+  butuh kejelasan lisensi sebelum memakai atau mendistribusikan ulang.
+- Fitur penyamaran request (browser impersonation, rotasi proxy, `--safe-mode`)
+  disediakan untuk pengujian berizin, **bukan** untuk menghindari tanggung
+  jawab hukum.
+- Kalau kamu menemukan Spade dipakai untuk aktivitas tanpa izin, laporkan ke
+  pemilik repo lewat issue di
+  [github.com/RiloArbabillah/spade](https://github.com/RiloArbabillah/spade).
+
+### Disclaimer (English)
+
+Spade is intended **for authorized security testing only** — assets you own or
+assets you have **explicit written permission** to test (bug bounty programs,
+pentest engagements, personal labs).
+
+**The repository owner is not responsible for any misuse of this repository or
+this tool.** The repository owner and contributors accept no liability for
+unauthorized or illegal use, for any direct or indirect damage, data loss,
+service disruption, or financial loss, or for any legal claim arising from the
+use of this software. The tool is provided **"as is"**, without warranty of any
+kind, express or implied. All responsibility rests with the user.
