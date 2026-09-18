@@ -635,6 +635,175 @@ def throttle_cooldown(seconds, attempt=1):
     return throttle.cooldown(max(float(seconds or 0.0), throttle.backoff_for(attempt)))
 
 
+# ==================================================================
+# PROXY - rotasi IP keluar (--proxy / --proxy-file)
+# ==================================================================
+
+# Skema proxy yang diterima. `socks5h` menyelesaikan DNS di sisi proxy (nama
+# target tidak terlihat dari jaringan tester), `socks5` menyelesaikan DNS lokal.
+PROXY_SCHEMES = ("http", "https", "socks5", "socks5h")
+# Respons yang dianggap tanda proxy/IP sudah diblokir -> proxy diistirahatkan.
+PROXY_BLOCK_STATUS = frozenset({403, 429, 503})
+DEFAULT_PROXY_COOLDOWN = 60.0      # durasi istirahat per proxy yang diblokir
+
+def _redact_proxy_url(url):
+    """URL proxy versi aman-untuk-log: password diganti `***`.
+
+    Kredensial proxy (user:pass@host) tidak boleh muncul di banner, pesan error,
+    maupun laporan; fungsi ini satu-satunya jalur untuk menyebut URL proxy.
+    """
+    text = str(url or "")
+    try:
+        parsed = urllib.parse.urlsplit(text)
+    except ValueError:
+        return "***"
+    if "@" not in parsed.netloc:
+        return text
+    userinfo, _, hostpart = parsed.netloc.rpartition("@")
+    user, sep, _password = userinfo.partition(":")
+    masked = f"{user}{sep}***" if sep else "***"
+    return urllib.parse.urlunsplit((parsed.scheme, f"{masked}@{hostpart}",
+                                    parsed.path, parsed.query, parsed.fragment))
+
+def parse_proxy_url(raw):
+    """Normalisasi + validasi satu URL proxy; `ValueError` kalau tidak layak pakai.
+
+    Skema wajib ditulis eksplisit (`http`, `https`, `socks5`, `socks5h`): tanpa
+    skema, libcurl menebak dan hasilnya ambigu. Kredensial di dalam URL
+    (`http://user:pass@host:8080`) didukung dan tidak pernah dicatat.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        raise ValueError("URL proxy kosong")
+    parsed = urllib.parse.urlsplit(text)
+    if parsed.scheme.lower() not in PROXY_SCHEMES:
+        shown = parsed.scheme or "(tanpa skema)"
+        raise ValueError(f"skema proxy '{shown}' tidak didukung "
+                         f"(pilih salah satu: {', '.join(PROXY_SCHEMES)})")
+    if not parsed.hostname:
+        raise ValueError(f"URL proxy '{_redact_proxy_url(text)}' tidak menyebut host")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"URL proxy '{_redact_proxy_url(text)}' punya port tidak valid") from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError(f"URL proxy '{_redact_proxy_url(text)}' memakai port di luar 1-65535")
+    return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc, parsed.path,
+                                    parsed.query, parsed.fragment))
+
+def load_proxy_file(path):
+    """Baca daftar proxy dari file teks: satu URL per baris, `#` = komentar."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError as exc:
+        raise ValueError(f"tidak bisa membaca --proxy-file '{path}': {exc.strerror or exc}") from exc
+    proxies = []
+    for lineno, line in enumerate(lines, 1):
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        try:
+            proxies.append(parse_proxy_url(text))
+        except ValueError as exc:
+            raise ValueError(f"{path}:{lineno}: {exc}") from exc
+    if not proxies:
+        raise ValueError(f"--proxy-file '{path}' tidak berisi satu URL proxy pun (satu per baris)")
+    return proxies
+
+class ProxyPool:
+    """Rotasi proxy keluar untuk seluruh scan: round-robin + istirahat saat diblokir.
+
+    Satu instance dipakai bersama semua worker. Setiap request meminta proxy
+    berikutnya lewat `next_proxy()`; kalau target membalas 403/429/503, proxy yang
+    dipakai saat itu diistirahatkan `cooldown` detik supaya IP yang sudah diblokir
+    tidak dipakai terus. Proxy yang sedang istirahat dilewati selama masih ada
+    proxy lain yang siap; kalau semuanya istirahat, proxy dengan waktu pulih
+    tercepat dipakai lagi supaya scan tidak berhenti di tengah jalan.
+
+    `describe()` sengaja hanya memuat jumlah/sumber/cooldown - URL dan kredensial
+    proxy tidak pernah masuk laporan.
+    """
+
+    def __init__(self, proxies=(), cooldown=DEFAULT_PROXY_COOLDOWN, source=""):
+        self.proxies = list(proxies or [])
+        self.cooldown = max(0.0, float(cooldown or 0.0))
+        self.source = source
+        self._lock = threading.Lock()
+        self._index = 0
+        self._blocked_until = {url: 0.0 for url in self.proxies}
+        self.blocked_count = 0     # berapa kali proxy diistirahatkan (audit)
+
+    @property
+    def enabled(self):
+        """True kalau ada proxy yang bisa dipakai."""
+        return bool(self.proxies)
+
+    @property
+    def count(self):
+        return len(self.proxies)
+
+    def describe(self):
+        """Ringkasan metadata laporan (tanpa URL/kredensial proxy)."""
+        return {"enabled": self.enabled, "count": self.count, "source": self.source,
+                "cooldown": self.cooldown}
+
+    def next_proxy(self):
+        """URL proxy berikutnya (round-robin), atau None kalau pool kosong."""
+        if not self.proxies:
+            return None
+        with self._lock:
+            now = time.monotonic()
+            total = len(self.proxies)
+            for offset in range(total):
+                index = (self._index + offset) % total
+                url = self.proxies[index]
+                if self._blocked_until.get(url, 0.0) <= now:
+                    self._index = (index + 1) % total
+                    return url
+            # Semua proxy sedang istirahat: pilih yang paling cepat pulih supaya
+            # scan tetap jalan (lebih baik lambat daripada berhenti total).
+            index = min(range(total), key=lambda i: self._blocked_until.get(self.proxies[i], 0.0))
+            self._index = (index + 1) % total
+            return self.proxies[index]
+
+    def mark_blocked(self, url):
+        """Istirahatkan `url` setelah respons blokir; True kalau cooldown baru dipasang."""
+        if not url or self.cooldown <= 0 or url not in self._blocked_until:
+            return False
+        with self._lock:
+            until = time.monotonic() + self.cooldown
+            if until <= self._blocked_until.get(url, 0.0):
+                return False
+            self._blocked_until[url] = until
+            self.blocked_count += 1
+            return True
+
+REQUEST_PROXIES = None
+
+def set_request_proxies(pool):
+    """Pasang pool proxy global (None = request langsung tanpa proxy)."""
+    global REQUEST_PROXIES
+    REQUEST_PROXIES = pool
+    return pool
+
+def proxy_rotation_enabled():
+    """True kalau rotasi proxy aktif (pool terpasang dan berisi minimal satu proxy)."""
+    pool = REQUEST_PROXIES
+    return bool(pool is not None and pool.enabled)
+
+def next_request_proxy():
+    """Proxy untuk request berikutnya; None kalau rotasi proxy tidak aktif."""
+    pool = REQUEST_PROXIES
+    return pool.next_proxy() if pool is not None else None
+
+def mark_proxy_blocked(url):
+    """Tandai proxy kena blokir (403/429/503) supaya diistirahatkan sementara."""
+    pool = REQUEST_PROXIES
+    if pool is not None:
+        pool.mark_blocked(url)
+
+
 def supported_impersonate_profiles():
     """Daftar profil yang diterima curl_cffi untuk --impersonate.
 
@@ -667,7 +836,8 @@ def _retry_after_seconds(value):
         return 0.0
 
 
-def make_session(timeout=15, verify_ssl=True, impersonate=_DEFAULT, extra_headers=None):
+def make_session(timeout=15, verify_ssl=True, impersonate=_DEFAULT, extra_headers=None,
+                 trust_env=None):
     """Buat satu curl_cffi Session dengan browser impersonation.
 
     User-Agent, sec-ch-ua, sec-fetch-*, dan Accept-Language tidak diset manual:
@@ -684,11 +854,18 @@ def make_session(timeout=15, verify_ssl=True, impersonate=_DEFAULT, extra_header
     fingerprint TLS + header tidak berubah.
 
     impersonate=None berarti impersonation dimatikan (mode paritas/debugging).
+
+    `trust_env=False` mematikan pembacaan proxy dari variabel lingkungan
+    (http_proxy/https_proxy); dipakai saat rotasi proxy aktif supaya request tidak
+    tercampur proxy sistem. `None` (default) berarti perilaku lama dibiarkan apa
+    adanya.
     """
     profile = DEFAULT_IMPERSONATE if impersonate is _DEFAULT else impersonate
     kwargs = {"timeout": timeout, "verify": verify_ssl, "retry": TRANSPORT_RETRIES}
     if profile:
         kwargs["impersonate"] = profile
+    if trust_env is not None:
+        kwargs["trust_env"] = trust_env
     session = CurlSession(**kwargs)
     if extra_headers:
         session.headers.update(extra_headers)
@@ -1354,6 +1531,10 @@ class ThreadLocalSession:
       sehingga kredensial tester hilang setelah respons pertama yang menulis cookie;
     * cookie jadi ter-scope ke host target saja, tidak ikut terkirim ke API pihak
       ketiga yang dipakai recon (crt.sh, Cert Spotter, Wayback, Common Crawl).
+
+    Rotasi proxy (`--proxy`/`--proxy-file`) juga menempel di funnel ini: setiap
+    request meminta proxy berikutnya dari `ProxyPool`, dan proxy yang membalas
+    403/429/503 langsung diistirahatkan supaya request berikutnya pindah IP.
     """
 
     def __init__(self, timeout=15, verify_ssl=True, impersonate=_DEFAULT, retries=None,
@@ -1383,9 +1564,13 @@ class ThreadLocalSession:
     def _session(self, url=""):
         sess = getattr(self._local, "sess", None)
         if sess is None:
+            # Saat rotasi proxy aktif, proxy dari variabel lingkungan dimatikan:
+            # proxy eksplisit (`--proxy`/`--proxy-file`) harus menang, bukan
+            # tercampur http_proxy/https_proxy milik sistem tester.
             sess = make_session(timeout=self.timeout, verify_ssl=self.verify_ssl,
                                 impersonate=self.impersonate,
-                                extra_headers=self.extra_headers)
+                                extra_headers=self.extra_headers,
+                                trust_env=False if proxy_rotation_enabled() else None)
             self._local.sess = sess
             self._local.cookie_hosts = set()
         host = urllib.parse.urlparse(url).hostname or ""
@@ -1416,7 +1601,17 @@ class ThreadLocalSession:
             # Penjadwalan global (--delay/--max-rps/jitter) dijalankan di funnel
             # yang sama supaya seluruh modul ikut terbatas tanpa mengubah call site.
             throttle_acquire()
+            # Rotasi proxy juga di funnel ini: recon, crawl, dan modul vuln memakai
+            # pool yang sama, jadi tidak ada jalur request yang memakai IP tester
+            # terus-menerus. `socks5h`/`http` dipilih per request oleh ProxyPool.
+            proxy_url = next_request_proxy()
+            if proxy_url:
+                kwargs["proxy"] = proxy_url
             resp = self._session(url).request(method, url, **kwargs)
+            if proxy_url and resp.status_code in PROXY_BLOCK_STATUS:
+                # Proxy ini kena blokir/WAF: istirahatkan supaya request berikutnya
+                # memakai IP lain (selama masih ada proxy yang siap).
+                mark_proxy_blocked(proxy_url)
             if resp.status_code not in RETRY_STATUS or attempt >= max_attempts:
                 break
             wait = _retry_after_seconds(resp.headers.get("Retry-After"))
@@ -4795,6 +4990,12 @@ def scan_smuggling(sess, base_url, ctx=None):
     f = FindingList(base_url, capture=False)
     if not _ctx_flag(ctx, "check_smuggling") or _ctx_flag(ctx, "safe_mode"):
         return f
+    if proxy_rotation_enabled():
+        # Payload desync dikirim lewat socket mentah (bukan curl), jadi tidak bisa
+        # mengikuti rotasi proxy. Melewati modul lebih baik daripada membocorkan
+        # IP tester yang justru sedang disembunyikan.
+        info("Request smuggling dilewati: payload socket mentah tidak bisa dikirim via proxy.")
+        return f
     info("Menguji request smuggling (raw socket, CL.TE/TE.CL)...")
     parsed = urllib.parse.urlparse(base_url)
     # `netloc` (host:port) hanya untuk header Host; koneksi socket butuh hostname polos.
@@ -5188,6 +5389,10 @@ def gen_json(finds, target, out, scan=None):
             "safe_mode": bool(scan.get("safe_mode")),
             "authorized": bool(scan.get("authorized")),
             "throttle": scan.get("throttle") or Throttle().describe(),
+            # Rotasi proxy: hanya jumlah/sumber/cooldown — URL dan kredensial
+            # proxy tidak pernah masuk laporan.
+            "proxy": scan.get("proxy") or {"enabled": False, "count": 0, "source": "",
+                                           "cooldown": DEFAULT_PROXY_COOLDOWN},
             "active_writes": bool(scan.get("active_writes")),
             "timing_probes": bool(scan.get("timing_probes")),
             "check_smuggling": bool(scan.get("check_smuggling")),
@@ -5338,7 +5543,9 @@ def main(argv=None):
   python3 spade.py example.com --detailed --port-scan # full + TCP connect scan
   python3 spade.py example.com --delay 0.5 --jitter 30   # sopan ke target (maks ~2 req/s)
   python3 spade.py example.com --max-rps 5 --safe-mode   # batas laju + tanpa uji destruktif
-  python3 spade.py example.com --session sesi.json       # impor cookie/header dari file JSON""")
+  python3 spade.py example.com --session sesi.json       # impor cookie/header dari file JSON
+  python3 spade.py example.com --proxy http://127.0.0.1:8080   # lewat satu proxy
+  python3 spade.py example.com --proxy-file proxy.txt    # rotasi IP round-robin dari file""")
     parser.add_argument("target", nargs="?", default="", help="Target URL (opsional — akan diminta interaktif jika kosong)")
     parser.add_argument("-o","--output", default="", help="Laporan HTML")
     parser.add_argument("--csv", default="", help="Export CSV")
@@ -5381,6 +5588,14 @@ def main(argv=None):
                         help="Acak jeda ±PCT%% (0-100) supaya pola request tidak seragam (default: 0)")
     parser.add_argument("--backoff-max", type=float, default=DEFAULT_BACKOFF_MAX, metavar="SEC",
                         help=f"Batas atas cooldown global saat target membalas 429/503 (default: {DEFAULT_BACKOFF_MAX:.0f}s)")
+    parser.add_argument("--proxy", action="append", default=[], metavar="URL",
+                        help="Proxy keluar; boleh diulang untuk rotasi round-robin. Skema: "
+                             + "/".join(PROXY_SCHEMES) + ". Kredensial di URL tidak pernah ditulis ke laporan")
+    parser.add_argument("--proxy-file", default="", metavar="FILE",
+                        help="File daftar proxy untuk rotasi (satu URL per baris, '#' = komentar). Tidak bisa digabung --proxy")
+    parser.add_argument("--proxy-cooldown", type=float, default=DEFAULT_PROXY_COOLDOWN, metavar="SEC",
+                        help=f"Istirahatkan proxy selama SEC detik setelah respons 403/429/503 lalu pindah "
+                             f"ke proxy lain (default: {DEFAULT_PROXY_COOLDOWN:.0f}s, 0 = langsung pakai lagi)")
     parser.add_argument("--safe-mode", action="store_true",
                         help="Mode aman: tidak mengirim metode/payload yang mengubah state (PUT/DELETE, uji tulis, probe timing, smuggling). Bentrok dengan flag destruktif → exit 2")
     parser.add_argument("--i-have-authorization", action="store_true",
@@ -5411,6 +5626,25 @@ def main(argv=None):
         parser.error("--jitter harus di antara 0 dan 100 (persen)")
     if args.backoff_max < 0:
         parser.error("--backoff-max tidak boleh negatif")
+    # ── Validasi rotasi proxy (--proxy/--proxy-file) ──
+    if args.proxy and args.proxy_file:
+        parser.error("--proxy dan --proxy-file tidak bisa dipakai bersamaan")
+    if args.proxy_cooldown < 0:
+        parser.error("--proxy-cooldown tidak boleh negatif")
+    proxy_urls, proxy_source = [], ""
+    if args.proxy:
+        proxy_source = "--proxy"
+        for raw_proxy in args.proxy:
+            try:
+                proxy_urls.append(parse_proxy_url(raw_proxy))
+            except ValueError as exc:
+                parser.error(f"--proxy: {exc}")
+    elif args.proxy_file:
+        proxy_source = "--proxy-file"
+        try:
+            proxy_urls = load_proxy_file(args.proxy_file)
+        except ValueError as exc:
+            parser.error(str(exc))
     # ── Safe-mode & gerbang otorisasi uji destruktif ──
     destructive = [label for label, attr, _why in DESTRUCTIVE_FLAGS if getattr(args, attr)]
     if args.safe_mode:
@@ -5525,6 +5759,10 @@ def main(argv=None):
     # (WAF detection / halaman utama) sudah ikut dibatasi.
     throttle = set_request_throttle(Throttle(delay=args.delay, max_rps=args.max_rps,
                                              jitter_pct=args.jitter, backoff_max=args.backoff_max))
+    # Pool proxy dipasang sebelum session dibuat supaya request pertama (WAF
+    # detection / halaman utama) sudah lewat proxy dan `trust_env` dimatikan.
+    proxies = set_request_proxies(ProxyPool(proxy_urls, cooldown=args.proxy_cooldown,
+                                            source=proxy_source))
 
     print()
     print(f"    {c('bold',c('cyan','+===========[ SPADE ]===========+'))}")
@@ -5541,6 +5779,13 @@ def main(argv=None):
     if throttle.enabled:
         rate = f"{1.0 / throttle.interval:.1f} req/s" if throttle.interval > 0 else "tanpa batas laju"
         info(f"Throttle: delay {throttle.delay:g}s, {rate}, jitter ±{throttle.jitter_pct:g}%")
+    if proxies.enabled:
+        info(f"Proxy : {proxies.count} proxy, rotasi round-robin "
+             f"(sumber {proxies.source}, cooldown {proxies.cooldown:g}s) — URL/kredensial tidak dicatat")
+        if args.check_smuggling:
+            warn("Request smuggling dilewati: payload desync lewat socket mentah tidak bisa dikirim via proxy.")
+        if args.port_scan:
+            warn("Port scan tetap koneksi langsung ke target (TCP connect tidak lewat proxy).")
     if args.safe_mode:
         warn("SAFE MODE — PUT/DELETE, uji tulis, probe timing, dan smuggling tidak dikirim.")
     if args.i_have_authorization:
@@ -5587,6 +5832,7 @@ def main(argv=None):
         "safe_mode": bool(args.safe_mode),
         "authorized": bool(args.i_have_authorization),
         "throttle": throttle.describe(),
+        "proxy": proxies.describe(),
         "active_writes": bool(args.active_writes),
         "timing_probes": bool(args.timing_probes),
         "check_smuggling": bool(args.check_smuggling),
@@ -5706,6 +5952,7 @@ def main(argv=None):
         warn(f"{len(scan['errors'])} modul gagal — lihat temuan SCAN_ERROR di laporan.")
     print()
     set_request_throttle(None)
+    set_request_proxies(None)
     return 0
 
 if __name__ == "__main__":

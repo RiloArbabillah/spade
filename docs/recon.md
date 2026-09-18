@@ -178,8 +178,11 @@ Recon menambah dua jenis jejak yang tidak ada di scan biasa:
 
 Karena itu ada `--no-recon`: di DETAILED, nama target tidak dikirim ke sumber
 pihak ketiga sama sekali (modul `recon` dan `subdomains` juga tidak dijalankan).
-Rotasi IP/proxy belum ada — lihat [docs/bug-bounty-gaps.md](bug-bounty-gaps.md)
-bagian 5.
+Sejak `--proxy`/`--proxy-file` ada, request recon ikut rotasi proxy karena
+memakai funnel `ThreadLocalSession` yang sama, jadi kalau rotasi proxy dipakai
+nama target tidak lagi keluar dari IP tester. Catatan: **port scan**
+(`--port-scan`) tetap TCP connect langsung, bukan lewat proxy. Detail rotasi ada di
+[docs/scan-engine.md](scan-engine.md).
 
 ## 10. API publik
 
