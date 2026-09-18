@@ -42,11 +42,18 @@ python3 spade.py example.com
 | `-H "Nama: nilai"` | Header tambahan untuk semua request, mis. token API (boleh diulang) |
 | `--bearer TOKEN` | Isi header `Authorization: Bearer …` (bentrok dengan `-H 'Authorization: …'` → exit 2) |
 | `--jwt-secrets FILE` | File daftar secret JWT (satu per baris) untuk crack HMAC offline |
-| `--active-writes` | Izinkan uji yang mengirim data (submit form CSRF dengan token palsu). **Default: mati** |
-| `--timing-probes` | Izinkan probe time-based SQLi/CMDi dengan delay 3 detik. **Default: mati** |
-| `--check-smuggling` | Aktifkan uji request smuggling CL.TE/TE.CL lewat socket mentah. **Default: mati** |
+| `--session FILE` | Impor sesi dari file JSON (objek nama→nilai, daftar `{name,value}`, atau `{cookies,headers}`). Nilainya tidak pernah ditulis ke laporan |
+| `--active-writes` | Izinkan uji yang mengirim data (submit form CSRF dengan token palsu). **Default: mati**, butuh konfirmasi otorisasi |
+| `--timing-probes` | Izinkan probe time-based SQLi/CMDi dengan delay 3 detik. **Default: mati**, butuh konfirmasi otorisasi |
+| `--check-smuggling` | Aktifkan uji request smuggling CL.TE/TE.CL lewat socket mentah. **Default: mati**, butuh konfirmasi otorisasi |
 | `--oob-host HOST[:PORT]` | Host collector OOB milik tester untuk membuktikan blind SSRF/XXE/CMDi (jalankan `tools/oob_collector.py`) |
 | `--workers N` | Jumlah request paralel (default 10, 1 = sekuensial) |
+| `--delay SEC` | Jeda minimum antar request untuk **semua** worker (default 0). Mis. `0.5` ≈ maksimal 2 request/detik |
+| `--max-rps N` | Batas laju global request per detik (default 0 = tanpa batas). Boleh digabung `--delay`; batas terketat yang menang |
+| `--jitter PCT` | Acak jeda ±`PCT`% (0–100) supaya pola request tidak seragam (default 0) |
+| `--backoff-max SEC` | Batas atas cooldown global saat target membalas 429/503 (default 30s) |
+| `--safe-mode` | Mode aman: tidak mengirim PUT/DELETE, uji tulis, probe timing, atau smuggling. Bentrok dengan flag destruktif → exit 2 |
+| `--i-have-authorization` | Konfirmasi non-interaktif bahwa kamu punya izin tertulis untuk uji destruktif (`--active-writes`/`--timing-probes`/`--check-smuggling`) |
 | `--crawl-depth N` | Kedalaman crawl mode detailed (default 2) |
 | `--crawl-max N` | Maksimal halaman di-crawl mode detailed (default 30) |
 | `--recon-only` | Hanya jalankan recon (subdomain, URL historis, endpoint JS, host hidup). Bentrok dengan `--quick`/`--detailed`/`--no-recon` → exit 2 |
@@ -64,10 +71,15 @@ python3 spade.py https://example.com --json hasil.json --sarif hasil.sarif  # un
 
 # Area terautentikasi (wajib untuk IDOR/CSRF aktif/JWT forgery)
 python3 spade.py https://example.com --detailed --cookie "session=..." -H "X-Api-Key: ..."
+python3 spade.py https://example.com --detailed --session sesi.json   # impor cookie/header dari file
 
-# Uji tulis + OOB (hanya di target yang mengizinkan)
+# Sopan ke target: batas laju + jitter
+python3 spade.py https://example.com --delay 0.5 --jitter 30    # maksimal ~2 req/s
+python3 spade.py https://example.com --max-rps 5 --safe-mode    # batas laju + tanpa uji destruktif
+
+# Uji tulis + OOB (hanya di target yang mengizinkan, butuh konfirmasi otorisasi)
 python3 tools/oob_collector.py --host 0.0.0.0 --port 9000 &
-python3 spade.py https://example.com --detailed --active-writes --oob-host 10.0.0.5:9000
+python3 spade.py https://example.com --detailed --active-writes --oob-host 10.0.0.5:9000 --i-have-authorization
 ```
 
 ## Struktur laporan
@@ -82,7 +94,7 @@ repro selalu jadi `COOKIE_ANDA`.
 |---|---|---|
 | HTML | `-o file.html` (default `spade_<host>.html`) | Tabel temuan + blok `<details>` berisi bukti, metadata (confidence/CVSS/CWE/OWASP), dan dua langkah repro |
 | CSV | `--csv file.csv` | 5 kolom lama + `Confidence`, `CVSS_Score`, `CVSS_Vector`, `CWE`, `OWASP`, `Repro_Curl`, `Evidence_Status`, `Evidence_URL` |
-| JSON | `--json file.json` | `tool`, `target`, `scan` (mode, durasi, worker, `errors`, `redacted`, plus flag audit `auth`/`active_writes`/`check_smuggling`/`oob`), `summary`, dan `findings` lengkap dengan `evidence` + `repro` |
+| JSON | `--json file.json` | `tool`, `target`, `scan` (mode, durasi, worker, `errors`, `redacted`, plus flag audit `auth`/`auth_source`/`safe_mode`/`authorized`/`throttle`/`active_writes`/`check_smuggling`/`oob`), `summary`, dan `findings` lengkap dengan `evidence` + `repro` |
 | SARIF | `--sarif file.sarif` | SARIF 2.1.0: satu rule per kode temuan + `partialFingerprints` supaya temuan tidak dobel di dashboard |
 
 Metadata per temuan: skor + vector CVSS 3.1, CWE, kategori OWASP Top 10, dan
@@ -177,13 +189,21 @@ Request smuggling dan payload CRLF dikirim lewat socket mentah justru **karena**
 `curl_cffi` menormalkan `Content-Length`/`Transfer-Encoding`/escape URL, sehingga
 payload desync harus dikirim apa adanya.
 
-Yang belum tersedia: rotasi IP/proxy, delay/jitter, dan pola request manusiawi.
-Daftar lengkapnya ada di [docs/bug-bounty-gaps.md](docs/bug-bounty-gaps.md).
+Untuk pola request, gunakan `--delay`/`--max-rps`/`--jitter`: penjadwal global
+membatasi laju seluruh worker dan mengacak jeda supaya pola tidak seragam.
+Modul `rate_limit` otomatis dilewati saat penjadwal aktif (burst 15 request
+tidak bisa diamati lagi) dan dicatat di log.
+
+Yang belum tersedia: rotasi IP/proxy dan pola request manusiawi (mis. `Referer`
+antar halaman atau pemuatan aset statis). Daftar lengkapnya ada di
+[docs/bug-bounty-gaps.md](docs/bug-bounty-gaps.md).
 
 Detail HTTP layer ada di [docs/http-layer.md](docs/http-layer.md), model
 temuan/bukti/laporan ada di [docs/findings-model.md](docs/findings-model.md),
 tahap recon ada di [docs/recon.md](docs/recon.md), dan rincian kelas kerentanan
-ada di [docs/vuln-classes.md](docs/vuln-classes.md).
+ada di [docs/vuln-classes.md](docs/vuln-classes.md). Kontrol operasional
+(throttle, safe-mode, impor sesi) ada di
+[docs/scan-engine.md](docs/scan-engine.md).
 
 **Catatan recon:** tahap recon di mode DETAILED mengirim **nama target** ke API
 pihak ketiga (crt.sh, Cert Spotter, Wayback, Common Crawl) dari IP tester.
@@ -201,14 +221,21 @@ python3 tools/oob_collector.py --help  # collector OOB (stdlib, tanpa dependency
 ```
 
 Test memakai fixture server lokal di `tests/conftest.py` (tanpa jaringan
-eksternal): 242 test mencakup 32 modul, flag CLI, recon, dan generator laporan.
+eksternal): 309 test mencakup 32 modul, flag CLI, recon, mesin scan
+(throttle/safe-mode/sesi), dan generator laporan.
 
 ## Catatan
 
-- Scan ini non-intrusive **kecuali** tiga uji opt-in: `--active-writes` (kirim
-  POST), `--check-smuggling` (socket mentah), dan `--oob-host` (callback ke
-  collector Anda). Semuanya mati secara default. Hanya gunakan di situs
+- Scan ini non-intrusive **kecuali** uji opt-in: `--active-writes` (kirim POST),
+  `--timing-probes` (delay 3 detik), `--check-smuggling` (socket mentah), dan
+  `--oob-host` (callback ke collector Anda). Semuanya mati secara default.
+  Tiga flag destruktif pertama butuh konfirmasi otorisasi (prompt interaktif
+  atau `--i-have-authorization` di CI); `--safe-mode` mematikannya total dan
+  menolak kombinasi dengan flag destruktif (exit 2). Hanya gunakan di situs
   sendiri/terotorisasi.
+- Batasi laju scan dengan `--delay`/`--max-rps`/`--jitter` kalau target sensitif
+  atau WAF agresif; penjadwal ini global untuk semua worker dan ikut menghormati
+  `Retry-After` (dibatasi `--backoff-max`).
 - Roadmap celah fitur bug bounty (proxy/rate limit, scope file, multi-target)
   ada di [docs/bug-bounty-gaps.md](docs/bug-bounty-gaps.md).
   Bagian 1 (kualitas temuan: bukti, repro, CVSS/CWE/OWASP, confidence,
@@ -224,7 +251,7 @@ eksternal): 242 test mencakup 32 modul, flag CLI, recon, dan generator laporan.
   [docs/vuln-classes.md](docs/vuln-classes.md).
 - Modul yang **butuh sesi autentikasi** (`idor`, `csrf` aktif, JWT forgery,
   cache deception) dilewati dengan catatan di log kalau `--cookie`/`-H`/
-  `--bearer` tidak diberikan — bukan dilaporkan sebagai bersih.
+  `--bearer`/`--session` tidak diberikan — bukan dilaporkan sebagai bersih.
 - Setiap temuan membawa bukti request/response dan perintah `curl` siap pakai.
   Kredensial disensor otomatis (`***REDACTED***`) dan temuan `JS_SECRET`/
   `JS_SECRET_MAYBE` hanya menampilkan nilai yang sudah dimask (4 karakter awal +

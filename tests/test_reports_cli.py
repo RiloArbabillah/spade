@@ -245,6 +245,7 @@ def test_cli_no_redact_flag_disables_redaction(vuln_server, tmp_path, capsys):
 def test_cli_timing_probes_metadata(vuln_server, tmp_path):
     json_out = tmp_path / "timing.json"
     assert spade.main([vuln_server.base_url, "--quick", "--no-color", "--timing-probes",
+                       "--i-have-authorization",
                        "-o", str(tmp_path / "timing.html"), "--json", str(json_out)]) == 0
     payload = json.loads(json_out.read_text(encoding="utf-8"))
     assert payload["scan"]["timing_probes"] is True

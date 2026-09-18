@@ -84,13 +84,14 @@ Banner scan menampilkan profil yang dipakai, mis. `Bot   : chrome` atau
 - 60 test (`tests/`) lulus saat PR itu dibuat, memakai fixture HTTP server lokal
   — tanpa koneksi internet. Mencakup header impersonation, retry status +
   `Retry-After`, timeout default, cookie, validasi `--impersonate`, serta regresi
-  23 modul. (Suite saat ini 242 test / 32 modul; lihat
+  23 modul. (Suite saat ini 309 test / 32 modul; lihat
   [vuln-classes.md](vuln-classes.md).)
 - Perbandingan hasil modul lama (`requests`) vs baru (`curl_cffi`) terhadap
   fixture yang sama: identik kecuali tiga perubahan perilaku di atas.
 - Smoke scan ke target eksternal **belum** diverifikasi di PR ini.
-- Impersonation hanya menyamarkan fingerprint klien. Rotasi IP, delay/jitter,
-  dan pola request manusiawi belum ada — lihat
+- Impersonation hanya menyamarkan fingerprint klien. Delay/jitter sudah tersedia
+  lewat `--delay`/`--max-rps`/`--jitter` (lihat [scan-engine.md](scan-engine.md)),
+  tapi rotasi IP dan pola request manusiawi belum ada — lihat
   [bug-bounty-gaps.md](bug-bounty-gaps.md) bagian 5 dan "Catatan penting soal
   anti-deteksi bot".
 - Gunakan hanya pada aset yang Anda miliki atau yang secara eksplisit masuk

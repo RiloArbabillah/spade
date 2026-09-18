@@ -13,7 +13,10 @@ Status: **bagian 1, 2, 3, dan 4 sudah dikerjakan** — bagian 1 di PR
 hardcode di JS sudah diperbaiki di PR `fix/js-secret-detection`; sisa bagian 4
 sekarang ditangani di `feat/module-detection-quality`. Integrasi binary
 eksternal (`sqlmap`, `ffuf`, `nuclei`, Playwright) sengaja tidak ditambahkan.
-Bagian 5–6 masih terbuka. PR
+Bagian 5 sudah dikerjakan sebagian di PR `feat/scan-throttle-safe-mode`
+(throttle, safe-mode, impor sesi — detail di
+[docs/scan-engine.md](scan-engine.md)); proxy/rotasi IP, resume/state, dan
+client certificate masih terbuka. Bagian 6 masih terbuka. PR
 `feat/curl-cffi-http-layer` sebelumnya hanya mengganti HTTP layer ke `curl_cffi`
 + menambah test + membuat dokumen ini.
 
@@ -125,12 +128,12 @@ dengan pendekatan tanpa dependency runtime baru. Rincian orakel ada di
 
 | Area | Bukti di kode | Dampak | Tool / pendekatan konkret | Prioritas |
 |---|---|---|---|---|
-| Tanpa rate limit / delay / jitter | Hanya `--workers`; request paralel penuh (default 10) | Target down / diblokir WAF → scan sia-sia | Tambah `--delay`, `--max-rps`, jitter acak, dan backoff saat 429/503 | P0 |
-| Tanpa proxy / rotasi IP | Tidak ada opsi proxy | IP tester cepat diblokir | Tambah `--proxy`, `--proxy-file` (rotasi), dukung SOCKS5 | P1 |
-| Tanpa auth/cookie/header injection | Tidak ada `--cookie`, `--header`, `--auth` | Tidak bisa scan area terautentikasi (mayoritas bounty) | Tambah `--cookie`, `-H`, `--bearer`, impor sesi (JSON cookie) | P0 |
-| Tanpa resume / state | Hasil hanya akhir scan; tidak ada checkpoint | Scan panjang harus diulang | Tulis `state.json` per modul selesai + `--resume` | P2 |
-| Tanpa client certificate | Tidak ada | Target mTLS tidak bisa diuji | `--cert/--key` (didukung `curl_cffi` lewat `cert=`) | P3 |
-| Safe-mode / gating payload berbahaya | Semua payload destruktif (PUT/DELETE, `SLEEP`) jalan di mode apa pun | Risiko melanggar aturan program | Tambah `--safe-mode` (tanpa payload destruktif) + konfirmasi eksplisit untuk uji tulis/hapus | P0 |
+| Tanpa rate limit / delay / jitter | Hanya `--workers`; request paralel penuh (default 10) | Target down / diblokir WAF → scan sia-sia | Tambah `--delay`, `--max-rps`, jitter acak, dan backoff saat 429/503 | ✅ Selesai (`--delay`/`--max-rps`/`--jitter`/`--backoff-max`, penjadwal global + cooldown 429/503) |
+| Tanpa proxy / rotasi IP | Tidak ada opsi proxy | IP tester cepat diblokir | Tambah `--proxy`, `--proxy-file` (rotasi), dukung SOCKS5 | P1 (belum) |
+| Tanpa auth/cookie/header injection | Tidak ada `--cookie`, `--header`, `--auth` | Tidak bisa scan area terautentikasi (mayoritas bounty) | Tambah `--cookie`, `-H`, `--bearer`, impor sesi (JSON cookie) | ✅ Selesai (`--cookie`/`-H`/`--bearer` di bagian 2; impor sesi `--session` di PR mesin scan) |
+| Tanpa resume / state | Hasil hanya akhir scan; tidak ada checkpoint | Scan panjang harus diulang | Tulis `state.json` per modul selesai + `--resume` | P2 (belum) |
+| Tanpa client certificate | Tidak ada | Target mTLS tidak bisa diuji | `--cert/--key` (didukung `curl_cffi` lewat `cert=`) | P3 (belum) |
+| Safe-mode / gating payload berbahaya | Semua payload destruktif (PUT/DELETE, `SLEEP`) jalan di mode apa pun | Risiko melanggar aturan program | Tambah `--safe-mode` (tanpa payload destruktif) + konfirmasi eksplisit untuk uji tulis/hapus | ✅ Selesai (`--safe-mode` + gerbang otorisasi `--i-have-authorization`) |
 
 ## 6. Kepatuhan & etika
 
@@ -161,7 +164,9 @@ Yang **belum** ada dan tetap jadi celah deteksi:
    Spotter, Wayback, Common Crawl) dari IP tester — request ini tidak bisa
    di-impersonate. Opt-out: `--no-recon` (mode DETAILED).
 
-Item 1–2 ada di tabel bagian 5 (P0/P1) dan akan dikerjakan di PR terpisah.
+Item 2 (delay/jitter) sudah ditangani `--delay`/`--max-rps`/`--jitter` di PR
+`feat/scan-throttle-safe-mode`; item 1 (rotasi IP/proxy) masih terbuka di tabel
+bagian 5.
 
 ## Urutan pengerjaan yang disarankan
 
@@ -174,9 +179,11 @@ Item 1–2 ada di tabel bagian 5 (P0/P1) dan akan dikerjakan di PR terpisah.
    (detail di [docs/vuln-classes.md](vuln-classes.md)). `--cookie/-H/--bearer`
    dari bagian 5 sudah dikerjakan sekaligus karena kelas di atas butuh sesi
    autentikasi.
-3. **P0 operasional sisanya**: `--delay/--max-rps`, `--proxy/--proxy-file`,
-   `--scope-file`, `-l targets.txt`, `--safe-mode`, `--i-have-authorization`
-   (bagian 5 & 6).
+3. **P0 operasional sisanya** (bagian 5 & 6): `--delay/--max-rps`,
+   `--safe-mode`, dan `--i-have-authorization` **sudah selesai** di PR
+   `feat/scan-throttle-safe-mode` (detail di
+   [docs/scan-engine.md](scan-engine.md)); `--proxy/--proxy-file`,
+   `--scope-file`, dan `-l targets.txt` masih terbuka.
 4. ~~**P0 akurasi**: perbaiki heuristik SSRF in-band dan perluas cakupan
    XSS/LFI (bagian 4).~~ **Sudah selesai** di `feat/module-detection-quality`;
    integrasi binary eksternal tetap tidak ditambahkan.
