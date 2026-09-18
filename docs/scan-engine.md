@@ -1,11 +1,13 @@
-# Mesin Scan / Operasional — Throttle, Safe-Mode, Impor Sesi, Rotasi Proxy, Resume, mTLS
+# Mesin Scan / Operasional — Throttle, Safe-Mode, Impor Sesi, Rotasi Proxy, Resume, mTLS, Mode Interaktif
 
-Dokumen ini menjelaskan enam kontrol operasional: penjadwal laju request,
+Dokumen ini menjelaskan tujuh kontrol operasional: penjadwal laju request,
 safe-mode beserta gerbang otorisasi, impor sesi dari file JSON, rotasi proxy
-keluar, checkpoint/resume scan, dan client certificate untuk target mTLS.
+keluar, checkpoint/resume scan, client certificate untuk target mTLS, dan mode
+interaktif yang menampilkan opsi flag-only beserta nilai default-nya.
 Empat yang pertama menempel di **satu funnel request**
 (`ThreadLocalSession.request()` + `raw_http_probe()`); resume dan mTLS bekerja
-di lapisan orkestrasi `main()` dan pembuatan `Session`.
+di lapisan orkestrasi `main()` dan pembuatan `Session`; mode interaktif bekerja
+di depan validasi argumen, sebelum `main()` menyentuh jaringan.
 
 Semua kontrol dijalankan **sebelum request pertama dikirim**. Pelanggaran
 kombinasi flag berhenti dengan exit code `2` tanpa menyentuh target.
@@ -357,12 +359,127 @@ libcurl hanya path-nya.
 Hanya status yang dicatat; path berkas lokal tidak ikut ke HTML/JSON supaya
 laporan tetap portabel dan tidak membocorkan struktur direktori tester.
 
+## 7. Mode interaktif & pengaturan lanjutan
+
+| Cara pakai | Efek |
+|---|---|
+| Tanpa argumen | Tanya target → tanya mode → tampilkan menu pengaturan lanjutan |
+| Enter di prompt menu | Pakai semua nilai default yang tampil, lalu mulai scan |
+| `1`, `3` | Ubah satu opsi; prompt kedua minta nilai barunya |
+| `1, 3 5` | Ubah beberapa opsi sekaligus (nomor dipisah koma/spasi) |
+| `l` (atau `list`, `?`) | Cetak ulang daftar opsi |
+| `-` di prompt nilai | Kosongkan opsi teks/daftar (cookie, header, proxy, dst.) |
+
+Sebelumnya mode interaktif hanya menanyakan **target** dan **mode**. Fitur
+lainnya — `--workers`, `--delay`, `--proxy`, `--cookie`, `--safe-mode`, dan
+seterusnya — hanya bisa dipakai kalau pengguna sudah tahu nama flag-nya lebih
+dulu. Sekarang semuanya dicetak bersama nilai default yang akan dipakai scan,
+jadi fitur flag-only tetap bisa ditemukan tanpa membuka `--help`.
+
+Prompt mode juga menambah opsi **[4] Recon** (`--recon-only`), yang tadinya
+hanya bisa dijangkau lewat flag.
+
+### Yang ditampilkan
+
+Daftar dibangun dari registry `INTERACTIVE_OPTIONS` — 33 entri dalam 7
+kelompok, dan setiap entri memuat nama flag aslinya supaya pengguna bisa
+berpindah ke jalur non-interaktif kapan saja:
+
+| Kelompok | Opsi |
+|---|---|
+| Kecepatan & stealth | `--workers`, `--impersonate`, `--delay`, `--max-rps`, `--jitter`, `--backoff-max`, `--proxy`, `--proxy-file`, `--proxy-cooldown` |
+| Sesi & autentikasi | `--cookie`, `-H/--header`, `--bearer`, `--session`, `--jwt-secrets` |
+| Cakupan uji | `--no-recon`, `--crawl-depth`, `--crawl-max`, `--port-scan`, `--safe-mode`, `--skip-ssl` |
+| Uji destruktif (butuh otorisasi) | `--active-writes`, `--timing-probes`, `--check-smuggling` |
+| Target khusus | `--oob-host`, `--cert`, `--key` |
+| Checkpoint | `--state`, `--resume` |
+| Laporan | `-o/--output`, `--json`, `--csv`, `--sarif`, `--no-redact` |
+
+Opsi bernilai angka punya batas bawah/atas yang sama dengan validasi CLI
+(`--jitter` 0–100, `--workers` ≥ 1, `--crawl-depth` ≥ 1, dst.), dan nama profil
+`--impersonate` diperiksa terhadap daftar profil `curl_cffi` yang tersedia.
+
+### Cara menjawab
+
+- **Angka** untuk opsi `int`/`float`. Nilai di luar rentang ditolak dengan
+  pesan batasnya lalu ditanyakan ulang — bukan `exit 2` yang membuang semua
+  isian.
+- **`aktif`/`mati`** (juga `ya`/`tidak`, `on`/`off`, `1`/`0`) untuk opsi
+  boolean. Flag negatif ditampilkan sebagai **keadaan fiturnya**, bukan nama
+  flag-nya: baris `Recon` menunjukkan `aktif`/`mati` walau yang ditulis ke
+  `args` adalah `--no-recon`.
+- **Enter** di prompt nilai membatalkan perubahan opsi itu saja; **Enter** di
+  prompt menu berarti "pakai semua default dan mulai scan".
+
+### Nilai rahasia tidak pernah ditampilkan
+
+`--cookie`, `-H/--header`, dan `--bearer` ditampilkan sebagai `***`
+(daftar: `*** (N item)`) — nilainya tidak pernah muncul di layar, termasuk di
+ringkasan "Pengaturan diubah:" sebelum scan. Alasannya sama dengan redaksi
+laporan: keluaran terminal bisa ikut tersimpan di log, `tmux` scrollback, atau
+rekaman sesi.
+
+### Konflik dicek di menu, validasi tetap di jalur CLI
+
+Kombinasi yang pasti berakhir `exit 2` dicek lebih awal di dalam prompt supaya
+pengguna tidak kehilangan isian:
+
+- `--safe-mode` digabung flag destruktif (`--active-writes`,
+  `--timing-probes`, `--check-smuggling`),
+- `--proxy` digabung `--proxy-file`,
+- `--port-scan` tanpa mode `detailed`/`recon`.
+
+Menu **tidak** menggandakan aturan validasi: nilai yang diisi langsung ditulis
+ke `args`, lalu `main()` menjalankan jalur validasi CLI yang sama. Kombinasi
+yang tidak dicek di menu (mis. `--key` tanpa `--cert`, `--bearer` bentrok
+`-H 'Authorization: …'`) tetap berhenti dengan `exit 2` lewat `parser.error`.
+
+### Flag yang sengaja tidak masuk menu
+
+| Flag | Alasan |
+|---|---|
+| `--quick` / `--detailed` / `--recon-only` | Sudah menjadi prompt mode (termasuk pilihan `[4] Recon`). |
+| `--no-color` | Harus di-set sebelum menu ini dicetak; memprosesnya di tengah menu akan membuat tampilan separuh berwarna. Karena itu `--no-color` kini diproses paling awal di `main()`. |
+| `--no-impersonate` | Sudah tercakup opsi `--impersonate` dengan nilai `-`/`tanpa`. |
+| `--i-have-authorization` | Digantikan prompt konfirmasi otorisasi, yang memang hanya muncul di terminal interaktif. |
+
+### Ringkasan sebelum scan
+
+Banner kedua menambah baris yang tadinya hanya terlihat di `--help`:
+
+```
+Workers: 10 request paralel
+Crawl : depth 2, maks 30 halaman      (hanya mode detailed)
+Recon : dilewati (--no-recon) — ...   (hanya kalau recon dimatikan)
+```
+
+### Perilaku saat input berakhir (EOF)
+
+Terminal non-TTY (pipeline/CI) tidak bisa menjawab prompt. EOF di prompt target
+maupun di prompt menu keluar dengan `exit 2` dan pesan singkat di `stderr`,
+tanpa traceback. Otomasi tetap harus memakai flag CLI.
+
+### API publik
+
+- `build_parser()` — parser `argparse` dipisah dari `main()` supaya daftar flag
+  bisa diperiksa tanpa menjalankan scan. `INTERACTIVE_OPTIONS` diuji agar selalu
+  sinkron dengannya: setiap dest CLI harus ada di menu atau terdaftar eksplisit
+  sebagai pengecualian.
+- `INTERACTIVE_OPTIONS` — tuple entri menu (`attr`, `flag`, `label`, `group`,
+  `kind`, `hint`, `invert`, `minimum`, `maximum`, `show`, `secret`). Menambah
+  flag baru cukup dengan menambah entri di sini.
+- `_interactive_option_text(option, args, host="")` /
+  `_apply_option_value(option, args, raw)` /
+  `_interactive_conflicts(args)` / `_prompt_advanced_options(args, host="")` —
+  bagian yang bisa diuji tanpa menjalankan scan penuh.
+
 ## Verifikasi
 
 ```bash
 .venv/bin/pytest -q tests/test_scan_engine.py        # unit + CLI end-to-end throttle/safe-mode/sesi
 .venv/bin/pytest -q tests/test_proxy_rotation.py     # unit + CLI end-to-end rotasi proxy (proxy lokal asli)
 .venv/bin/pytest -q tests/test_resume_client_cert.py # unit + CLI end-to-end checkpoint/resume & mTLS
+.venv/bin/pytest -q tests/test_interactive_defaults.py # menu pengaturan lanjutan: registry, nilai default, alur end-to-end
 .venv/bin/pytest -q                                 # seluruh suite (fixture lokal, tanpa internet)
 .venv/bin/ruff check .                              # lint
 ```
@@ -372,8 +489,20 @@ Test rotasi proxy memakai forward proxy HTTP lokal di `tests/conftest.py`
 diteruskan ke fixture target, sehingga round-robin dan *skip-on-block* terbukti
 pada jalur HTTP nyata.
 
+Test mode interaktif menjalankan `spade.main([])` dengan `input()` yang
+disuntik jawaban berurutan, jadi alur target → mode → menu → scan benar-benar
+dieksekusi terhadap fixture target lokal. Salah satu test memastikan setiap
+flag CLI muncul di menu (atau terdaftar sebagai pengecualian), sehingga flag
+baru tidak bisa ditambahkan tanpa ikut tampil di mode interaktif.
+
 ## Batasan / yang ditunda
 
+- Menu pengaturan lanjutan hanya muncul di mode interaktif. Pada pemanggilan
+  dengan argumen (`spade.py contoh.test --quick`) perilakunya tidak berubah
+  sama sekali; di terminal non-TTY menu ini langsung berakhir EOF → `exit 2`.
+- Menu menampilkan **nilai** opsi, bukan konsekuensinya: mengubah
+  `--crawl-depth` di mode `quick` tetap tidak berpengaruh karena crawl hanya
+  jalan di mode `detailed` (baris `Crawl :` di banner menandai ini).
 - Resume tidak memulihkan *ctx* modul yang dilewati (lihat §5) dan tidak
   melanjutkan modul yang terpotong di tengah: checkpoint ditulis per modul,
   jadi modul yang belum selesai diulang dari awal.

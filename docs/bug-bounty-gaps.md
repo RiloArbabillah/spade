@@ -13,10 +13,11 @@ Status: **bagian 1, 2, 3, dan 4 sudah dikerjakan** — bagian 1 di PR
 hardcode di JS sudah diperbaiki di PR `fix/js-secret-detection`; sisa bagian 4
 sekarang ditangani di `feat/module-detection-quality`. Integrasi binary
 eksternal (`sqlmap`, `ffuf`, `nuclei`, Playwright) sengaja tidak ditambahkan.
-Bagian 5 sudah dikerjakan sebagian: throttle, safe-mode, dan impor sesi di PR
-`feat/scan-throttle-safe-mode`; proxy/rotasi IP di PR `feat/proxy-rotation`
-(detail keduanya di [docs/scan-engine.md](scan-engine.md)). Resume/state dan
-client certificate masih terbuka. Bagian 6 masih terbuka. PR
+Bagian 5 sudah lengkap: throttle, safe-mode, dan impor sesi di PR
+`feat/scan-throttle-safe-mode`; proxy/rotasi IP di PR `feat/proxy-rotation`;
+resume/state dan client certificate di PR `feat/resume-client-cert`; opsi
+flag-only juga sudah muncul di mode interaktif beserta nilai default-nya
+(detail di [docs/scan-engine.md](scan-engine.md)). Bagian 6 masih terbuka. PR
 `feat/curl-cffi-http-layer` sebelumnya hanya mengganti HTTP layer ke `curl_cffi`
 + menambah test + membuat dokumen ini.
 
